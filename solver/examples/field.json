@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "_comment": [
+    "Field description for the Peregrine solver.",
+    "",
+    "Obstacles are the REAL physical obstacles -- do NOT inflate them by the",
+    "robot's size. Give the robot's own footprint under 'robot' instead and",
+    "the solver works out the swept shape for every heading itself.",
+    "",
+    "That has to be done per heading, because the configuration-space",
+    "obstacle of a polygonal robot is not a polyhedron in (x, y, heading):",
+    "its faces satisfy  n_x*x + n_y*y + A*cos(h) + B*sin(h) = c,  which is",
+    "planar only for a point robot. Each fixed-heading slice IS exactly a",
+    "polygon, so the solver rasterises one slice per heading bin.",
+    "",
+    "The robot polygon is in the ROBOT BODY frame, with the origin at the",
+    "odometry tracking point -- the same point whose x/y the value tables",
+    "are indexed by. If your tracking point is not the centre of the",
+    "chassis, the polygon must be off-centre to match.",
+    "",
+    "Polygons may be concave. Vertex order does not matter. Units are cm,",
+    "matching the calibration regression. Omit 'robot' entirely to treat the",
+    "robot as a point."
+  ],
+  "units": { "distance": "cm", "angle": "rad" },
+
+  "field": { "x_min": 0.0, "y_min": 0.0, "x_max": 366.0, "y_max": 366.0 },
+
+  "robot": {
+    "_comment": "A 36 x 36 cm chassis centred on the tracking point.",
+    "polygon": [[-18.0, -18.0], [18.0, -18.0], [18.0, 18.0], [-18.0, 18.0]]
+  },
+
+  "obstacles": [
+    {
+      "name": "center_structure",
+      "polygon": [[150.0, 150.0], [216.0, 150.0], [216.0, 216.0], [150.0, 216.0]]
+    },
+    {
+      "name": "left_pillar",
+      "polygon": [[40.0, 170.0], [70.0, 170.0], [70.0, 200.0], [40.0, 200.0]]
+    },
+    {
+      "name": "right_ramp",
+      "polygon": [[300.0, 60.0], [366.0, 60.0], [366.0, 120.0], [330.0, 120.0]]
+    }
+  ]
+}

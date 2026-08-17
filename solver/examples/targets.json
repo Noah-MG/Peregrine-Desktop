@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "Target states for the Peregrine solver. One value table is produced per",
+    "target. Each state is the same 6-vector used everywhere in Peregrine:",
+    "  [x, y, heading, vx, vy, omega]",
+    "ALL of it in the FIELD frame: x/y in cm, heading in rad, vx/vy in cm/s,",
+    "omega in rad/s. A target with zero velocity means 'arrive and stop',",
+    "while a nonzero velocity means 'pass through this point already moving",
+    "that way' -- useful for chaining motions without stopping."
+  ],
+  "units": { "distance": "cm", "angle": "rad" },
+
+  "targets": [
+    { "name": "score_left",  "state": [ 60.0, 300.0,  0.7854, 0.0, 0.0, 0.0] },
+    { "name": "score_right", "state": [300.0, 300.0, -0.7854, 0.0, 0.0, 0.0] },
+    { "name": "park_center", "state": [183.0,  40.0,  0.0,    0.0, 0.0, 0.0] }
+  ]
+}
