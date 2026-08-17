@@ -1,0 +1,28 @@
+# Generated calibration output. These embed absolute paths to whatever log
+# they were fitted from, so they are per-machine artefacts, not source.
+calibration/drivetrain_fit.json
+calibration/drivetrain_fit.toml
+
+# Solver output: value tables, manifests, run logs.
+solver/out/
+**/TABLES/
+MANIFEST.JSON
+card_written.json
+
+# Julia
+solver/Manifest.toml
+*.jl.cov
+*.jl.mem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
