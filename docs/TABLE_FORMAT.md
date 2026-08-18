@@ -1,214 +1,39 @@
 # Peregrine value-table SD card format
 
-This is the contract between the desktop solver and the online optimizer on
-the robot. The desktop side writes it; the robot side reads it. Nothing else
-depends on it, and nothing else should.
+The desktop solver writes this; the online optimizer on the robot reads it.
+
+The card holds one **value table** per target. A value table answers a single
+question for every state the robot could be in:
+
+> from this state, what is the shortest possible time to reach the target?
+
+The robot reads a few of those numbers near its current state each loop and
+steers toward the smallest. All the searching happened offline.
+
+Read this document in order. Every symbol is defined before it is used.
 
 ---
 
-## 1. What is on the card, and why
-
-The solver produces, for every target you asked about, a **table of
-minimum-time-to-go**. One number per state:
-
-> If the robot were in state `s` right now, what is the shortest possible time
-> to reach the target, driving as hard as the drivetrain allows and avoiding
-> every obstacle?
-
-That number is the *value function*. The robot does not re-plan from scratch
-each loop; it looks up a few of these numbers around its current state and
-picks the direction that decreases the value fastest. All the expensive
-searching already happened on the desktop.
-
-A state is six numbers, and that is the reason the tables are large: a table
-is a six-dimensional array, so its size is the **product** of all six axis
-resolutions. Doubling one axis doubles the file. Doubling all six multiplies
-it by 64. That single fact drives every other decision below.
-
-The card holds only two kinds of thing:
+## 1. Files on the card
 
 ```
-/MANIFEST.JSON            one small file describing everything
-/TABLES/T00C0000.BIN      raw table data, nothing else
-/TABLES/T00C0001.BIN
-/TABLES/T01C0000.BIN
+/MANIFEST.JSON            describes everything below
+/MODEL.JSON               the drivetrain model, see section 8
+/TABLES/T00C0000.BIN      target 00, chunk 0000
+/TABLES/T00C0001.BIN      target 00, chunk 0001
+/TABLES/T01C0000.BIN      target 01, chunk 0000
 ...
 ```
 
-No logs, no configs, no leftovers. Everything except the manifest is payload.
+Chunk filenames are `T` + two-digit target + `C` + four-digit chunk + `.BIN`,
+which is a strict 8.3 name. On FAT32 a long filename consumes several
+directory entries; an 8.3 name consumes one.
+
+Nothing else belongs on the card.
 
 ---
 
-## 2. The state vector
-
-The same six numbers appear everywhere in Peregrine, always in this order:
-
-| axis | name | meaning | unit |
-| ---: | --- | --- | --- |
-| 0 | `x` | position across the field | cm |
-| 1 | `y` | position along the field | cm |
-| 2 | `h` | heading | rad |
-| 3 | `vx` | velocity, x component | cm/s |
-| 4 | `vy` | velocity, y component | cm/s |
-| 5 | `w` | angular velocity | rad/s |
-
-**Everything is field frame.** Position, heading, and *both velocity
-components* are measured against the field, not the robot. `w` is the same in
-either frame, so the question does not arise for it.
-
-This matters because it is a deliberate choice that costs the desktop a little
-and saves the robot a lot. The drivetrain model is naturally body-frame — motor
-forces push along the robot's own axes — so the solver rotates into the body
-frame internally, steps the physics, and rotates back out before storing. Doing
-that once per cell on a GPU is free. Doing the inverse rotation on the robot,
-every loop cycle, is not. The robot reads field-frame velocity straight from
-odometry and indexes the table with it, with no trigonometry at all.
-
-### Heading wraps, the others do not
-
-Axis 2 is periodic. It covers a full turn, `[-pi, +pi)`, in `n[2]` equal
-steps:
-
-```
-step  = 2*pi / n[2]
-value = -pi + i * step
-```
-
-Index `n[2]` is the same state as index `0`. When interpolating or looking at
-neighbours, wrap with `mod`, never clamp — heading `+3.10` and `-3.10` rad are
-neighbours, not opposite ends of the range.
-
-Every other axis is a plain inclusive span from `min[k]` to `max[k]`:
-
-```
-step  = (max[k] - min[k]) / (n[k] - 1)
-value = min[k] + i * step
-```
-
-Note the `n[k] - 1`: both endpoints are sample points. For heading it is
-`n[2]`, not `n[2] - 1`, precisely because the two ends are the same state and
-sampling both would be a duplicate.
-
-### Going from a state to indices
-
-```
-i = round((value - min[k]) / step[k])          # non-wrapping axes: then clamp
-i = mod(round((value - min[2]) / step[2]), n[2])   # heading
-```
-
-Clamping the non-wrapping axes is the right behaviour, not a fudge. Position
-outside the field is meaningless, and velocity outside the grid means the
-robot is moving faster than the model was ever fitted for — the nearest edge
-cell is the best available answer in both cases.
-
----
-
-## 3. Finding a cell
-
-The six-dimensional array is flattened into one long run of numbers in
-**row-major order**: the last axis varies fastest, the first slowest.
-
-```
-idx = ((((ix * Ny + iy) * Nh + ih) * Nvx + ivx) * Nvy + ivy) * Nw + iw
-```
-
-The same formula is repeated verbatim in the manifest as `index_formula`, so
-the robot code and the file can be checked against each other.
-
-Row-major with `w` last is not arbitrary. The robot's lookups are clustered
-around its current state, and neighbours along the *last* axes are adjacent in
-the file. Reading a small neighbourhood therefore touches a short contiguous
-stretch rather than scattering across the whole table.
-
-### Why the data is split into chunks
-
-`idx` can run into the billions, and a single table can be far larger than any
-file the card can hold — FAT32 caps a file at 4 GiB, and FAT32 is the only
-filesystem the Control Hub accepts. So the flat run of numbers is cut into
-equal **chunks**, each written as its own file.
-
-The chunk size is measured in **elements, not bytes**, and is always a power of
-two. That is what makes the lookup cheap: a division and a modulo become a
-shift and a mask.
-
-```
-chunk         = idx >> chunk_shift
-elem_in_chunk = idx &  (chunk_elements - 1)
-byte_offset   = elem_in_chunk * elem_bytes
-```
-
-with `chunk_elements == 1 << chunk_shift`. Default is `2^23` elements, which
-is 16 MiB per file at two bytes each. Every chunk is exactly full except the
-last one of each target.
-
-### Why the filenames look like that
-
-```
-TABLES/T00C0000.BIN
-       ^^ ^^^^
-       |  chunk number, 4 digits
-       target number, 2 digits
-```
-
-Eight characters, then `.BIN`: a strict **8.3** name. FAT32 stores a long
-filename by chaining several directory entries together, so `table_00_0000.bin`
-would cost four entries where `T00C0000.BIN` costs one. With thousands of
-chunks that is a real amount of the card's directory space, and it also means
-the robot never has to deal with long-filename handling.
-
----
-
-## 4. Reading a number
-
-Each element is one time-to-go value. Four encodings are available, chosen
-when you solve, because these tables are big enough that precision is the
-cheapest thing to trade away.
-
-| `dtype` | bytes | how to read it | "unreachable" is |
-| --- | ---: | --- | --- |
-| `u8` | 1 | unsigned int, `seconds = raw * scale` | `255` |
-| `u16` | 2 | unsigned int, `seconds = raw * scale` | `65535` |
-| `f16` | 2 | IEEE half, already seconds | `NaN` |
-| `f32` | 4 | IEEE single, already seconds | `NaN` |
-
-All little-endian.
-
-**The default is `u16` with `scale = 0.001`** — plain milliseconds. It covers
-0 to 65.534 s with exact 1 ms resolution, in half the space of `f32`. Prefer
-it to `f16`, which costs the same two bytes but carries only about three
-significant digits, so it is already rounding to tenths of a second by the
-time you reach a minute.
-
-`u8` with `scale = 0.025` gives 25 ms steps up to 6.35 s, in one byte. Worth it
-when the horizon is genuinely short and the grid is large.
-
-### The unreachable sentinel
-
-A cell reads as the sentinel when the robot cannot get from that state to the
-target: the state is inside an obstacle, or off the field, or no route was
-found within the solved horizon.
-
-These are deliberately **not** distinguished. All of them mean the same thing
-to the robot — *do not plan through here* — so collapsing them costs nothing
-and reduces the check to a single comparison in the hot loop.
-
-```
-raw == unreachable  ->  +infinity
-otherwise           ->  raw * scale     (integer types)
-                    ->  raw             (float types)
-```
-
-Treat unreachable as `+infinity`, not as a large finite number. It has to lose
-every comparison against a real route.
-
----
-
-## 5. The manifest
-
-`/MANIFEST.JSON`, UTF-8, no BOM. Deliberately short: individual chunk
-filenames are **not** listed, because they follow from `file_pattern` and
-`n_chunks`. Listing several thousand of them would make the manifest larger
-than it has any need to be.
+## 2. The manifest, which defines every symbol
 
 ```json
 {
@@ -217,6 +42,7 @@ than it has any need to be.
   "generator": "peregrine-desktop",
   "regression_sha256": "...",
   "field_sha256": "...",
+  "model_file": "MODEL.JSON",
 
   "grid": {
     "axes":  ["x", "y", "h", "vx", "vy", "w"],
@@ -257,77 +83,296 @@ than it has any need to be.
 }
 ```
 
-Read `n`, `min`, `max`, and `wrap` from the file rather than hard-coding them.
-The whole point of the manifest is that the grid can change without a firmware
-change.
+Every name used in the rest of this document comes from that file:
 
-A few fields deserve a note:
+| symbol | manifest field | meaning |
+| --- | --- | --- |
+| `n[k]` | `grid.n` | number of samples on axis `k` |
+| `min[k]`, `max[k]` | `grid.min`, `grid.max` | span of axis `k` |
+| `wrap[k]` | `grid.wrap` | true if axis `k` is periodic |
+| `step[k]` | *derived*, see §3 | spacing between samples on axis `k` |
+| `Nx … Nw` | `grid.n[0] … n[5]` | shorthand for the six axis lengths |
+| `ix … iw` | *computed*, see §3 | the six per-axis indices |
+| `idx` | *computed*, see §4 | flat index into the table |
+| `elem_bytes` | `encoding.elem_bytes` | bytes per stored value |
+| `dtype` | `encoding.dtype` | how to decode those bytes |
+| `scale` | `encoding.scale` | seconds per raw unit, integer types only |
+| `unreachable` | `encoding.unreachable` | the "no route" sentinel |
+| `chunk_elements` | `encoding.chunk_elements` | values per chunk file, a power of two |
+| `chunk_shift` | `encoding.chunk_shift` | `log2(chunk_elements)` |
 
-- **`sha256`** is over the *concatenated logical table*, in index order — not
-  per chunk. So it does not change if the chunk size changes, and it is the
-  same value `verify_tables.py` recomputes.
-- **`reached_frac`** is the fraction of cells that got a real answer. A low
-  number is a warning that much of the state space could not reach that
-  target within the solved horizon.
-- **`regression_sha256`** and **`field_sha256`** identify exactly which
-  drivetrain fit and which field description produced these tables, so a card
-  can always be traced back to its inputs.
+Read these from the file rather than hard-coding them. The grid is expected to
+change as the resolution gets tuned; that should not require a firmware change.
+
+Three fields are informational rather than needed for lookup:
+`sha256` covers the concatenated logical table in index order, so it does not
+change if the chunking does; `reached_frac` is the fraction of cells that got
+a real answer, and a low value warns that much of the state space could not
+reach that target; `regression_sha256` and `field_sha256` identify which
+drivetrain fit and field description produced the tables.
 
 ---
 
-## 6. A complete lookup
+## 3. Step 1 — from a robot state to six indices
 
-Everything above, in the order the robot does it:
+A state is six numbers, always in this order:
 
-```java
-// 1. state -> indices  (field-frame velocity, straight from odometry)
-int ix  = clamp(round((x - min0) / step0), 0, n0 - 1);
-int iy  = clamp(round((y - min1) / step1), 0, n1 - 1);
-int ih  = floorMod(round((h - min2) / step2), n2);     // wraps
-int ivx = clamp(round((vx - min3) / step3), 0, n3 - 1);
-int ivy = clamp(round((vy - min4) / step4), 0, n4 - 1);
-int iw  = clamp(round((w  - min5) / step5), 0, n5 - 1);
+| `k` | axis | meaning | unit |
+| ---: | --- | --- | --- |
+| 0 | `x` | position across the field | cm |
+| 1 | `y` | position along the field | cm |
+| 2 | `h` | heading | rad |
+| 3 | `vx` | velocity, x component | cm/s |
+| 4 | `vy` | velocity, y component | cm/s |
+| 5 | `w` | angular velocity | rad/s |
 
-// 2. indices -> flat index
-long idx = ((((long) ix * n1 + iy) * n2 + ih) * n3 + ivx) * n4 + ivy;
-idx = idx * n5 + iw;
+All six are **field frame**, velocities included, so they can be fed straight
+from odometry with no rotation. (`w` is the same in either frame.)
 
-// 3. flat index -> file and byte offset
-int  chunk  = (int) (idx >>> chunkShift);
-long offset = (idx & (chunkElements - 1)) * elemBytes;
+### Sample spacing
 
-// 4. read, and decode
-//    open TABLES/T<tt>C<cccc>.BIN, seek(offset), read elemBytes little-endian
-double seconds = (raw == unreachable)
-               ? Double.POSITIVE_INFINITY
-               : raw * scale;
+Two cases, distinguished by `wrap[k]`:
+
+```
+wrap[k] == false:   step[k] = (max[k] - min[k]) / (n[k] - 1)
+wrap[k] == true:    step[k] =  2*pi / n[k]
 ```
 
-Two practical notes for the robot side:
+The `n[k] - 1` is not a typo, and neither is its absence in the second case.
+On a normal axis both endpoints are stored samples, so `n[k]` samples leave
+`n[k] - 1` gaps between them. On the heading axis the two ends are the *same
+state* — `-pi` and `+pi` are the same direction — so storing both would be a
+duplicate. Heading stores `n[2]` distinct samples spanning the full circle,
+which leaves `n[2]` gaps, not `n[2] - 1`.
 
-**Keep the chunk files open.** Reopening a file every loop cycle will cost far
-more than the read itself. The states queried in one cycle are close together,
-so they nearly always land in the same chunk or two — a small cache of open
-handles keyed by chunk number is enough.
+### Index of a value
 
-**Interpolate if you need smoothness.** The steps above snap to the nearest
-cell, which is fine for comparing candidate directions. If you want a smooth
-value, interpolate between neighbouring cells — remembering to wrap on the
-heading axis and clamp on the rest.
+```
+c = (value - min[k]) / step[k]
+
+wrap[k] == false:   i = clamp(round(c), 0, n[k] - 1)
+wrap[k] == true:    i = mod(round(c), n[k])
+```
+
+Clamping is correct behaviour, not a fallback. A position off the field is
+meaningless, and a velocity past the edge of the grid means the robot is
+moving faster than the drivetrain model was ever fitted for; the nearest edge
+cell is the best answer available in both cases.
+
+`mod` on the heading axis is what makes index `n[2]` fold back to `0`. Use it
+for neighbours too: index `n[2] - 1` and index `0` are adjacent, not opposite
+ends.
 
 ---
 
-## 7. Checking a card
+## 4. Step 2 — from six indices to one flat index
+
+```
+idx = ((((ix * Ny + iy) * Nh + ih) * Nvx + ivx) * Nvy + ivy) * Nw + iw
+```
+
+This is a mixed-radix number: `iw` is the ones digit in base `Nw`, `ivy` the
+next digit up, and so on, with the nesting evaluated by Horner's method. The
+same expression appears in the manifest as `index_formula`, so the file and
+the firmware can be checked against each other.
+
+Two consequences worth knowing:
+
+- `idx` runs from `0` to `total_cells - 1` with no gaps, so the table is one
+  dense array.
+- Incrementing `iw` by one moves one element along in the file. The last axes
+  are the fastest-varying, so a small neighbourhood of states lands in a short
+  contiguous stretch rather than scattered across the whole table.
+
+---
+
+## 5. Step 3 — from a flat index to a byte in a file
+
+A single table can exceed the 4 GiB that FAT32 allows in one file — and FAT32
+is the only filesystem the Control Hub accepts — so the array is cut into
+equal **chunks** of `chunk_elements` values each, one file per chunk.
+
+```
+chunk         = idx >> chunk_shift
+elem_in_chunk = idx &  (chunk_elements - 1)
+byte_offset   = elem_in_chunk * elem_bytes
+```
+
+Those are exactly `idx / chunk_elements` and `idx % chunk_elements`. They can
+be written as a shift and a mask because `chunk_elements` is always a power of
+two, with `chunk_elements == 1 << chunk_shift`. For non-negative integers the
+two forms are identical, so this is a free speed-up rather than an
+approximation.
+
+The file is `file_pattern` with `chunk` substituted, e.g. chunk 3 of target 0
+is `TABLES/T00C0003.BIN`. Every chunk is completely full except the last one
+of each target.
+
+---
+
+## 6. Step 4 — from bytes to seconds
+
+Read `elem_bytes` bytes at `byte_offset`, little-endian, and decode according
+to `dtype`:
+
+| `dtype` | `elem_bytes` | raw type | seconds |
+| --- | ---: | --- | --- |
+| `u8` | 1 | unsigned byte | `raw * scale` |
+| `u16` | 2 | unsigned 16-bit | `raw * scale` |
+| `f16` | 2 | IEEE half | `raw` |
+| `f32` | 4 | IEEE single | `raw` |
+
+Before scaling, check for the sentinel:
+
+```
+integer dtypes:   raw == unreachable   ->  +infinity
+float dtypes:     isnan(raw)           ->  +infinity
+```
+
+Integers compare exactly, so `==` is safe there. Floats need `isnan`, because
+`NaN == NaN` is false by definition and an equality test would never fire.
+
+Unreachable must be treated as `+infinity`, not as a large finite number, so
+it loses every comparison against a real route. It covers three situations —
+inside an obstacle, off the field, or no route found within the solved horizon
+— which are deliberately not distinguished, since all three mean the same
+thing to the robot.
+
+The default `u16` with `scale = 0.001` is plain milliseconds: exact to 1 ms up
+to 65.534 s, in half the space of `f32`. `f16` is the same size but carries
+only about three significant digits, so prefer `u16` unless you specifically
+want floats. `u8` with `scale = 0.025` gives 25 ms steps up to 6.35 s in one
+byte, which is worth it when the horizon is short and the grid is large.
+
+---
+
+## 7. Worked example
+
+Using the manifest shown in §2, and the state
+
+```
+x = 100 cm, y = 200 cm, h = 1.0 rad, vx = 50 cm/s, vy = -30 cm/s, w = 2.0 rad/s
+```
+
+**Steps** (§3), with `n = [46, 46, 24, 13, 13, 13]`:
+
+```
+step[0] = (366 - 0) / (46 - 1)   = 8.133333    step[3] = 300 / 12 = 25.0
+step[1] = (366 - 0) / (46 - 1)   = 8.133333    step[4] = 300 / 12 = 25.0
+step[2] = 2*pi / 24              = 0.261799    step[5] =  20 / 12 =  1.666667
+```
+
+**Indices** (§3):
+
+```
+ix  = round((100 - 0)      / 8.133333) = round(12.2951) = 12
+iy  = round((200 - 0)      / 8.133333) = round(24.5902) = 25
+ih  = round((1.0 - -pi)    / 0.261799) = round(15.8197) = 16   (mod 24)
+ivx = round((50 - -150)    / 25.0)     = round( 8.0000) =  8
+ivy = round((-30 - -150)   / 25.0)     = round( 4.8000) =  5
+iw  = round((2.0 - -10)    / 1.666667) = round( 7.2000) =  7
+```
+
+**Flat index** (§4):
+
+Evaluated from the inside out, one axis per line:
+
+```
+     12 * 46 + 25  =        577      folded in iy
+    577 * 24 + 16  =      13864      folded in ih
+  13864 * 13 +  8  =     180240      folded in ivx
+ 180240 * 13 +  5  =    2343125      folded in ivy
+2343125 * 13 +  7  =   30460632      folded in iw   -> idx
+```
+
+**File and offset** (§5), with `chunk_shift = 23`:
+
+```
+chunk         = 30460632 >> 23      = 3          -> TABLES/T00C0003.BIN
+elem_in_chunk = 30460632 & 8388607  = 5294808
+byte_offset   = 5294808 * 2         = 10589616
+```
+
+**Decode** (§6): read 2 bytes little-endian at 10589616. If they read `65535`,
+the state is unreachable; otherwise the answer is `raw * 0.001` seconds.
+
+---
+
+## 8. The drivetrain model
+
+The tables say how long a route takes. They do not say how the robot moves,
+and the online optimizer needs both, so `/MODEL.JSON` carries the fitted
+drivetrain alongside them.
+
+```
+a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + k
+```
+
+where `.*` is elementwise squaring, and
+
+| symbol | shape | meaning |
+| --- | --- | --- |
+| `a` | 3 | output acceleration, `[a_x, a_y, alpha]` |
+| `s` | 6 | state, the same `[x, y, h, vx, vy, w]` as everywhere else |
+| `u` | 3 | control, `[fwd, strafe, turn]` |
+| `A_s` | 3x6 | state to acceleration |
+| `A_u` | 3x3 | control to acceleration |
+| `A_ss` | 3x6 | squared state to acceleration |
+| `A_uu` | 3x3 | squared control to acceleration |
+| `k` | 3 | constant |
+
+Read the shapes from the declared `state`, `control` and `output` vectors
+rather than hard-coding 3 and 6.
+
+Several blocks are currently all zero: the fit has no position dependence, so
+the `x`, `y` and `h` columns of `A_s` and `A_ss` are zero, and there are no
+control-squared terms, so `A_uu` is zero throughout. They are written out
+anyway. The point is that the regression can gain or lose terms later without
+the robot-side reader changing — it always multiplies the same five things and
+sums them. `nonzero_blocks` lists which are actually carrying anything, if you
+want to skip the rest for speed.
+
+### Two things that will bite
+
+**The velocities in `s` must be body frame here.** The value tables index
+field-frame velocity, because that is what odometry gives you. This model is
+body frame, because motor forces act along the robot's own axes — which is
+exactly why it *can* be written with constant matrices. Rotate `vx, vy` by
+`-h` before evaluating the model, and rotate back afterwards if you need the
+result in field terms. `alpha` and `w` are the same in both frames.
+
+**`k` reflects what the solver used, not the raw fit.** If the solve zeroed
+the constant term, `k` is zero here too, and `constant_zeroed` says so.
+Otherwise the robot's dynamics would disagree with the tables solved from
+them.
+
+---
+
+## 9. Notes for the robot side
+
+**Keep chunk files open.** Reopening a file every loop cycle costs far more
+than the read. Consecutive queries almost always land in the same chunk or
+two, so a small cache keyed by chunk number is enough.
+
+**Interpolate if you need a smooth value.** §3 snaps to the nearest cell,
+which is fine for ranking candidate directions. For a continuous value,
+interpolate between neighbouring cells — wrapping on the heading axis and
+clamping on the other five, per §3.
+
+---
+
+## 10. Verifying a card
 
 ```bash
 py -3.12 wizard/verify_tables.py G:\
 ```
 
-This implements the lookup from *this document*, independently of the solver's
-own code, so it tests the contract rather than agreeing with whatever the
+This implements §3 to §6 directly from this document rather than from the
+solver's code, and checks `MODEL.JSON` against §8, so it tests the contract instead of agreeing with whatever the
 solver happened to write. It checks chunk counts and sizes, SHA-256, FAT32
-file limits, that the value at each target is approximately zero, and that
-time-to-go grows as you move away from a target.
+file limits, that the value at each target is approximately zero, that
+time-to-go grows with distance, and that the velocity axes behave as field
+frame.
 
-If you change anything in this file, change `verify_tables.py` too, and expect
-the robot side to need updating — that is the whole point of writing it down.
+Change anything here and `verify_tables.py` needs the same change, and the
+robot side will too.

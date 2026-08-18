@@ -79,6 +79,62 @@ function polys_overlap(A::Matrix{Float64}, B::Matrix{Float64})
     false
 end
 
+"""Distance from point `p` to segment `a`-`b`."""
+@inline function pt_seg_dist(p, a, b)
+    abx = b[1] - a[1]; aby = b[2] - a[2]
+    L2 = abx * abx + aby * aby
+    t = L2 <= 0 ? 0.0 :
+        clamp(((p[1] - a[1]) * abx + (p[2] - a[2]) * aby) / L2, 0.0, 1.0)
+    dx = p[1] - (a[1] + t * abx); dy = p[2] - (a[2] + t * aby)
+    sqrt(dx * dx + dy * dy)
+end
+
+"""Distance between segments `a1`-`a2` and `b1`-`b2`, zero if they cross."""
+@inline function seg_seg_dist(a1, a2, b1, b2)
+    seg_cross(a1, a2, b1, b2) && return 0.0
+    min(pt_seg_dist(a1, b1, b2), pt_seg_dist(a2, b1, b2),
+        pt_seg_dist(b1, a1, a2), pt_seg_dist(b2, a1, a2))
+end
+
+"""
+Is polygon `A` within `clearance` of polygon `B`?
+
+Requiring a gap of `d` around every obstacle is the same as asking whether
+the two shapes come within `d` of each other, so the clearance is applied by
+measuring distance rather than by offsetting the obstacle polygons. Offsetting
+would mean handling miter joins and self-intersections; this is exact, works
+on concave polygons, and keeps the clearance a true Euclidean distance rather
+than something quantised to the grid.
+"""
+function polys_too_close(A::Matrix{Float64}, B::Matrix{Float64}, d::Real)
+    polys_overlap(A, B) && return true
+    d <= 0 && return false
+    na, nb = size(A, 2), size(B, 2)
+    @inbounds for i in 1:na
+        a1 = (A[1, i], A[2, i])
+        a2 = (A[1, mod1(i + 1, na)], A[2, mod1(i + 1, na)])
+        for j in 1:nb
+            b1 = (B[1, j], B[2, j])
+            b2 = (B[1, mod1(j + 1, nb)], B[2, mod1(j + 1, nb)])
+            seg_seg_dist(a1, a2, b1, b2) < d && return true
+        end
+    end
+    false
+end
+
+"""Same test for a point robot."""
+function point_too_close(px::Float64, py::Float64, B::Matrix{Float64}, d::Real)
+    inpoly(px, py, B) && return true
+    d <= 0 && return false
+    nb = size(B, 2)
+    @inbounds for j in 1:nb
+        b1 = (B[1, j], B[2, j])
+        b2 = (B[1, mod1(j + 1, nb)], B[2, mod1(j + 1, nb)])
+        pt_seg_dist((px, py), b1, b2) < d && return true
+    end
+    false
+end
+
 """
 Rasterise the configuration-space obstacle onto the (x, y, h) grid.
 
@@ -97,11 +153,17 @@ heading and is all the solver ever asks about. Each bin is unioned over
 `substeps` angles spanning the bin, so a heading between two samples cannot
 sneak through.
 
+`clearance_cm` is a safety gap held around every obstacle, applied *before*
+the robot's own shape is considered, so it is a plain "keep this far away"
+distance independent of how big the robot is. `margin_cm` is different and
+generally left at zero: it dilates the finished grid, which is only useful to
+force a very thin obstacle to occupy at least one cell.
+
 Result is Nx*Ny*Nh booleans -- still tiny next to the 6D value table.
 """
 function build_occupancy(g::Grid6, polys::Vector{Matrix{Float64}},
                          margin_cm::Real, robot::Union{Nothing,Matrix{Float64}},
-                         substeps::Int = 3)
+                         substeps::Int = 3, clearance_cm::Real = 0.0)
     nx, ny, nh = Int(g.n[1]), Int(g.n[2]), Int(g.n[3])
     occ = falses(nx, ny, nh)
     point_robot = robot === nothing || size(robot, 2) < 3
@@ -122,10 +184,11 @@ function build_occupancy(g::Grid6, polys::Vector{Matrix{Float64}},
 
             for P in polys
                 # Only sweep cells near this obstacle.
-                x0 = minimum(P[1, :]) - rad - margin_cm
-                x1 = maximum(P[1, :]) + rad + margin_cm
-                y0 = minimum(P[2, :]) - rad - margin_cm
-                y1 = maximum(P[2, :]) + rad + margin_cm
+                pad = rad + margin_cm + clearance_cm
+                x0 = minimum(P[1, :]) - pad
+                x1 = maximum(P[1, :]) + pad
+                y0 = minimum(P[2, :]) - pad
+                y1 = maximum(P[2, :]) + pad
                 i0 = max(0, floor(Int, (x0 - g.lo[1]) / g.step[1]))
                 i1 = min(nx - 1, ceil(Int, (x1 - g.lo[1]) / g.step[1]))
                 j0 = max(0, floor(Int, (y0 - g.lo[2]) / g.step[2]))
@@ -136,10 +199,12 @@ function build_occupancy(g::Grid6, polys::Vector{Matrix{Float64}},
                     px = Float64(axisvalue(g, 1, i))
                     py = Float64(axisvalue(g, 2, j))
                     if point_robot
-                        occ[i+1, j+1, k+1] = inpoly(px, py, P)
+                        occ[i+1, j+1, k+1] = point_too_close(px, py, P,
+                                                             clearance_cm)
                     else
                         body = Rr .+ [px; py]
-                        occ[i+1, j+1, k+1] = polys_overlap(body, P)
+                        occ[i+1, j+1, k+1] = polys_too_close(body, P,
+                                                             clearance_cm)
                     end
                 end
             end

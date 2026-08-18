@@ -11,6 +11,7 @@ rely on rather than agreeing with whatever the solver happened to write.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import math
@@ -26,16 +27,24 @@ DTYPE = {
 }
 
 
+BOM = codecs.BOM_UTF8
+
+
+def read_json(path: str):
+    """Read JSON, tolerating the UTF-8 BOM that Windows editors add."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw.startswith(BOM):
+        raw = raw[len(BOM):]
+    return json.loads(raw.decode("utf-8"))
+
+
 class Card:
     """Read-only view of a card image, addressed the way the robot addresses it."""
 
     def __init__(self, root: str):
         self.root = root
-        with open(os.path.join(root, "MANIFEST.JSON"), "rb") as fh:
-            raw = fh.read()
-        if raw[:3] == b"\xef\xbb\xbf":
-            raw = raw[3:]
-        self.m = json.loads(raw.decode("utf-8"))
+        self.m = read_json(os.path.join(root, "MANIFEST.JSON"))
         g = self.m["grid"]
         self.n = g["n"]
         self.lo = g["min"]
@@ -90,6 +99,61 @@ class Card:
     def close(self):
         for fh in self._fh.values():
             fh.close()
+
+
+def check_model(root: str, fails: list, warns: list) -> None:
+    """
+    Validate MODEL.JSON: the drivetrain the robot evaluates alongside the
+    tables.
+
+    Shapes are checked against the declared state and control vectors rather
+    than against hard-coded 3/6, so the file can gain terms later without this
+    needing to change.
+    """
+    path = os.path.join(root, "MODEL.JSON")
+    if not os.path.exists(path):
+        fails.append("MODEL.JSON is missing")
+        return
+    try:
+        m = read_json(path)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        fails.append(f"MODEL.JSON is not valid JSON: {e}")
+        return
+
+    ns = len(m["state"]["vector"])
+    nu = len(m["control"]["vector"])
+    no = len(m["output"]["vector"])
+    print()
+    print(f"  model: {no} outputs, state {ns}, control {nu}")
+    print(f"    {m['equation']}")
+
+    for name, rows, cols in (("A_s", no, ns), ("A_u", no, nu),
+                             ("A_ss", no, ns), ("A_uu", no, nu)):
+        M = m.get(name)
+        if M is None:
+            fails.append(f"MODEL.JSON has no {name}")
+            continue
+        if len(M) != rows or any(len(r) != cols for r in M):
+            fails.append(f"MODEL.JSON {name} should be {rows}x{cols}, "
+                         f"got {len(M)}x{len(M[0]) if M else 0}")
+    if len(m.get("k", [])) != no:
+        fails.append(f"MODEL.JSON k should have {no} entries")
+
+    nz = m.get("nonzero_blocks", [])
+    print(f"    non-zero blocks: {', '.join(nz) if nz else 'NONE'}")
+    if not nz:
+        fails.append("MODEL.JSON is entirely zero; the robot would never move")
+    if "A_u" not in nz:
+        fails.append("MODEL.JSON A_u is zero: control has no effect")
+    if m.get("constant_zeroed"):
+        print("    constant term zeroed, matching the solve")
+
+    # The tables index field-frame velocity but this model is body-frame; that
+    # mismatch is the easiest thing to get wrong on the robot, so make sure the
+    # file says so.
+    if "body" not in json.dumps(m.get("state", {})).lower():
+        warns.append("MODEL.JSON does not flag that its velocities are "
+                     "body-frame while the tables are field-frame")
 
 
 def main(root: str) -> int:
@@ -200,6 +264,9 @@ def main(root: str) -> int:
                      "unreachable (obstacle, or too coarse a grid)")
 
     card.close()
+
+    check_model(root, fails, warns)
+
     print()
     for w in warns:
         print(f"  WARN  {w}")

@@ -431,6 +431,11 @@ def gather_solver_config(ws: Workspace, run_dir: str) -> dict:
     vmax = ask_float("  max |velocity| cm/s", 150.0)
     wmax = ask_float("  max |omega| rad/s", 10.0)
     print()
+    print("  Clearance is a safety gap held around every obstacle, applied")
+    print("  before the robot's own footprint is swept in -- so it is just")
+    print("  'keep this far away', independent of how big the robot is.")
+    clearance = ask_float("  obstacle clearance cm", 5.0)
+    print()
     print("  Element type: u8 (1 B, 25 ms steps to 6.3 s), u16 (2 B, 1 ms to")
     print("  65.5 s, recommended), f16 (2 B, ~3 digits), f32 (4 B).")
     dtype = ask("  dtype", "u16")
@@ -447,6 +452,7 @@ def gather_solver_config(ws: Workspace, run_dir: str) -> dict:
         "targets": ws.targets_file,
         "out_dir": run_dir,
         "grid": {"n": n, "vmax": vmax, "wmax": wmax},
+        "clearance_cm": clearance,
         "dtype": dtype,
         "iterations": iters,
         "dt": dt,

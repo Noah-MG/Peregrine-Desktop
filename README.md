@@ -67,7 +67,9 @@ Pinpoint's 1.5 kHz velocity quantisation is handled.
 **2. Field and targets.** Two JSON files, with commented examples in
 `solver/examples/`. Obstacles are the **real** physical obstacles,
 un-inflated; the robot's own footprint goes under `robot` and the solver
-swells them itself, once per heading bin.
+swells them itself, once per heading bin. The solve also asks for a
+**clearance** (default 5 cm), a plain safety gap held around every obstacle
+before the footprint is swept in.
 
 It has to be per heading, and that is worth knowing: the configuration-space
 obstacle of a polygonal robot is **not** a polyhedron in `(x, y, h)`. Its
@@ -89,8 +91,10 @@ bin so nothing slips through in between.
 size and VRAM fit before committing, since these tables get very large very
 quickly.
 
-**4. Write the SD card.** Wipes the card and writes the tables plus
-`MANIFEST.JSON`. Nothing else goes on the card.
+**4. Write the SD card.** Wipes the card and writes the tables, plus
+`MANIFEST.JSON` describing them and `MODEL.JSON` carrying the drivetrain
+model itself — the online optimizer needs both. Nothing else goes on the
+card.
 
 ## Safety
 

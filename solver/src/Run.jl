@@ -56,6 +56,77 @@ function plan(cfg::AbstractDict)
 end
 
 """
+Build the dynamics model the robot needs alongside the tables.
+
+Written in a deliberately over-general form:
+
+    a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + k
+
+Most of those blocks are currently zero -- the fitted regression has no
+position dependence and no control-squared terms. They are emitted anyway so
+that the regression can gain or lose terms later without the robot-side
+reader needing to change: it always multiplies the same five things and adds
+them up.
+
+The matrices describe the model **as the solver actually used it**, so if
+`zero_c` was set the constant here is zero too. Otherwise the robot's
+dynamics would disagree with the tables that were solved from them.
+"""
+function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
+    row3(t, r) = [Float64(t[(r - 1) * 3 + c]) for c in 1:3]
+    Am = [row3(m.A, r) for r in 1:3]      # velocity -> acceleration
+    Bm = [row3(m.B, r) for r in 1:3]      # control  -> acceleration
+
+    # State is the same 6-vector the value tables use. Position and heading do
+    # not affect the dynamics, so those columns are zero.
+    A_s  = [[0.0, 0.0, 0.0, Am[r][1], Am[r][2], Am[r][3]] for r in 1:3]
+    # Only omega^2 is fitted, and it lands in the w column of s.*s.
+    A_ss = [[0.0, 0.0, 0.0, 0.0, 0.0, Float64(m.q[r])] for r in 1:3]
+    A_u  = Bm
+    A_uu = [[0.0, 0.0, 0.0] for _ in 1:3]
+    k    = [Float64(m.c[r]) for r in 1:3]
+
+    Dict(
+        "schema_version" => 1,
+        "generator" => "peregrine-desktop",
+        "regression_sha256" => filehash(reg_path),
+        "equation" => "a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + k",
+        "output" => Dict(
+            "vector" => ["a_x", "a_y", "alpha"],
+            "units" => ["cm/s^2", "cm/s^2", "rad/s^2"],
+            "frame" => "robot body",
+        ),
+        "state" => Dict(
+            "vector" => collect(AXES),
+            "units" => ["cm", "cm", "rad", "cm/s", "cm/s", "rad/s"],
+            "frame_note" => "IMPORTANT: vx and vy must be rotated into the " *
+                "ROBOT BODY frame before use here. The value tables index " *
+                "field-frame velocity, so rotate by -h between the two. " *
+                "Motor forces act along the body axes, which is why the " *
+                "model cannot be written with constant matrices in the " *
+                "field frame. x, y and h have zero coefficients throughout.",
+        ),
+        "control" => Dict(
+            "vector" => ["fwd", "strafe", "turn"],
+            "note" => "mecanum projection of the wheel powers; the " *
+                      "admissible set is |fwd| + |strafe| + |turn| <= 1",
+        ),
+        "A_s" => A_s,      # 3x6
+        "A_u" => A_u,      # 3x3
+        "A_ss" => A_ss,    # 3x6
+        "A_uu" => A_uu,    # 3x3
+        "k" => k,          # 3
+        "constant_zeroed" => zeroed_c,
+        "nonzero_blocks" => [b for (b, nz) in (
+            ("A_s", any(any(!iszero, r) for r in A_s)),
+            ("A_u", any(any(!iszero, r) for r in A_u)),
+            ("A_ss", any(any(!iszero, r) for r in A_ss)),
+            ("A_uu", any(any(!iszero, r) for r in A_uu)),
+            ("k", any(!iszero, k))) if nz],
+    )
+end
+
+"""
 Solve every target and write the card image.
 
 Tables are written into `out_dir/TABLES`, and the manifest to
@@ -96,6 +167,9 @@ function run_solve(cfg::AbstractDict)
     tol = Float64(getc(cfg, "tolerance", 1e-3))
     level = Int(getc(cfg, "control_level", 1))
     margin = Float64(getc(cfg, "margin_cm", 0.0))
+    # Safety gap held around every obstacle, applied before the robot's own
+    # footprint is swept in.
+    clearance = Float64(getc(cfg, "clearance_cm", 5.0))
     # Half a cell, so the seed is normally the single nearest cell. The online
     # optimizer owns the real arrival test; this only has to plant the seed.
     ttol = NTuple{6,Float32}(Float32.(getc(cfg, "target_tol",
@@ -115,12 +189,12 @@ function run_solve(cfg::AbstractDict)
              n_targets = length(names))
 
     hsub = Int(getc(cfg, "heading_substeps", 3))
-    occ_h = build_occupancy(g, polys, margin, robot, hsub)
+    occ_h = build_occupancy(g, polys, margin, robot, hsub, clearance)
     blocked = count(occ_h)
     progress(phase = "occupancy", blocked_cells = blocked,
              blocked_frac = blocked / length(occ_h),
              robot_vertices = robot === nothing ? 0 : size(robot, 2),
-             heading_substeps = hsub)
+             heading_substeps = hsub, clearance_cm = clearance)
 
     backend = String(getc(cfg, "backend", "auto"))
     use_gpu = backend == "cuda" || (backend == "auto" && CUDA.functional())
@@ -239,16 +313,25 @@ function run_solve(cfg::AbstractDict)
             "control_level" => level, "iterations_max" => iters,
             "tolerance" => tol, "nearest" => nearest,
             "sweep_checks" => checks, "zero_c" => Bool(getc(cfg, "zero_c", true)),
-            "margin_cm" => margin, "value_cap_s" => Float64(cap),
+            "margin_cm" => margin, "clearance_cm" => clearance,
+            "value_cap_s" => Float64(cap),
             "heading_substeps" => hsub,
             "robot_vertices" => robot === nothing ? 0 : size(robot, 2),
             "occupancy" => "per heading bin (x, y, h)",
         ),
+        "model_file" => "MODEL.JSON",
         "targets" => entries,
     )
     open(joinpath(out_dir, "MANIFEST.JSON"), "w") do io
         JSON3.pretty(io, manifest)
     end
+
+    mj = model_json(m, reg_path, Bool(getc(cfg, "zero_c", true)))
+    open(joinpath(out_dir, "MODEL.JSON"), "w") do io
+        JSON3.pretty(io, mj)
+    end
+    progress(phase = "model", file = "MODEL.JSON",
+             nonzero_blocks = mj["nonzero_blocks"])
     progress(phase = "done", out_dir = out_dir, targets = length(entries))
     manifest
 end
