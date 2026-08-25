@@ -27,6 +27,8 @@ import sdcard
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 FITTER = os.path.join(REPO, "calibration", "fit_drivetrain.py")
+DIAGNOSER = os.path.join(REPO, "calibration", "diagnose_fit.py")
+PODFINDER = os.path.join(REPO, "calibration", "find_pod_offsets.py")
 SOLVER = os.path.join(REPO, "solver", "solve.jl")
 SOLVER_PROJ = os.path.join(REPO, "solver")
 EXAMPLES = os.path.join(REPO, "solver", "examples")
@@ -107,8 +109,10 @@ def ask_float(prompt, default) -> float:
             print(c("    not a number", "31"))
 
 
-def confirm(prompt: str) -> bool:
-    return ask(f"{prompt} (y/N)", "n").lower().startswith("y")
+def confirm(prompt: str, default_yes: bool = False) -> bool:
+    suffix = "(Y/n)" if default_yes else "(y/N)"
+    got = ask(f"{prompt} {suffix}", "y" if default_yes else "n").lower()
+    return got.startswith("y")
 
 
 def human(n: float) -> str:
@@ -240,6 +244,74 @@ class Workspace:
 
 
 # --------------------------------------------------------------------------
+# Step 0 -- pod offsets (optional, but do it first)
+# --------------------------------------------------------------------------
+
+def step_pods(ws: Workspace) -> None:
+    """
+    Find the odometry pod offsets from a rotate-in-place log.
+
+    Optional, but it belongs before everything else: a wrong pod offset makes
+    the robot report a phantom sideways velocity whenever it turns, and the
+    drivetrain fit cannot tell that apart from real dynamics. It quietly
+    absorbs it and gives you a model that is wrong wherever the robot rotates.
+    """
+    rule("0. Pod offsets from a rotation-only run  (optional, do it first)")
+    print("  Spin the robot in place -- no translation, a few revolutions each")
+    print("  way -- and log it. If the offsets are right the reported position")
+    print("  stays put; if they are wrong it sweeps a circle, and the radius of")
+    print("  that circle is the error.")
+    print()
+    print(c("  Do this before step 1. A wrong offset contaminates every later", "33"))
+    print(c("  run, and the drivetrain fit will absorb it silently.", "33"))
+    print()
+
+    logs = find_logs(ws)
+    if not logs:
+        print(c("  No calibration_log_*.csv found on a card or in the workspace.",
+                "33"))
+        return
+    for i, (src, p_) in enumerate(logs, 1):
+        print(f"   {i:2d}. [{src}] {os.path.basename(p_)}")
+    print()
+    i = ask_int("Which log (a rotation-only one)", 1, 1, len(logs))
+    src, path = logs[i - 1]
+    local = os.path.join(ws.calib, os.path.basename(path))
+    if os.path.abspath(path) != os.path.abspath(local):
+        shutil.copy2(path, local)
+        print(f"  imported to {c(local, '36')}")
+
+    cur = ask("Offsets currently set on the robot, 'X Y' in CM "
+              "(blank if unknown)", "")
+    cmd = [sys.executable, PODFINDER, local,
+           "-o", os.path.join(ws.calib, "pod_offsets.json")]
+    if cur:
+        parts = cur.replace(",", " ").split()
+        if len(parts) == 2:
+            cmd += ["--current-offsets", parts[0], parts[1]]
+        else:
+            print(c("  could not read that as two numbers; continuing without",
+                    "33"))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        if r.stderr.strip():
+            print(c(r.stderr.strip()[:800], "31"))
+        return
+    rec = os.path.join(ws.calib, "pod_offsets.json")
+    try:
+        with open(rec, encoding="utf-8") as fh:
+            got = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return
+    if got.get("centred"):
+        print(c("  Nothing to change. Go on to step 1.", "32"))
+    else:
+        print(c("  Apply the change above, spin again, and re-run this step "
+                "to confirm.", "33"))
+
+
+# --------------------------------------------------------------------------
 # Step 1 -- calibration
 # --------------------------------------------------------------------------
 
@@ -289,10 +361,19 @@ def step_calibration(ws: Workspace) -> None:
         print(f"  imported to {c(local, '36')}")
 
     print()
+    # The defaults here mirror the fitter's own, so pressing Enter through
+    # this block gives the recommended model.
     extra: list[str] = []
-    if not confirm("Include the omega^2 centripetal term?"):
-        extra.append("--no-omega-sq")
-    if not confirm("Include the constant offset term?"):
+    print()
+    print("  Model terms. The defaults are the recommended ones -- press Enter")
+    print("  through these unless you have a reason not to.")
+    if not confirm("  Coulomb friction + quadratic drag (recommended)",
+                   default_yes=True):
+        extra += ["--no-coulomb", "--no-drag"]
+    if confirm("  omega^2 centripetal term (only if the pods are NOT centred)"):
+        extra.append("--omega-sq")
+    if not confirm("  Constant offset term (a diagnostic; should come out ~0)",
+                   default_yes=True):
         extra.append("--no-intercept")
 
     cmd = [sys.executable, FITTER, local, "-o", ws.calib,
@@ -306,6 +387,60 @@ def step_calibration(ws: Workspace) -> None:
         print(r.stderr.strip()[:2000])
         return
     print(c(f"  wrote {os.path.join(ws.calib, 'drivetrain_fit.toml')}", "32"))
+
+
+# --------------------------------------------------------------------------
+# Optional helper -- regression diagnostics
+# --------------------------------------------------------------------------
+
+def step_diagnose(ws: Workspace) -> None:
+    """
+    Optional: plot how well the regression fits and what model form to use.
+
+    Deliberately not one of the numbered steps -- nothing downstream needs it,
+    and a run is perfectly valid without ever opening it.
+    """
+    rule("Diagnose the regression fit  (optional)")
+    logs = [f for f in sorted(os.listdir(ws.calib)) if f.endswith(".csv")]
+    if not logs:
+        print(c("  No calibration CSV in the workspace -- run step 1 first.",
+                "33"))
+        return
+    print("  Plots how well the fitted model tracks the data, and scores")
+    print("  candidate model forms against each other by cross-validation, so")
+    print("  you can see whether linear is really the right shape.")
+    print()
+    for i, f in enumerate(logs, 1):
+        print(f"   {i:2d}. {f}")
+    print()
+    i = ask_int("Which log", 1, 1, len(logs))
+    log = os.path.join(ws.calib, logs[i - 1])
+
+    cmd = [sys.executable, DIAGNOSER, log]
+    # Mirror the preprocessing of the existing fit so the report describes
+    # that fit rather than a differently-preprocessed one.
+    if ws.regression:
+        cmd += ["--fit", ws.regression]
+        print(c("  matching the preprocessing of the current regression", "2"))
+    out = os.path.join(ws.calib, os.path.splitext(logs[i - 1])[0] +
+                       "_diagnostics.html")
+    cmd += ["-o", out]
+
+    print(c("  analysing...", "2"))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    # The tool already prints the report path; do not echo it twice.
+    for line in r.stdout.splitlines():
+        if not line.strip().startswith("report:"):
+            print(line)
+    if r.returncode != 0:
+        print(c("  diagnostics failed:", "31"))
+        print((r.stderr or "").strip()[:1500])
+        return
+    print()
+    print(c(f"  report: {out}", "32"))
+    if confirm("Open it in a browser?"):
+        import webbrowser
+        webbrowser.open("file:///" + out.replace("\\", "/"))
 
 
 # --------------------------------------------------------------------------
@@ -444,7 +579,14 @@ def gather_solver_config(ws: Workspace, run_dir: str) -> dict:
     print()
     iters = ask_int("  max iterations per target", 400, 1, 100000)
     dt = ask_float("  integration step dt (s)", 0.05)
-    level = ask_int("  control refinement level (1 = bang-bang, 7 controls)", 1, 1, 4)
+    print()
+    print("  Control sampling. Bang-bang puts the optimum on the boundary of")
+    print("  the reachable set, but not at its corners, so the boundary is")
+    print("  sampled. Level 1 is corners only and is measurably pessimistic;")
+    print("  higher costs solve time roughly in proportion to the count.")
+    print("    1 = 7 controls (corners only, not recommended)")
+    print("    2 = 19    3 = 39 (recommended)    4 = 67")
+    level = ask_int("  control refinement level", 3, 1, 4)
 
     return {
         "regression": ws.regression,
@@ -736,6 +878,20 @@ def status(ws: Workspace) -> None:
     print()
     print(f"  workspace  {c(ws.root, '36')}   {human(ws.free())} free")
     print()
+    pods = os.path.join(ws.calib, "pod_offsets.json")
+    pod_note = c("   (optional, do first)", "2")
+    if os.path.exists(pods):
+        try:
+            with open(pods, encoding="utf-8") as fh:
+                pr = json.load(fh)
+            pod_note = ("   (centred, %.2f cm)" % pr["delta_magnitude"]
+                        if pr.get("centred")
+                        else c("   (%.2f cm off -- fix it)"
+                               % pr["delta_magnitude"], "33"))
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+    print(f"  {mark(os.path.exists(pods))}  0. Pod offsets from a rotation run"
+          + pod_note)
     print(f"  {mark(bool(ws.regression))}  1. Calibration -> regression")
     print(f"  {mark(bool(ws.field_file and ws.targets_file))}  2. Field and targets")
     print(f"  {mark(bool(run))}  3. Solve value tables"
@@ -745,6 +901,8 @@ def status(ws: Workspace) -> None:
         when = card.get("written_utc", "")[:16].replace("T", " ")
         detail = f"   ({card['drive']}: {when}, {human(card.get('bytes', 0))})"
     print(f"  {mark(bool(card))}  4. Write the SD card{detail}")
+    print()
+    print(c("  d. diagnose the regression fit (optional)", "2"))
     print()
     print("  w. change workspace     q. quit")
 
@@ -758,8 +916,8 @@ def main() -> int:
     ws = Workspace(ws_path) if ws_path and os.path.isdir(
         os.path.dirname(ws_path) or ws_path) else pick_workspace(settings)
 
-    steps = {"1": step_calibration, "2": step_field, "3": step_solve,
-             "4": step_card}
+    steps = {"0": step_pods, "1": step_calibration, "2": step_field,
+             "3": step_solve, "4": step_card, "d": step_diagnose}
     while True:
         try:
             status(ws)

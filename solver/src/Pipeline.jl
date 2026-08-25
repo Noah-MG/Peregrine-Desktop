@@ -252,9 +252,26 @@ function load_model(path::AbstractString)
     A = NTuple{9,Float32}(Float32(mb["A"][r][c]) for r in 1:3 for c in 1:3)
     q = NTuple{3,Float32}(Float32(v) for v in mb["q"])
     c = NTuple{3,Float32}(Float32(v) for v in mb["c"])
+    # Coulomb and drag blocks arrived in schema 3; older fits simply lack them.
+    S = haskey(mb, "S") ?
+        NTuple{9,Float32}(Float32(mb["S"][r][cc]) for r in 1:3 for cc in 1:3) :
+        NTuple{9,Float32}(ntuple(_ -> 0.0f0, 9))
+    D = haskey(mb, "D") ?
+        NTuple{9,Float32}(Float32(mb["D"][r][cc]) for r in 1:3 for cc in 1:3) :
+        NTuple{9,Float32}(ntuple(_ -> 0.0f0, 9))
+    # TOML cannot express null, so a disabled knee comes through as NaN.
+    # Normalise both spellings to 0, which the kernel reads as "off".
+    knee = 0.0f0
+    if haskey(mb, "traction_knee") && mb["traction_knee"] !== nothing
+        kv = Float32(mb["traction_knee"])
+        knee = isnan(kv) ? 0.0f0 : kv
+    end
+    eps = haskey(mb, "coulomb_eps") ?
+        NTuple{3,Float32}(Float32(v) for v in mb["coulomb_eps"]) :
+        (5.0f0, 5.0f0, 0.15f0)
     units = get(get(cfg, "units", Dict()), "distance", "cm")
     units == "cm" || @warn "regression distance unit is '$units', solver assumes cm"
-    (Model(B, A, q, c), cfg)
+    (Model(B, A, q, S, D, c, eps, knee), cfg)
 end
 
 function _poly(pts, what)

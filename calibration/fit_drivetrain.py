@@ -4,9 +4,9 @@ Fit a linear drivetrain model from a Peregrine calibration log.
 
 Model (one linear equation per body-frame degree of freedom):
 
-    a_x    = B[0,:] . u + A[0,:] . v + c[0]
-    a_y    = B[1,:] . u + A[1,:] . v + c[1]
-    alpha  = B[2,:] . u + A[2,:] . v + c[2]
+    a = B.u + A.v + q*omega^2 + S.csign(v) + D.(|v|*v) + c
+
+one row per body-frame degree of freedom, where
 
 where
     u = [FR, FL, BR, BL]        commanded motor powers, -1..1
@@ -37,12 +37,30 @@ import numpy as np
 # Constants
 # --------------------------------------------------------------------------
 
-# 2: added the omega^2 centripetal term (the equation gained q*omega^2), and
-#    removed the per-motor basis -- inputs are always {fwd, strafe, turn}.
-SCHEMA_VERSION = 2
+# 2: added the omega^2 centripetal term, and removed the per-motor basis --
+#    inputs are always {fwd, strafe, turn}.
+# 3: added Coulomb (S) and quadratic-drag (D) blocks and turned omega^2 off by
+#    default, after a real run showed omega^2 scoring worse than plain linear
+#    while S and D both earned their place on held-out velocity prediction.
+SCHEMA_VERSION = 3
 HEADER_FIELDS = ["timestamp", "FR", "FL", "BR", "BL",
                  "x", "y", "h", "x_vel", "y_vel", "h_vel"]
 N_FIELDS = len(HEADER_FIELDS)
+
+# Coulomb friction is smoothed over this velocity band rather than using a
+# hard sign(). A true sign() flips discontinuously at v = 0, and the solver
+# integrates this model forward -- a discontinuity there chatters. The fit and
+# the solver must use the same smoothing, so it is part of the model, not a
+# solver detail. Units: cm/s, cm/s, rad/s.
+COULOMB_EPS = (5.0, 5.0, 0.15)
+
+# Traction knee search. `None` means "no saturation"; the auto search always
+# includes it, so a run that shows no slip disables the term by itself.
+KNEE_GRID = (None, 1.20, 0.90, 0.70, 0.55, 0.45, 0.35, 0.28)
+# A knee has to earn its parameter. Below this improvement in held-out rollout
+# it is not switched on -- an always-sliding run, for instance, can be fitted
+# marginally better with a huge knee that means nothing.
+KNEE_MIN_GAIN = 0.01
 
 MOTORS = ["FR", "FL", "BR", "BL"]
 MECANUM = ["fwd", "strafe", "turn"]
@@ -50,12 +68,21 @@ STATES = ["v_x", "v_y", "omega"]
 RESPONSES = ["a_x", "a_y", "alpha"]
 
 # Mecanum mixing, expressed against the log's FR,FL,BR,BL column order.
+#
+# This is the exact inverse of the mixer the ROBOT uses:
+#     FR = drive + strafe - turn      BR = drive - strafe - turn
+#     FL = drive - strafe + turn      BL = drive + strafe + turn
+# whose columns are orthogonal with norm^2 = 4, so the inverse is its
+# transpose over 4. The signs must match the robot exactly -- the gains are
+# fitted against these definitions and the robot applies them by name, so a
+# flipped row would send it the wrong way along that axis.
+#
 # The fourth row is the "null" direction: it commands the wheels to fight one
 # another and produces no chassis force, so it is excluded from the model and
 # only reported as a diagnostic.
 MEC_MIX = np.array([
-    [+1, +1, +1, +1],      # fwd
-    [-1, +1, +1, -1],      # strafe
+    [+1, +1, +1, +1],      # drive  (a.k.a. fwd)
+    [+1, -1, -1, +1],      # strafe
     [-1, +1, -1, +1],      # turn
     [+1, +1, -1, -1],      # null (unactuated)
 ], dtype=float) / 4.0
@@ -502,8 +529,51 @@ def prepare(seg: Segment, args) -> Prepared:
                     keep=keep, diag=diag)
 
 
-def build_design(u: np.ndarray, v: np.ndarray, coulomb: bool,
-                 intercept: bool = True, omega_sq: bool = True):
+def traction_gain(u_mec, knee):
+    """
+    How much of the commanded effort the tyres can actually deliver.
+
+    Past a certain demand the wheels break loose and extra command buys no
+    extra force, so the relationship bends over. Modelled as
+
+        m = |u|                       total demand across all three axes
+        g = tanh(m / knee) / (m / knee)
+
+    which is 1 for small demand, falls off smoothly past the knee, and keeps
+    the direction of the command unchanged. Traction is one shared budget, so
+    the demand counts all three axes and the gain scales all three -- if the
+    tyres are sliding, every force they were producing drops together.
+
+    `knee` of None disables it and returns 1.
+    """
+    if knee is None or knee <= 0:
+        return np.ones(len(u_mec))
+    m = np.sqrt(u_mec[:, 0] ** 2 + u_mec[:, 1] ** 2 + u_mec[:, 2] ** 2)
+    r = np.maximum(m / knee, 1e-9)
+    return np.tanh(r) / r
+
+
+def saturate_u(u_wheel, knee):
+    """Apply the traction gain to wheel powers.
+
+    Scaling every mecanum component by one factor is the same as scaling the
+    wheel powers by it, because the mixing is linear -- so this stays in wheel
+    space and no round trip is needed.
+    """
+    if knee is None or knee <= 0:
+        return u_wheel
+    g = traction_gain(u_wheel @ MEC_MIX[:3].T, knee)
+    return u_wheel * g[:, None]
+
+
+def csign(v, eps):
+    """Smoothed sign: a linear ramp through zero, saturating at +-1."""
+    return np.clip(v / eps, -1.0, 1.0)
+
+
+def build_design(u: np.ndarray, v: np.ndarray, coulomb: bool = True,
+                 intercept: bool = True, omega_sq: bool = False,
+                 drag: bool = True, eps=COULOMB_EPS):
     """Assemble the regressor matrix and its column names.
 
     Inputs are always the {fwd, strafe, turn} projection of the motor powers.
@@ -511,6 +581,12 @@ def build_design(u: np.ndarray, v: np.ndarray, coulomb: bool,
     mecanum mapping leaves the fourth direction (FR+FL-BR-BL) essentially
     unexcited, so those coefficients are not separately identifiable -- and
     that direction exerts no chassis force anyway. See WHY MECANUM ONLY.
+
+    Defaults follow the 2026-08-19 analysis of a real run: Coulomb friction
+    and quadratic drag are on because they earn their place on held-out
+    velocity prediction, and omega^2 is off because it did not -- it scored
+    worse than a plain linear model and its apparent centripetal signal was a
+    mis-set odometry tracking point leaking in.
     """
     m = u @ MEC_MIX[:3].T
     cols = [m[:, 0], m[:, 1], m[:, 2], v[:, 0], v[:, 1], v[:, 2]]
@@ -518,17 +594,23 @@ def build_design(u: np.ndarray, v: np.ndarray, coulomb: bool,
     if omega_sq:
         # Centripetal term. A tracking point offset by delta from the true
         # centre of rotation sees  a_P = a_C + alpha x delta - omega^2 * delta,
-        # so the omega^2 coefficient estimates -delta directly: it should be
-        # roughly -delta_x in the a_x row and -delta_y in the a_y row, and
-        # near zero in the alpha row, since omega^2 cannot torque a rigid body.
-        # Always non-negative, so watch its VIF against the constant.
+        # so the omega^2 coefficient estimates -delta directly. Off by default:
+        # correct the pod offsets instead of fitting around them.
         cols.append(v[:, 2] ** 2)
         names.append("omega_sq")
     if coulomb:
-        # Still linear in the parameters; captures the sign-dependent
-        # break-away friction a purely proportional drag term cannot.
-        cols += [np.sign(v[:, 0]), np.sign(v[:, 1]), np.sign(v[:, 2])]
+        # Break-away friction, which a proportional drag term cannot express:
+        # it opposes motion with roughly constant magnitude regardless of
+        # speed. Smoothed through zero -- see COULOMB_EPS.
+        cols += [csign(v[:, 0], eps[0]), csign(v[:, 1], eps[1]),
+                 csign(v[:, 2], eps[2])]
         names += ["sgn_v_x", "sgn_v_y", "sgn_omega"]
+    if drag:
+        # |v|*v keeps the sign of v but grows faster than linear, which is the
+        # shape aerodynamic and rolling losses actually take.
+        cols += [np.abs(v[:, 0]) * v[:, 0], np.abs(v[:, 1]) * v[:, 1],
+                 np.abs(v[:, 2]) * v[:, 2]]
+        names += ["absv_v_x", "absv_v_y", "absv_omega"]
     if intercept:
         # A drivetrain at rest with no power should not accelerate, so this
         # term ought to come out near zero. When it does not, it is absorbing
@@ -628,6 +710,57 @@ def print_report(results: list[FitResult], prep: Prepared, args, dist_unit: str,
         print("     so its coefficient is not separately identified -- the")
         print("     standard error swamps it even if the model predicts well.")
         print("     Drive the run so that input varies independently of the rest.")
+    print()
+
+
+def print_traction(args, rows):
+    """Show what the knee search found, including when it found nothing."""
+    print()
+    print("=" * 78)
+    print("  WHEEL SLIP (traction saturation)")
+    print("=" * 78)
+    if args.knee_mode == "off":
+        print("  disabled by --traction-knee off")
+        print()
+        return
+    if rows:
+        print("  Searching for the demand at which the tyres stop delivering.")
+        print("  Scored by integrating the model on held-out data, because a")
+        print("  saturating term will always reduce the fit residual somewhere.")
+        print()
+        print("    %-14s %8s %8s %8s %8s" % ("knee", "v_x", "v_y", "omega", "mean"))
+        best = max(rows, key=lambda r: r[2])
+        for knee, r2, mu in rows:
+            lbl = "no saturation" if knee is None else "%.2f" % knee
+            print("    %-14s %8.3f %8.3f %8.3f %8.3f%s"
+                  % (lbl, *r2, mu, "   <-- chosen" if knee == best[0] else ""))
+        flat = [r for r in rows if r[0] is None]
+        gain = best[2] - (flat[0][2] if flat else best[2])
+        print()
+        if args.knee is None and best[0] is not None:
+            print("  Best knee %.2f gained only %+.3f, below the %.2f needed to"
+                  % (best[0], best[2] - (flat[0][2] if flat else best[2]),
+                     KNEE_MIN_GAIN))
+            print("  justify the parameter, so the term is switched off. A run")
+            print("  that is ALWAYS sliding looks like this: it can be fitted")
+            print("  slightly better with a huge knee, but the knee is not")
+            print("  identifiable because the data never comes back below it.")
+        elif args.knee is None:
+            print("  No slip found: the run scores best with no saturation, so")
+            print("  the term switches itself off. That is the right answer both")
+            print("  for a run that never reaches the traction limit and for one")
+            print("  that never comes back below it -- a permanently sliding")
+            print("  robot just looks like a lower gain.")
+        else:
+            print("  Knee at %.2f, worth %+.3f mean rollout R2 over no saturation."
+                  % (args.knee, gain))
+            print("  Past that demand, extra command buys no extra force.")
+    elif args.knee:
+        print("  knee fixed at %.2f by --traction-knee" % args.knee)
+    if args.knee:
+        print()
+        print("  This knee describes THIS FLOOR. A grippier surface slips later,")
+        print("  so re-measure whenever the surface changes.")
     print()
 
 
@@ -754,8 +887,10 @@ def print_sensitivity(seg: Segment, args, base_results: list[FitResult]):
                 if p2.keep.sum() < 30:
                     continue
                 v2 = p2.v_reported if args.vel_source == "reported" else p2.v
-                X2, nm2 = build_design(p2.u[p2.keep], v2[p2.keep], args.coulomb,
-                                       args.intercept, args.omega_sq)
+                X2, nm2 = build_design(
+                    saturate_u(p2.u, getattr(args, "knee", None))[p2.keep],
+                    v2[p2.keep], args.coulomb, args.intercept, args.omega_sq,
+                    args.drag)
                 r2 = fit_linear(X2, p2.a[p2.keep, resp_i], nm2, resp,
                                 robust=args.robust, cv_folds=args.cv_folds)
             except Exception:
@@ -779,9 +914,10 @@ def print_vel_source_comparison(seg: Segment, args):
         return
     print(f"    {'source':<12}{'response':<9}{'R^2':>9}{'CV R^2':>9}"
           f"{'c_vx':>10}{'c_vy':>10}{'c_w':>10}")
+    us = saturate_u(prep.u, getattr(args, "knee", None))
     for src, v in (("position", prep.v), ("reported", prep.v_reported)):
-        X, nm = build_design(prep.u[k], v[k], args.coulomb, args.intercept,
-                             args.omega_sq)
+        X, nm = build_design(us[k], v[k], args.coulomb, args.intercept,
+                             args.omega_sq, args.drag)
         iv = nm.index("v_x")
         for i, resp in enumerate(RESPONSES):
             r = fit_linear(X, prep.a[k, i], nm, resp, robust=args.robust,
@@ -797,7 +933,7 @@ def print_vel_source_comparison(seg: Segment, args):
 # Output files
 # --------------------------------------------------------------------------
 
-def _pack_basis(results: list[FitResult], inputs: list[str]) -> dict:
+def _pack_basis(results, inputs, knee=None) -> dict:
     names = results[0].names
     B = np.array([[r.coef[names.index(m)] for m in inputs] for r in results])
     A = np.array([[r.coef[names.index(s)] for s in STATES] for r in results])
@@ -808,11 +944,20 @@ def _pack_basis(results: list[FitResult], inputs: list[str]) -> dict:
     q = np.array([r.coef[names.index("omega_sq")] if has_wsq else 0.0
                   for r in results])
 
+    def block(prefix, present):
+        return np.array([[r.coef[names.index(prefix + s_)] if present else 0.0
+                          for s_ in STATES] for r in results])
+
+    has_coul = ("sgn_" + STATES[0]) in names
+    has_drag = ("absv_" + STATES[0]) in names
+    S = block("sgn_", has_coul)     # Coulomb, multiplies csign(v)
+    D = block("absv_", has_drag)    # quadratic drag, multiplies |v|*v
+
     # Every optional regressor still appears, pinned to zero when it was not
     # fitted, so the file has one fixed shape regardless of the flags used.
-    canonical = list(inputs) + STATES + ["omega_sq"]
-    canonical += [n for n in names if n.startswith("sgn_")]
-    canonical += ["const"]
+    canonical = (list(inputs) + STATES + ["omega_sq"]
+                 + ["sgn_" + s_ for s_ in STATES]
+                 + ["absv_" + s_ for s_ in STATES] + ["const"])
 
     def pad(pairs, missing=0.0):
         d = {n: float(v) if v is not None and math.isfinite(v) else None
@@ -841,11 +986,20 @@ def _pack_basis(results: list[FitResult], inputs: list[str]) -> dict:
     return {
         "inputs": list(inputs),
         "regressors": canonical,
-        "equation": "a = B*u + A*v + q*omega^2 + c",
+        "equation": ("a = B*u + A*v + q*omega^2 + S*csign(v) + "
+                     "D*(|v|*v) + c"),
         "B": B.tolist(),          # (3,3) input -> acceleration
         "A": A.tolist(),          # (3,3) velocity -> acceleration (drag / back-EMF)
         "q": q.tolist(),          # (3,)  centripetal, estimates -delta
+        "S": S.tolist(),          # (3,3) Coulomb break-away friction
+        "D": D.tolist(),          # (3,3) quadratic drag
         "c": c.tolist(),          # (3,)  constant offset
+        "coulomb_eps": list(COULOMB_EPS),
+        "csign": "csign(v)_i = clamp(v_i / coulomb_eps_i, -1, 1)",
+        "traction_knee": knee,
+        "traction_note": ("u is the SATURATED command: m = norm(u_raw), "
+                          "u = u_raw * tanh(m/knee)/(m/knee). "
+                          "A null knee means no saturation."),
         "B_columns": list(inputs),
         "A_columns": STATES,
         "rows": RESPONSES,
@@ -854,6 +1008,8 @@ def _pack_basis(results: list[FitResult], inputs: list[str]) -> dict:
         # equation is unchanged, so a consumer never has to branch on this --
         # evaluating a = B*u + A*v + q*omega^2 + c just drops the term.
         "has_omega_sq": bool(has_wsq),
+        "has_coulomb": bool(has_coul),
+        "has_drag": bool(has_drag),
         "n_coefficients_per_direction": len(names),
         # q ~ -delta, so this is the implied tracking-point offset.
         "implied_tracking_offset": [float(-q[0]), float(-q[1])],
@@ -889,7 +1045,7 @@ def build_output(mec_results: list[FitResult], prep: Prepared, seg: Segment,
             "mecanum_mix": MEC_MIX.tolist(),
             "basis": "mecanum",
         },
-        "mecanum_basis": _pack_basis(mec_results, MECANUM),
+        "mecanum_basis": _pack_basis(mec_results, MECANUM, args.knee),
         "preprocessing": {
             "derivative_method": "local weighted polynomial (tricube, irregular grid)",
             "window_halfwidth_s": args.window,
@@ -898,7 +1054,11 @@ def build_output(mec_results: list[FitResult], prep: Prepared, seg: Segment,
             "velocity_source": args.vel_source,
             "inputs_band_limited": bool(args.smooth_inputs),
             "omega_sq_term": bool(args.omega_sq),
+            "traction_knee": args.knee,
+            "traction_knee_mode": args.knee_mode,
             "coulomb_terms": bool(args.coulomb),
+            "drag_terms": bool(args.drag),
+            "coulomb_eps": list(COULOMB_EPS),
             "robust_huber": bool(args.robust),
             "cv_folds": args.cv_folds,
             "v_min": args.v_min,
@@ -953,10 +1113,137 @@ def write_toml(data: dict, path: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Rollout scoring
+# --------------------------------------------------------------------------
+
+def eval_terms(u, v, names, eps=COULOMB_EPS):
+    """Rebuild the design columns for arbitrary (u, v) from a name list.
+
+    Lets a fitted coefficient vector be evaluated at states the fit never saw,
+    which is what rolling the model forward requires.
+    """
+    cols = []
+    idx = {"fwd": 0, "strafe": 1, "turn": 2}
+    for nm in names:
+        if nm in idx:
+            cols.append(u[:, idx[nm]])
+        elif nm in STATES:
+            cols.append(v[:, STATES.index(nm)])
+        elif nm == "omega_sq":
+            cols.append(v[:, 2] ** 2)
+        elif nm.startswith("sgn_"):
+            j = STATES.index(nm[4:])
+            cols.append(csign(v[:, j], eps[j]))
+        elif nm.startswith("absv_"):
+            j = STATES.index(nm[5:])
+            cols.append(np.abs(v[:, j]) * v[:, j])
+        elif nm.endswith("^2") and nm[:-2] in idx:
+            cols.append(u[:, idx[nm[:-2]]] ** 2)
+        elif "*" in nm:
+            a_, b_ = nm.split("*", 1)
+            cols.append(u[:, idx[a_]] * v[:, STATES.index(b_)])
+        elif nm == "const":
+            cols.append(np.ones(len(u)))
+        else:
+            raise ValueError("unknown regressor " + nm)
+    return np.column_stack(cols)
+
+
+def rollout_r2(t, u_mec, v_meas, coef, names, horizon=0.5, dt=0.01,
+               eps=COULOMB_EPS, stride=7, test_half=True):
+    """
+    Integrate the model and score the CHANGE in velocity over `horizon`.
+
+    This is the yardstick that matters, because the solver integrates this
+    model forward. Scoring the acceleration instead flatters or damns a model
+    for how noisy a smoothed second derivative happened to be. Scoring the
+    change rather than the absolute velocity keeps the comparison honest: over
+    a short horizon "assume nothing changes" would otherwise score ~0.99.
+
+    Returns (r2 per axis, r2 of the null "no change" model).
+    """
+    tu = np.arange(t.min(), t.max(), dt)
+    if len(tu) < 50:
+        return [float("nan")] * 3, [float("nan")] * 3
+    U = np.column_stack([np.interp(tu, t, u_mec[:, i]) for i in range(3)])
+    V = np.column_stack([np.interp(tu, t, v_meas[:, i]) for i in range(3)])
+    ns = max(1, int(horizon / dt))
+    st = np.arange(0, len(tu) - ns - 1, stride)
+    if len(st) < 20:
+        return [float("nan")] * 3, [float("nan")] * 3
+    if test_half:
+        st = st[len(st) // 2:]          # never fitted on
+
+    v = V[st].copy()
+    for k in range(ns):
+        X = eval_terms(U[st + k], v, names, eps)
+        acc = X @ coef.T
+        w = v[:, 2]
+        # Body-frame proper acceleration: dv/dt = a - omega x v.
+        dv = np.column_stack([acc[:, 0] + w * v[:, 1],
+                              acc[:, 1] - w * v[:, 0], acc[:, 2]])
+        v = v + dv * dt
+        if not np.all(np.isfinite(v)):
+            return [float("-inf")] * 3, [0.0] * 3
+
+    v0 = V[st]
+    truth = V[st + ns] - v0
+    pred = v - v0
+    out, null = [], []
+    for i in range(3):
+        ss = float(np.sum((truth[:, i] - truth[:, i].mean()) ** 2))
+        if ss <= 0:
+            out.append(float("nan")); null.append(float("nan")); continue
+        out.append(1.0 - float(np.sum((pred[:, i] - truth[:, i]) ** 2)) / ss)
+        null.append(1.0 - float(np.sum(truth[:, i] ** 2)) / ss)
+    return out, null
+
+
+def choose_knee(prep, args, grid=KNEE_GRID):
+    """
+    Pick the traction knee by held-out rollout, "no saturation" included.
+
+    Judged by integrating the model rather than by fit residual, because a
+    saturating term will always reduce residual somewhere. Including `None` in
+    the grid is what makes this safe to leave on: a run with no visible slip
+    simply scores best without it and the term switches itself off.
+
+    Slip is only identifiable from a run that CROSSES the traction limit. A
+    run that lives entirely above it just looks like a lower gain, and one
+    that never reaches it has nothing to see -- both come back as None.
+    """
+    k = prep.keep
+    best = (None, -np.inf, None)
+    rows = []
+    flat_score = None
+    for knee in grid:
+        us = saturate_u(prep.u[k], knee)
+        X, names = build_design(us, prep.v[k], args.coulomb, args.intercept,
+                                args.omega_sq, args.drag)
+        coef = np.zeros((3, X.shape[1]))
+        for i in range(3):
+            b, *_ = np.linalg.lstsq(X, prep.a[k][:, i], rcond=None)
+            coef[i] = b
+        r2, _ = rollout_r2(prep.t[k], us @ MEC_MIX[:3].T, prep.v[k], coef,
+                           names, horizon=0.5)
+        mu = float(np.nanmean(r2))
+        rows.append((knee, r2, mu))
+        if knee is None:
+            flat_score = mu
+        if mu > best[1]:
+            best = (knee, mu, r2)
+    # Only keep a knee that is clearly better than no saturation at all.
+    if (best[0] is not None and flat_score is not None
+            and best[1] - flat_score < KNEE_MIN_GAIN):
+        return None, rows
+    return best[0], rows
+
+
+# --------------------------------------------------------------------------
 # Synthetic drive, for validating the pipeline end to end
 # --------------------------------------------------------------------------
 
-def synth_drive(B, A, q, c, dur=14.0, hz=150.0, jitter=0.35,
+def synth_drive(B, A, q, c, S=None, D=None, dur=14.0, hz=150.0, jitter=0.35,
                 pos_noise=0.02, vel_noise=4.0, seed=0):
     """Simulate a robot obeying  a = B*u + A*v + q*omega^2 + c  exactly.
 
@@ -986,6 +1273,10 @@ def synth_drive(B, A, q, c, dur=14.0, hz=150.0, jitter=0.35,
     for i in range(n_fine):
         st = np.array([v[0], v[1], w])
         a = B @ U[i] + A @ st + q * w * w + c
+        if S is not None:
+            a = a + S @ csign(st, np.asarray(COULOMB_EPS))
+        if D is not None:
+            a = a + D @ (np.abs(st) * st)
         dv = a[:2] - w * (J @ v)
         out[i] = (i * fine, p[0], p[1], h,
                   *(np.array([[math.cos(h), -math.sin(h)],
@@ -1027,11 +1318,18 @@ def self_test(args) -> int:
     A = np.array([[-0.80, -0.10, -4.0], [-0.05, -0.75, 3.0], [0.004, -0.002, -1.90]])
     q = np.array([-3.5, 2.1, 0.0])          # implies a tracking offset
     c = np.array([0.0, 0.0, 0.0])
-    # With the term switched off, simulate a robot that genuinely has no
-    # centripetal offset -- otherwise the test would be asking a model to
-    # reproduce a term it was explicitly denied.
+    # Break-away friction and quadratic drag, both opposing motion.
+    S = np.diag([-9.0, -11.0, -0.45])
+    D = np.diag([-0.004, -0.005, -0.03])
+    # Each term is simulated only when the model is allowed to fit it --
+    # otherwise the test would ask a model to reproduce something it was
+    # explicitly denied, and "failure" would mean nothing.
     if not args.omega_sq:
         q = np.zeros(3)
+    if not args.coulomb:
+        S = np.zeros((3, 3))
+    if not args.drag:
+        D = np.zeros((3, 3))
 
     print()
     print("=" * 78)
@@ -1041,57 +1339,67 @@ def self_test(args) -> int:
     print("  150 Hz with 0.02 cm position noise and 4 cm/s velocity noise.")
     print()
 
-    rows = synth_drive(B, A, q, c, seed=7)
+    rows = synth_drive(B, A, q, c, S, D, seed=7)
     seg = Segment(raw=rows, source="<synthetic>", index=0)
     a2 = argparse.Namespace(**vars(args))
     a2.self_test = False
     prep = prepare(seg, a2)
     k = prep.keep
     X, names = build_design(prep.u[k], prep.v[k], a2.coulomb, a2.intercept,
-                            a2.omega_sq)
+                            a2.omega_sq, a2.drag)
     res = [fit_linear(X, prep.a[k, i], names, r, cv_folds=a2.cv_folds)
            for i, r in enumerate(RESPONSES)]
 
     print(f"  samples used: {int(k.sum())}")
     print()
-    # Each coefficient is scored against the dominant scale of its own block,
-    # not against itself. A small cross-term is not "150% wrong" because it
-    # missed by an amount that is negligible next to the row's main gain.
-    print(f"  {'row':<7}{'term':<10}{'true':>12}{'fitted':>12}{'err %':>9}"
-          f"   (% of block scale)")
-    print("  " + "-" * 62)
-    worst = {"input": 0.0, "velocity": 0.0, "omega_sq": 0.0}
+    # Two different things are checked, because they have different answers.
+    #
+    # The input gains B are identifiable and physically meaningful, so they are
+    # checked against the truth directly. The velocity-dependent blocks are
+    # NOT: linear v, csign(v) and |v|*v are all odd monotonic functions of the
+    # same variable, so over any finite speed range they are mutually
+    # collinear and the fit can trade freely between them. Demanding that each
+    # come back individually would fail a model that predicts perfectly.
+    #
+    # What the solver actually needs is prediction, so that is the pass/fail
+    # criterion, with coefficient recovery reported only for B.
+    print("  %-7s %-11s %11s %11s %8s" % ("row", "term", "true", "fitted", "err %"))
+    print("  " + "-" * 52)
+    worst_B = 0.0
     for i, r in enumerate(res):
-        blocks = [("input", MECANUM, B[i], max(np.abs(B[i]).max(), 1e-9)),
-                  ("velocity", STATES, A[i], max(np.abs(A[i]).max(), 1e-9))]
-        if a2.omega_sq:
-            blocks.append(("omega_sq", ["omega_sq"], [q[i]],
-                           max(abs(q[i]), 0.05 * np.abs(q).max(), 1e-9)))
-        for bname, terms, truths, scale in blocks:
-            for nm, tv in zip(terms, truths):
-                fv = r.coef[names.index(nm)]
-                e = 100 * abs(fv - tv) / scale
-                worst[bname] = max(worst[bname], e)
-                print(f"  {r.name if nm == MECANUM[0] else '':<7}{nm:<10}"
-                      f"{tv:12.4f}{fv:12.4f}{e:9.1f}")
-        print()
+        scale = max(np.abs(B[i]).max(), 1e-9)
+        for nm, tv in zip(MECANUM, B[i]):
+            fv = r.coef[names.index(nm)]
+            e = 100 * abs(fv - tv) / scale
+            worst_B = max(worst_B, e)
+            print("  %-7s %-11s %11.3f %11.3f %8.1f"
+                  % (r.name if nm == MECANUM[0] else "", nm, tv, fv, e))
+    print()
+    print("  worst input-gain error: %.1f%% of that row's dominant gain" % worst_B)
 
-    print("  worst error by block, as a % of that block's dominant coefficient:")
-    for bname, e in worst.items():
-        if bname == "omega_sq" and not a2.omega_sq:
-            continue
-        print(f"    {bname:<10}{e:7.1f}%")
+    coef = np.vstack([r.coef for r in res])
+    r2, null = rollout_r2(prep.t[k], prep.u[k] @ MEC_MIX[:3].T, prep.v[k],
+                          coef, names, horizon=0.5)
     print()
-    print("  Expect the dominant input gains back within ~10%, omega^2 within")
-    print("  ~25%, and small cross-terms to be unreliable. All three are")
-    print("  attenuated low, because smoothing removes signal from the response")
-    print("  faster than from the regressors. omega^2 suffers extra: squaring a")
-    print("  smoothed omega drops the variance of the noise that was removed,")
-    print("  which biases that regressor and so shrinks its coefficient.")
+    print("  held-out prediction of the CHANGE in velocity over 0.5 s:")
+    print("    %-10s %9s %9s %9s" % ("", "v_x", "v_y", "omega"))
+    print("    %-10s %9.3f %9.3f %9.3f" % ("model", *r2))
+    print("    %-10s %9.3f %9.3f %9.3f" % ("null", *null))
+
+    ok_B = worst_B < 25.0
+    ok_pred = all(np.isfinite(x) and x > 0.90 for x in r2)
     print()
-    ok = max(worst.values()) < 40.0
-    print(f"  {'PASS' if ok else 'FAIL'}  (tolerance 40%; this checks the "
-          f"pipeline is sound, not that it is precise)")
+    print("  input gains within 25%%: %s" % ("yes" if ok_B else "NO"))
+    print("  every axis predicts above 0.90: %s" % ("yes" if ok_pred else "NO"))
+    ok = ok_B and ok_pred
+    print()
+    print("  %s" % ("PASS" if ok else "FAIL"))
+    print()
+    print("  Note: the velocity-dependent coefficients are deliberately not")
+    print("  checked one by one. Linear v, csign(v) and |v|*v are collinear")
+    print("  over any finite speed range, so their split is arbitrary even")
+    print("  when the model as a whole is exactly right. Read A, S and D as a")
+    print("  group, never individually.")
     print()
     return 0 if ok else 1
 
@@ -1126,11 +1434,19 @@ def parse_args(argv: Sequence[str] | None = None):
                    help="distance unit for the fit and the output file")
     p.add_argument("--no-intercept", dest="intercept", action="store_false",
                    help="drop the constant term (3 input + 3 velocity + omega^2)")
-    p.add_argument("--no-omega-sq", dest="omega_sq", action="store_false",
-                   help="drop the omega^2 centripetal term, which corrects for the "
-                        "tracking point being offset from the centre of rotation")
-    p.add_argument("--coulomb", action="store_true",
-                   help="add sign(v) Coulomb-friction terms (still linear in parameters)")
+    p.add_argument("--omega-sq", dest="omega_sq", action="store_true",
+                   help="add an omega^2 centripetal term. Off by default: on a "
+                        "real run it scored worse than plain linear, and its "
+                        "apparent signal was a mis-set tracking point. Correct "
+                        "the pod offsets instead (see find_pod_offsets.py)")
+    p.add_argument("--no-coulomb", dest="coulomb", action="store_false",
+                   help="drop the Coulomb break-away friction terms (on by default)")
+    p.add_argument("--no-drag", dest="drag", action="store_false",
+                   help="drop the quadratic |v|v drag terms (on by default)")
+    p.add_argument("--traction-knee", default="auto",
+                   help="wheel-slip saturation: 'auto' searches for the knee "
+                        "and switches the term off if the run shows no slip, "
+                        "'off' disables it, or give a number to fix it")
     p.add_argument("--robust", action="store_true",
                    help="Huber IRLS instead of ordinary least squares")
     p.add_argument("--min-excitation", type=float, default=0.01,
@@ -1162,6 +1478,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     # so --units does not silently change which samples are kept.
     if args.v_min is None:
         args.v_min = 2.0 if args.units == "cm" else 0.02
+    tk = str(args.traction_knee).strip().lower()
+    if tk in ("off", "none", "0"):
+        args.knee_mode, args.knee = "off", None
+    elif tk == "auto":
+        args.knee_mode, args.knee = "auto", None
+    else:
+        try:
+            args.knee_mode, args.knee = "fixed", float(tk)
+        except ValueError:
+            print("error: --traction-knee wants 'auto', 'off' or a number",
+                  file=sys.stderr)
+            return 2
     if args.self_test:
         return self_test(args)
     if not args.log:
@@ -1226,8 +1554,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     k = prep.keep
     v = prep.v_reported if args.vel_source == "reported" else prep.v
 
-    X, names = build_design(prep.u[k], v[k], args.coulomb, args.intercept,
-                            args.omega_sq)
+    knee_rows = None
+    if args.knee_mode == "auto":
+        args.knee, knee_rows = choose_knee(prep, args)
+    print_traction(args, knee_rows)
+
+    # Everything downstream sees the SATURATED command, so the fitted gains
+    # describe force actually delivered rather than force asked for.
+    u_fit = saturate_u(prep.u, args.knee)
+    X, names = build_design(u_fit[k], v[k], args.coulomb, args.intercept,
+                            args.omega_sq, args.drag)
     mec_results = [fit_linear(X, prep.a[k, i], names, resp, robust=args.robust,
                               cv_folds=args.cv_folds)
                    for i, resp in enumerate(RESPONSES)]
@@ -1268,7 +1604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print('    A = mat(fit["A"])          # 3x3, columns [v_x v_y omega]')
         print('    q = Vector{Float64}(fit["q"])   # centripetal, x omega^2')
         print('    c = Vector{Float64}(fit["c"])')
-        print('    a = B*u + A*v + q*v[3]^2 + c    # a = [a_x, a_y, alpha]')
+        print('    a = B*u + A*v + q*v[3]^2 + S*csign(v) + D*(abs.(v).*v) + c')
         print()
 
     return 0

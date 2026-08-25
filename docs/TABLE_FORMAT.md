@@ -304,49 +304,162 @@ The tables say how long a route takes. They do not say how the robot moves,
 and the online optimizer needs both, so `/MODEL.JSON` carries the fitted
 drivetrain alongside them.
 
+This section is the whole thing: what the file contains, the order to
+evaluate it in, and the three places it is easy to get wrong.
+
+### 8.1 What it computes
+
+Given a **command** and a **state**, it returns the **acceleration** the robot
+will produce.
+
+| symbol | size | is | units |
+| --- | ---: | --- | --- |
+| `u_raw` | 3 | commanded `[fwd, strafe, turn]`, each in −1…1 | — |
+| `s` | 6 | state `[x, y, h, vx, vy, w]` | cm, rad, cm/s, rad/s |
+| `a` | 3 | resulting `[a_x, a_y, alpha]` | cm/s², rad/s² |
+
+Two conventions that are not negotiable, both covered again in §8.5:
+
+- **`vx`, `vy` in `s` must be BODY frame here.** The value tables index
+  field-frame velocity. Rotate by `−h` before evaluating this model.
+- **`a` is the *proper* body-frame acceleration.** Integrating it to get a
+  velocity needs the Coriolis term removed — see §8.4.
+
+### 8.2 The equation
+
 ```
-a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + k
+u = u_raw * traction_gain(u_raw)                          (1) wheel slip
+
+a = A_u   * u
+  + A_uu  * (u .* u)
+  + A_s   * s
+  + A_ss  * (s .* s)
+  + A_sgn * csign(s)
+  + A_absv* (abs(s) .* s)
+  + k                                                     (2) acceleration
 ```
 
-where `.*` is elementwise squaring, and
+`.*` is elementwise multiplication. Every matrix comes straight out of
+`MODEL.JSON`:
 
-| symbol | shape | meaning |
+| field | shape | multiplies |
 | --- | --- | --- |
-| `a` | 3 | output acceleration, `[a_x, a_y, alpha]` |
-| `s` | 6 | state, the same `[x, y, h, vx, vy, w]` as everywhere else |
-| `u` | 3 | control, `[fwd, strafe, turn]` |
-| `A_s` | 3x6 | state to acceleration |
-| `A_u` | 3x3 | control to acceleration |
-| `A_ss` | 3x6 | squared state to acceleration |
-| `A_uu` | 3x3 | squared control to acceleration |
-| `k` | 3 | constant |
+| `A_u` | 3×3 | `u` |
+| `A_uu` | 3×3 | `u .* u` |
+| `A_s` | 3×6 | `s` |
+| `A_ss` | 3×6 | `s .* s` |
+| `A_sgn` | 3×6 | `csign(s)` |
+| `A_absv` | 3×6 | `abs(s) .* s` |
+| `k` | 3 | — |
 
 Read the shapes from the declared `state`, `control` and `output` vectors
 rather than hard-coding 3 and 6.
 
-Several blocks are currently all zero: the fit has no position dependence, so
-the `x`, `y` and `h` columns of `A_s` and `A_ss` are zero, and there are no
-control-squared terms, so `A_uu` is zero throughout. They are written out
-anyway. The point is that the regression can gain or lose terms later without
-the robot-side reader changing — it always multiplies the same five things and
-sums them. `nonzero_blocks` lists which are actually carrying anything, if you
-want to skip the rest for speed.
+Several blocks are usually zero. The dynamics have no position dependence, so
+the `x, y, h` columns of every state block are zero; there are no
+control-squared terms, so `A_uu` is zero; and `A_ss` is zero whenever the
+`omega²` term is off, which is the normal case. **`nonzero_blocks` lists the
+ones actually carrying anything** — skip the rest if you want the speed. They
+are all emitted regardless so the equation never changes shape.
 
-### Two things that will bite
+### 8.3 The two helper functions
 
-**The velocities in `s` must be body frame here.** The value tables index
-field-frame velocity, because that is what odometry gives you. This model is
-body frame, because motor forces act along the robot's own axes — which is
-exactly why it *can* be written with constant matrices. Rotate `vx, vy` by
-`-h` before evaluating the model, and rotate back afterwards if you need the
-result in field terms. `alpha` and `w` are the same in both frames.
+**Traction gain** — wheel slip. Past a certain demand the tyres stop
+delivering and extra command buys no extra force.
 
-**`k` reflects what the solver used, not the raw fit.** If the solve zeroed
-the constant term, `k` is zero here too, and `constant_zeroed` says so.
-Otherwise the robot's dynamics would disagree with the tables solved from
-them.
+```
+knee = MODEL.JSON -> control.saturation.knee
 
----
+traction_gain(u_raw):
+    if knee is null or knee <= 0:  return 1
+    m = sqrt(fwd² + strafe² + turn²)         # one shared traction budget
+    r = m / knee
+    if r < 1e-6:                   return 1  # avoid 0/0
+    return tanh(r) / r
+```
+
+It is 1 for small demand, falls off smoothly past the knee, and never changes
+the *direction* of the command — only its magnitude. Because it is derived
+from the total demand and scales all three components, a robot that is sliding
+loses translation and rotation authority together.
+
+**`csign`** — Coulomb friction, smoothed.
+
+```
+eps = MODEL.JSON -> csign.coulomb_eps        # 6 entries, matching s
+
+csign(s)_i = clamp(s_i / eps_i, -1, 1)
+```
+
+This is **not** `sign()`. A true sign flips discontinuously at zero and makes
+any integrator chatter there. The desktop fit uses this exact smoothed form,
+so departing from it means the robot no longer matches the tables it was
+given. The `x, y, h` entries of `eps` are 0 and unused; their coefficients are
+zero anyway.
+
+### 8.4 Evaluation order
+
+```
+ 1. read u_raw = [fwd, strafe, turn]        the command you are about to send
+ 2. read the robot state, field frame
+ 3. rotate velocity into the BODY frame:
+        vbx = +cos(h)*vx_field + sin(h)*vy_field
+        vby = -sin(h)*vx_field + cos(h)*vy_field
+        s   = [x, y, h, vbx, vby, w]
+ 4. u = u_raw * traction_gain(u_raw)                       §8.3
+ 5. a = A_u*u + A_uu*(u.*u) + A_s*s + A_ss*(s.*s)
+        + A_sgn*csign(s) + A_absv*(abs(s).*s) + k          §8.2
+ 6. a is now [a_x, a_y, alpha], body frame, PROPER acceleration
+```
+
+To step a simulation forward from `a`, remove the Coriolis term:
+
+```
+    dvbx/dt = a_x   + w * vby
+    dvby/dt = a_y   - w * vbx
+    dw/dt   = alpha
+    dh/dt   = w
+    d(x,y)/dt = R(h) * [vbx, vby]           back to the field frame
+```
+
+That `± w * v` is not optional. `a` is what an accelerometer bolted to the
+chassis would read; the rate of change of the body-frame velocity components
+is a different quantity, and they differ by exactly `w × v`. Skipping it makes
+the model wrong the moment the robot turns.
+
+### 8.5 The three easy mistakes
+
+**Saturating in the wrong place, or not at all.** Step 4 comes before step 5.
+The gains were fitted against the *saturated* command, so they describe force
+delivered rather than force requested. Feeding `u_raw` straight into `A_u`
+overestimates what the robot can do near full stick — exactly where it matters.
+
+**Frames.** The tables are field frame, this model is body frame. Rotate in at
+step 3 and back out at step 6. Motor forces act along the robot's own axes,
+which is precisely why the model *can* be constant matrices — a field-frame
+version would need matrices that depend on heading.
+
+**Using `k` from the wrong place.** `k` reflects what the solver actually
+used. If `constant_zeroed` is true it is zero here, because the tables were
+solved that way. Substituting the raw fit's constant would put the robot on
+different dynamics than the tables it is steering by.
+
+### 8.6 Where the numbers come from
+
+Everything in §8.2 is fitted by `calibration/fit_drivetrain.py`. Worth knowing
+when reading a file:
+
+- `A_sgn` and `A_absv` are on by default; `A_ss` (the `omega²` term) is off by
+  default. On a real run `omega²` scored *worse* than a plain linear model,
+  and what looked like a centripetal signal turned out to be a mis-set
+  odometry tracking point leaking in.
+- The traction knee is fitted per run and **describes that floor**. A grippier
+  surface slips later. Re-measure when the surface changes; a knee measured on
+  a slippery practice floor will make the robot look weaker than it is.
+- `A_s`, `A_sgn` and `A_absv` are collinear — linear `v`, `csign(v)` and
+  `|v|·v` are all odd monotonic functions of the same variable, so how the fit
+  splits a given behaviour between them is somewhat arbitrary. Use them
+  together; do not read one coefficient on its own as physics.
 
 ## 9. Notes for the robot side
 

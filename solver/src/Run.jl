@@ -60,13 +60,14 @@ Build the dynamics model the robot needs alongside the tables.
 
 Written in a deliberately over-general form:
 
-    a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + k
+    a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u)
+        + A_sgn*csign(s) + A_absv*(abs(s).*s) + k
 
-Most of those blocks are currently zero -- the fitted regression has no
-position dependence and no control-squared terms. They are emitted anyway so
-that the regression can gain or lose terms later without the robot-side
-reader needing to change: it always multiplies the same five things and adds
-them up.
+Several blocks are usually zero -- the fitted regression has no position
+dependence and no control-squared terms. They are emitted anyway so that the
+regression can gain or lose terms without the robot-side reader changing: it
+always multiplies the same things and adds them up. `nonzero_blocks` says
+which are actually carrying anything.
 
 The matrices describe the model **as the solver actually used it**, so if
 `zero_c` was set the constant here is zero too. Otherwise the robot's
@@ -84,13 +85,26 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
     A_ss = [[0.0, 0.0, 0.0, 0.0, 0.0, Float64(m.q[r])] for r in 1:3]
     A_u  = Bm
     A_uu = [[0.0, 0.0, 0.0] for _ in 1:3]
+    Sm   = [row3(m.S, r) for r in 1:3]
+    Dm   = [row3(m.D, r) for r in 1:3]
+    A_sgn = [[0.0, 0.0, 0.0, Sm[r][1], Sm[r][2], Sm[r][3]] for r in 1:3]
+    A_abs = [[0.0, 0.0, 0.0, Dm[r][1], Dm[r][2], Dm[r][3]] for r in 1:3]
     k    = [Float64(m.c[r]) for r in 1:3]
 
     Dict(
-        "schema_version" => 1,
+        "schema_version" => 2,
         "generator" => "peregrine-desktop",
         "regression_sha256" => filehash(reg_path),
-        "equation" => "a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + k",
+        "equation" => "a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + " *
+                      "A_sgn*csign(s) + A_absv*(abs(s).*s) + k",
+        "csign" => Dict(
+            "formula" => "csign(s)_i = clamp(s_i / coulomb_eps_i, -1, 1)",
+            "coulomb_eps" => [0.0, 0.0, 0.0, Float64(m.eps[1]),
+                              Float64(m.eps[2]), Float64(m.eps[3])],
+            "why" => "Coulomb friction is smoothed instead of using a hard " *
+                     "sign(), which would flip discontinuously at zero and " *
+                     "make an integrator chatter. Use exactly this form.",
+        ),
         "output" => Dict(
             "vector" => ["a_x", "a_y", "alpha"],
             "units" => ["cm/s^2", "cm/s^2", "rad/s^2"],
@@ -110,11 +124,22 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
             "vector" => ["fwd", "strafe", "turn"],
             "note" => "mecanum projection of the wheel powers; the " *
                       "admissible set is |fwd| + |strafe| + |turn| <= 1",
+            "saturation" => Dict(
+                "knee" => m.knee > 0 ? Float64(m.knee) : nothing,
+                "formula" => "m = norm(u_raw); " *
+                             "u = u_raw * tanh(m/knee) / (m/knee)",
+                "why" => "Past the knee the tyres stop delivering, so extra " *
+                         "command buys no extra force. APPLY THIS BEFORE " *
+                         "A_u -- the gains were fitted against the saturated " *
+                         "command. A null knee means no saturation.",
+            ),
         ),
         "A_s" => A_s,      # 3x6
         "A_u" => A_u,      # 3x3
         "A_ss" => A_ss,    # 3x6
         "A_uu" => A_uu,    # 3x3
+        "A_sgn" => A_sgn,  # 3x6, Coulomb, multiplies csign(s)
+        "A_absv" => A_abs, # 3x6, quadratic drag, multiplies abs(s).*s
         "k" => k,          # 3
         "constant_zeroed" => zeroed_c,
         "nonzero_blocks" => [b for (b, nz) in (
@@ -122,6 +147,8 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
             ("A_u", any(any(!iszero, r) for r in A_u)),
             ("A_ss", any(any(!iszero, r) for r in A_ss)),
             ("A_uu", any(any(!iszero, r) for r in A_uu)),
+            ("A_sgn", any(any(!iszero, r) for r in A_sgn)),
+            ("A_absv", any(any(!iszero, r) for r in A_abs)),
             ("k", any(!iszero, k))) if nz],
     )
 end
@@ -144,7 +171,8 @@ function run_solve(cfg::AbstractDict)
         # A drivetrain at rest with no power must not accelerate. A nonzero
         # constant makes the simulated robot drift forever, so it is zeroed
         # by default -- it is a diagnostic of the fit, not real dynamics.
-        m = Model(m.B, m.A, m.q, (0.0f0, 0.0f0, 0.0f0))
+        m = Model(m.B, m.A, m.q, m.S, m.D, (0.0f0, 0.0f0, 0.0f0),
+                  m.eps, m.knee)
     end
     bounds, polys, robot, fieldcfg = load_field(field_path)
     names, states, _ = load_targets(targ_path)
@@ -165,7 +193,10 @@ function run_solve(cfg::AbstractDict)
     nearest = Bool(getc(cfg, "nearest", false))
     iters = Int(getc(cfg, "iterations", 400))
     tol = Float64(getc(cfg, "tolerance", 1e-3))
-    level = Int(getc(cfg, "control_level", 1))
+    # 3 samples the octahedron boundary properly. Corners alone (level 1)
+    # made every cell pessimistic by ~1.8 s on a real model, because a plain
+    # diagonal was not in the control set at all.
+    level = Int(getc(cfg, "control_level", 3))
     margin = Float64(getc(cfg, "margin_cm", 0.0))
     # Safety gap held around every obstacle, applied before the robot's own
     # footprint is swept in.

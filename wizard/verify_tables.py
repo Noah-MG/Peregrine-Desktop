@@ -128,7 +128,8 @@ def check_model(root: str, fails: list, warns: list) -> None:
     print(f"    {m['equation']}")
 
     for name, rows, cols in (("A_s", no, ns), ("A_u", no, nu),
-                             ("A_ss", no, ns), ("A_uu", no, nu)):
+                             ("A_ss", no, ns), ("A_uu", no, nu),
+                             ("A_sgn", no, ns), ("A_absv", no, ns)):
         M = m.get(name)
         if M is None:
             fails.append(f"MODEL.JSON has no {name}")
@@ -147,6 +148,24 @@ def check_model(root: str, fails: list, warns: list) -> None:
         fails.append("MODEL.JSON A_u is zero: control has no effect")
     if m.get("constant_zeroed"):
         print("    constant term zeroed, matching the solve")
+
+    # Coulomb is smoothed, and the robot must use the same band or its
+    # dynamics will not match the tables that were solved from them.
+    if "A_sgn" in nz:
+        cs = m.get("csign") or {}
+        eps = cs.get("coulomb_eps")
+        if not eps or not any(e > 0 for e in eps):
+            fails.append("MODEL.JSON has a Coulomb block but no usable "
+                         "coulomb_eps, so csign() is undefined")
+        else:
+            print("    coulomb_eps = %s" % [round(e, 3) for e in eps])
+
+    sat = (m.get("control") or {}).get("saturation") or {}
+    if sat.get("knee"):
+        print("    traction knee = %.3f (saturate the command first)"
+              % sat["knee"])
+        if "tanh" not in str(sat.get("formula", "")):
+            fails.append("MODEL.JSON declares a traction knee but no formula")
 
     # The tables index field-frame velocity but this model is body-frame; that
     # mismatch is the easiest thing to get wrong on the robot, so make sure the

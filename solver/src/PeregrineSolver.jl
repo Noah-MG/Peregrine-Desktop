@@ -87,25 +87,69 @@ end
 """
 Body-frame acceleration model from the calibration regression:
 
-    a = B*u + A*v + q*w^2 + c
+    u = u_raw * traction_gain(u_raw)        wheel slip, applied first
+    a = B*u + A*v + q*w^2 + S*csign(v) + D*(|v|*v) + c
 
 with u = (fwd, strafe, turn), v = (vx, vy, w) in the body frame. `a` is the
 *proper* body-frame acceleration, so integrating it back to a velocity has to
 subtract the Coriolis term -- see `step_state`.
+
+The saturation comes first because the fit was made against the saturated
+command: the gains describe force delivered, not force asked for.
 """
 struct Model
-    B::NTuple{9,Float32}   # row-major 3x3
-    A::NTuple{9,Float32}
-    q::NTuple{3,Float32}
-    c::NTuple{3,Float32}
+    B::NTuple{9,Float32}   # row-major 3x3, control
+    A::NTuple{9,Float32}   # velocity
+    q::NTuple{3,Float32}   # omega^2
+    S::NTuple{9,Float32}   # Coulomb, multiplies csign(v)
+    D::NTuple{9,Float32}   # quadratic drag, multiplies |v|*v
+    c::NTuple{3,Float32}   # constant
+    eps::NTuple{3,Float32} # Coulomb smoothing band
+    knee::Float32          # traction knee; <= 0 disables saturation
 end
 
-@inline function body_accel(m::Model, u1, u2, u3, vx, vy, w)
-    B = m.B; A = m.A; q = m.q; c = m.c
+"""Smoothed sign: a linear ramp through zero saturating at +-1.
+
+A hard `sign` would flip discontinuously at v = 0 and make the integration
+chatter, so the fit and the solver share this smoothed form -- it is part of
+the model, not a solver convenience.
+"""
+@inline csign(v, e) = clamp(v / e, -1.0f0, 1.0f0)
+
+"""Fraction of commanded effort the tyres can actually deliver.
+
+Past `knee` the wheels break loose and extra command buys no extra force. The
+direction of the command is preserved; only its magnitude is folded over.
+Traction is one shared budget, so the demand counts all three axes and the
+result scales all three.
+"""
+@inline function traction_gain(u1, u2, u3, knee)
+    # NaN as well as <= 0 means "no saturation". TOML has no null, so a
+    # disabled knee arrives as NaN, and `NaN <= 0` is false -- without this
+    # check the gain becomes NaN, every control becomes NaN, and the kernel
+    # indexes the table with garbage.
+    (isnan(knee) || knee <= 0.0f0) && return 1.0f0
+    m = sqrt(u1 * u1 + u2 * u2 + u3 * u3)
+    r = m / knee
+    r < 1.0f-6 && return 1.0f0
+    tanh(r) / r
+end
+
+@inline function body_accel(m::Model, u1r, u2r, u3r, vx, vy, w)
+    B = m.B; A = m.A; q = m.q; S = m.S; D = m.D; c = m.c; e = m.eps
+    # The fit was made against the saturated command, so the solver has to
+    # saturate too or its dynamics will not match the tables.
+    g = traction_gain(u1r, u2r, u3r, m.knee)
+    u1 = u1r * g; u2 = u2r * g; u3 = u3r * g
     w2 = w * w
-    ax = B[1]*u1 + B[2]*u2 + B[3]*u3 + A[1]*vx + A[2]*vy + A[3]*w + q[1]*w2 + c[1]
-    ay = B[4]*u1 + B[5]*u2 + B[6]*u3 + A[4]*vx + A[5]*vy + A[6]*w + q[2]*w2 + c[2]
-    al = B[7]*u1 + B[8]*u2 + B[9]*u3 + A[7]*vx + A[8]*vy + A[9]*w + q[3]*w2 + c[3]
+    sx = csign(vx, e[1]); sy = csign(vy, e[2]); sw = csign(w, e[3])
+    dx = abs(vx) * vx;    dy = abs(vy) * vy;    dw = abs(w) * w
+    ax = B[1]*u1 + B[2]*u2 + B[3]*u3 + A[1]*vx + A[2]*vy + A[3]*w +
+         q[1]*w2 + S[1]*sx + S[2]*sy + S[3]*sw + D[1]*dx + D[2]*dy + D[3]*dw + c[1]
+    ay = B[4]*u1 + B[5]*u2 + B[6]*u3 + A[4]*vx + A[5]*vy + A[6]*w +
+         q[2]*w2 + S[4]*sx + S[5]*sy + S[6]*sw + D[4]*dx + D[5]*dy + D[6]*dw + c[2]
+    al = B[7]*u1 + B[8]*u2 + B[9]*u3 + A[7]*vx + A[8]*vy + A[9]*w +
+         q[3]*w2 + S[7]*sx + S[8]*sy + S[9]*sw + D[7]*dx + D[8]*dy + D[9]*dw + c[3]
     (ax, ay, al)
 end
 
@@ -142,27 +186,63 @@ end
 """
 Admissible controls for a mecanum drive.
 
-Wheel powers live in [-1,1]^4, and the mixing
-`fwd,strafe,turn = (FR+FL+BR+BL, -FR+FL+BR-BL, -FR+FL-BR+BL)/4`
-maps that cube onto the octahedron `|fwd| + |strafe| + |turn| <= 1`.
+The robot mixes a command into wheel powers with
 
-Because the acceleration is affine in u, the minimum-time Hamiltonian is
-affine in u as well, so the optimum sits at an extreme point of that
-octahedron -- bang-bang. `level == 1` returns exactly those 6 vertices plus
-coast, which is the cheapest set that can still represent the optimum.
-Higher levels subdivide, which helps only because time is discretized.
+    FR = drive + strafe - turn      BR = drive - strafe - turn
+    FL = drive - strafe + turn      BL = drive + strafe + turn
+
+and every wheel must stay in [-1, 1]. Those four rows are (1, +-1, +-1) over
+all sign combinations, and the largest of `|d +- s +- t|` is `|d|+|s|+|t|`, so
+the constraint is exactly the octahedron
+
+    |drive| + |strafe| + |turn| <= 1
+
+**Why the boundary and not just the corners.** Minimum time wants as much
+useful acceleration as possible, so the optimum lies on the boundary of that
+octahedron -- that is all "bang-bang" actually tells us. It would additionally
+land on a *vertex* if the dynamics were affine in u, because the minimum of a
+linear function over a polytope sits at a corner. They are not affine: the
+traction term scales the command by `tanh(|u|/knee)/(|u|/knee)`, which depends
+on the Euclidean length of u, and that length varies over the boundary -- 1.0
+at a vertex against 0.577 at a face centre. Corners are therefore saturated
+hardest, and a point in the middle of a face can deliver more useful force
+than the corner next to it. Sampling only the corners quietly forbids those.
+
+So the boundary is sampled: each of the eight triangular faces is covered by a
+lattice of resolution `level`, plus the origin for coasting. Interior points
+are not needed, because more command always means more force -- the saturation
+is monotone -- so the best point in any direction is the one on the boundary.
+
+    level 1 ->  7 controls (the corners, as before)
+    level 2 -> 19    level 3 -> 39    level 4 -> 67
 """
 function control_set(level::Int)
     level < 1 && error("control level must be >= 1")
-    vals = range(-1.0f0, 1.0f0; length = 2 * level + 1)
+    seen = Set{NTuple{3,Float32}}()
     out = NTuple{3,Float32}[]
-    for f in vals, s in vals, t in vals
-        abs(f) + abs(s) + abs(t) <= 1.0f0 + 1.0f-6 || continue
-        push!(out, (Float32(f), Float32(s), Float32(t)))
+    push!(seen, (0.0f0, 0.0f0, 0.0f0))
+    push!(out, (0.0f0, 0.0f0, 0.0f0))          # coast
+    L = level
+    for sd in (-1, 1), ss in (-1, 1), st in (-1, 1)
+        for i in 0:L, j in 0:(L - i)
+            k = L - i - j
+            # a + b + c == 1, so the point sits on the octahedron surface.
+            a = Float32(i) / Float32(L)
+            b = Float32(j) / Float32(L)
+            c = Float32(k) / Float32(L)
+            # Normalise -0.0 away so mirrored duplicates collapse.
+            p = (a == 0 ? 0.0f0 : Float32(sd) * a,
+                 b == 0 ? 0.0f0 : Float32(ss) * b,
+                 c == 0 ? 0.0f0 : Float32(st) * c)
+            if !(p in seen)
+                push!(seen, p)
+                push!(out, p)
+            end
+        end
     end
-    unique!(out)
-    # Put coast first so ties resolve toward doing nothing.
-    sort!(out; by = c -> (abs(c[1]) + abs(c[2]) + abs(c[3])))
+    # Coast first, then increasing effort, so ties resolve toward doing less.
+    sort!(out; by = p -> (abs(p[1]) + abs(p[2]) + abs(p[3]),
+                          p[1] * p[1] + p[2] * p[2] + p[3] * p[3]))
     out
 end
 
