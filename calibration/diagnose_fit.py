@@ -105,8 +105,12 @@ def build_terms(u, v, eps=fd.COULOMB_EPS):
                ("sgn_omega", fd.csign(w, eps[2]))]
     drag = [("absv_v_x", np.abs(vx) * vx), ("absv_v_y", np.abs(vy) * vy),
             ("absv_omega", np.abs(w) * w)]
-    usq = [("fwd^2", fwd * fwd), ("strafe^2", strafe * strafe),
-           ("turn^2", turn * turn)]
+    # No control-squared family, deliberately. A u^2 column is even in u, so
+    # it predicts the same force for full forward and full reverse, which no
+    # drivetrain does; what it actually absorbs is the saturation curvature
+    # that `traction_gain` already models, and it does so in a form the fitted
+    # model cannot carry (`A_uu` is structurally zero, see TABLE_FORMAT §8.2).
+    # A family that cannot be shipped is not worth scoring.
     inter = []
     for un, uu in (("fwd", fwd), ("strafe", strafe), ("turn", turn)):
         for vn, vv in (("v_x", vx), ("v_y", vy), ("omega", w)):
@@ -119,7 +123,6 @@ def build_terms(u, v, eps=fd.COULOMB_EPS):
         "+ Coulomb + drag (current)": linear + coulomb + drag,
         "+ omega^2": linear + omega_sq,
         "+ omega^2 + Coulomb + drag": linear + omega_sq + coulomb + drag,
-        "+ control squared": linear + coulomb + drag + usq,
         "+ control x velocity": linear + coulomb + drag + inter,
     }
     return linear, fams
@@ -691,8 +694,9 @@ def parse_args(argv=None):
     p.add_argument("--omega-sq", dest="omega_sq", action="store_true")
     p.add_argument("--no-intercept", dest="intercept", action="store_false")
     p.add_argument("--traction-knee", default=None,
-                   help="wheel-slip knee: a number, 'off', or 'auto' to search "
-                        "for it. Default is whatever --fit used, or auto.")
+                   help="wheel-slip knee: a positive number, or 'auto' to "
+                        "search for it. A knee is required. Default is "
+                        "whatever --fit used, or auto.")
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--segment", type=int, default=None)
     p.add_argument("--open", action="store_true",
@@ -747,7 +751,10 @@ def main(argv=None) -> int:
     if override is not None:
         tk = str(override).strip().lower()
         if tk in ("off", "none", "0"):
-            args.knee, args.knee_mode = None, "off (--traction-knee)"
+            print("error: the traction knee cannot be switched off -- the "
+                  "model requires one. Use 'auto' or a positive number.",
+                  file=sys.stderr)
+            return 2
         elif tk == "auto":
             args.knee, knee_rows = fd.choose_knee(prep, args)
             args.knee_mode = "searched"

@@ -138,6 +138,10 @@ class Bar:
     def __init__(self, label: str):
         self.label = label
         self.last = 0.0
+        # Kept so a caller can redraw with a new note without knowing where
+        # the bar had got to -- a tiled solve reports tile progress between
+        # rounds, and those must not drag the bar back to zero.
+        self.frac = 0.0
 
     def update(self, frac: float, note: str = "") -> None:
         frac = min(1.0, max(0.0, frac))
@@ -145,6 +149,7 @@ class Bar:
         if frac < 1.0 and now - self.last < 0.08:
             return
         self.last = now
+        self.frac = frac
         filled = int(BAR_W * frac)
         bar = "#" * filled + "-" * (BAR_W - filled)
         line = f"  {self.label:<12} [{bar}] {frac*100:5.1f}%  {note}"
@@ -545,74 +550,577 @@ def step_field(ws: Workspace) -> None:
 # Step 3 -- solve
 # --------------------------------------------------------------------------
 
+# The cards a run can be planned for, and what they cost to rent by the hour.
+#
+# `plan` decides in-core against tiled from a VRAM budget and estimates a wall
+# clock from a cell rate, so planning for a machine you do not have in front of
+# you is just a matter of handing it that machine's two numbers. Both are
+# overridable per entry, and `cell_rate` is deliberately absent until measured:
+# `solver/cloud/benchmark.jl` fills it in, and until it has, the estimate is
+# quoted at the desktop's rate and labelled as a ceiling.
+#
+# `headroom` matches the solver's own default -- the driver and the CUDA
+# context need room that a solve may not have.
+TARGET_GPUS = {
+    "local":  dict(label="this machine's card", vram_gb=None, usd_hr=0.0),
+    "l40s":   dict(label="NVIDIA L40S 48 GB", vram_gb=48.0, usd_hr=1.57),
+    "h100":   dict(label="NVIDIA H100 80 GB", vram_gb=80.0, usd_hr=3.39),
+}
+GPU_HEADROOM = 0.85
+# Held back for the driver and the CUDA context, as the solver does.
+GPU_RESERVE_GB = 1.0
+
+
+def gpu_budget_bytes(vram_gb: float) -> int:
+    return int((vram_gb - GPU_RESERVE_GB) * (2 ** 30) * GPU_HEADROOM)
+
+
+def target_overrides(target: str, measured: dict) -> dict:
+    """Config keys that make `plan` answer for `target` rather than for here.
+
+    Only ever added for the *plan*. A solve that runs on this machine must see
+    this machine's real card, so these are stripped before solving locally --
+    a stale `vram_budget_bytes` would tile a grid that fits, or worse, claim
+    one fits that does not.
+    """
+    spec = TARGET_GPUS.get(target)
+    if not spec or spec["vram_gb"] is None:
+        return {}
+    out = {"vram_budget_bytes": gpu_budget_bytes(spec["vram_gb"])}
+    rates = measured.get(target, {})
+    if rates.get("cell_rate"):
+        out["cell_rate"] = float(rates["cell_rate"])
+    if rates.get("disk_rate"):
+        out["disk_rate"] = float(rates["disk_rate"])
+    return out
+
+
 def julia_exe() -> str | None:
     return shutil.which("julia")
 
 
-def gather_solver_config(ws: Workspace, run_dir: str) -> dict:
-    print()
-    print("  Grid resolution drives everything: table size grows as the product")
-    print("  of all six axes, and solve time with it. Start coarse.")
-    print()
-    n = [
-        ask_int("  x samples", 41, 2, 4096),
-        ask_int("  y samples", 41, 2, 4096),
-        ask_int("  heading samples", 16, 2, 512),
-        ask_int("  vx samples", 11, 2, 512),
-        ask_int("  vy samples", 11, 2, 512),
-        ask_int("  omega samples", 11, 2, 512),
-    ]
-    print()
-    vmax = ask_float("  max |velocity| cm/s", 150.0)
-    wmax = ask_float("  max |omega| rad/s", 10.0)
-    print()
-    print("  Clearance is a safety gap held around every obstacle, applied")
-    print("  before the robot's own footprint is swept in -- so it is just")
-    print("  'keep this far away', independent of how big the robot is.")
-    clearance = ask_float("  obstacle clearance cm", 5.0)
-    print()
-    print("  Element type: u8 (1 B, 25 ms steps to 6.3 s), u16 (2 B, 1 ms to")
-    print("  65.5 s, recommended), f16 (2 B, ~3 digits), f32 (4 B).")
-    dtype = ask("  dtype", "u16")
-    while dtype not in ("u8", "u16", "f16", "f32"):
-        dtype = ask("  dtype (u8/u16/f16/f32)", "u16")
-    print()
-    iters = ask_int("  max iterations per target", 400, 1, 100000)
-    dt = ask_float("  integration step dt (s)", 0.05)
-    print()
-    print("  Control sampling. Bang-bang puts the optimum on the boundary of")
-    print("  the reachable set, but not at its corners, so the boundary is")
-    print("  sampled. Level 1 is corners only and is measurably pessimistic;")
-    print("  higher costs solve time roughly in proportion to the count.")
-    print("    1 = 7 controls (corners only, not recommended)")
-    print("    2 = 19    3 = 39 (recommended)    4 = 67")
-    level = ask_int("  control refinement level", 3, 1, 4)
+# Everything the solve needs, in the unit the thing is actually measured in.
+# Nothing here is a sample count: counts are what the solver derives, not what
+# a user should be asked to reason about.
+DEFAULTS = {
+    "clearance": 5.0,
+    "wall_clearance": 5.0,
+    "vmax": 170.0,
+    "wmax": 8.0,
+    "xy_cm": 8.0,
+    "heading_deg": 22.5,
+    "v_cm_s": 34.0,
+    "w_rad_s": 1.6,
+    "dtype": "u16",
+    "iterations": 400,
+    "cfl": 2.0,
+    "tau_levels": 5,
+    # Derived per run by the solver, not carried between them. It was a number
+    # once and that was a trap: applying a recommendation on a tiled grid wrote
+    # a short step into the saved answers, where it then stayed -- silently
+    # costing accuracy on every later run, including in-core ones with nothing
+    # to gain from it. "auto" is the only value the wizard ever writes.
+    "tau_max": "auto",
+    "level": 4,
+    "budget_gb": 8.0,
+}
 
+
+ELEM_BYTES = {"u8": 1, "u16": 2, "f16": 2, "f32": 4}
+
+
+def derived_shape(span_x: float, span_y: float, d: dict) -> dict:
+    """
+    The sample counts a resolution implies, mirroring `axis_samples` and
+    `symmetric_samples` in the solver.
+
+    Duplicated arithmetic, deliberately, and it is three lines: it buys the
+    user the size of what they are asking for *while they are asking for it*.
+    Cell sizes are a much better way to say what you want than sample counts
+    were, but they hide the one thing sample counts made obvious -- that the
+    table goes as the product of six axes, so halving the position cell is
+    eight times the space and not twice. Finding that out from `plan` twenty
+    seconds later is finding out too late.
+    """
+    import math
+    n1 = max(2, math.ceil(span_x / d["xy_cm"] - 1e-9) + 1)
+    n2 = max(2, math.ceil(span_y / d["xy_cm"] - 1e-9) + 1)
+    nh = max(4, round(360.0 / d["heading_deg"]))
+    nv = 2 * max(1, math.ceil(d["vmax"] / d["v_cm_s"] - 1e-9)) + 1
+    nw = 2 * max(1, math.ceil(d["wmax"] / d["w_rad_s"] - 1e-9)) + 1
+    n = [n1, n2, nh, nv, nv, nw]
+    cells = 1
+    for x in n:
+        cells *= x
+    return {"n": n, "cells": cells,
+            "bytes": cells * ELEM_BYTES.get(d["dtype"], 2),
+            # 4 bytes for V plus 12 for the warm-start policy: what it would
+            # take to hold the whole grid on the card at once.
+            "vram": cells * 16}
+
+
+def show_shape(shape: dict, ntargets: int, exact: bool) -> None:
+    about = "" if exact else c("  (upper bound: the table is inset from the "
+                               "wall, so the real count is a little smaller)", "2")
+    print(f"    -> {' x '.join(str(x) for x in shape['n'])}"
+          f" = {shape['cells']:,} cells, {human(shape['bytes'])} per table,"
+          f" {human(shape['bytes'] * max(ntargets, 1))} total")
+    v = shape["vram"]
+    note = c("   <-- too big to hold whole; will be solved a tile at a time, "
+             "which is much slower", "33") if v > 4 * 2 ** 30 else ""
+    print(f"       {human(v)} of VRAM to hold it whole" + note)
+    if about:
+        print(about)
+
+
+def gather_solver_config(ws: Workspace, run_dir: str, prev: dict,
+                         span: tuple | None = None, exact: bool = False,
+                         ntargets: int = 1) -> dict:
+    """
+    Ask for the run settings, in physical units, with the previous answers as
+    the defaults.
+
+    The previous answers matter more than they look. Tuning a grid is a loop --
+    plan, look, adjust, plan again -- and re-typing fifteen answers to change
+    one of them is most of what made the old version painful to use.
+    """
+    d = dict(DEFAULTS); d.update(prev)
+
+    print()
+    print("  The table covers every state the robot can legally be in, and the")
+    print("  solver works out that extent itself: the field, inset by the")
+    print("  robot's own footprint and the wall clearance. So there are no")
+    print("  bounds to type in -- only how big you want one cell to be.")
+
+    rule("Safety gaps")
+    print("  A gap held around every obstacle, applied before the robot's own")
+    print("  footprint is swept in, so it is plain 'keep this far away' and")
+    print("  does not depend on how big the robot is.")
+    d["clearance"] = ask_float("  clearance around obstacles, cm", d["clearance"])
+    print()
+    print("  The field wall is an obstacle too, and gets the same treatment by")
+    print("  default. Give it its own number if you are willing to run closer")
+    print("  to the perimeter than to a scoring structure.")
+    d["wall_clearance"] = ask_float("  clearance from the field wall, cm",
+                                    d["wall_clearance"])
+
+    rule("Speed envelope")
+    print("  The table says nothing outside this box -- a state beyond it is")
+    print("  unreachable, not merely expensive -- so this is a real speed")
+    print("  limit and not a description of the drivetrain. The fitted model")
+    print("  can go far faster than either of these.")
+    d["vmax"] = ask_float("  max |velocity|, cm/s", d["vmax"])
+    d["wmax"] = ask_float("  max |omega|, rad/s", d["wmax"])
+
+    rule("Resolution")
+    print("  The physical size of one cell, on each axis. This is independent")
+    print("  of the field and of the envelope above: change either and the")
+    print("  cell stays the size you asked for while the sample count moves.")
+    print("  Table size grows as the product of all six axes, so halving the")
+    print("  position cell costs roughly eight times the space.")
+    print()
+    d["xy_cm"] = ask_float("  position cell, cm", d["xy_cm"])
+    d["heading_deg"] = ask_float("  heading bin, degrees", d["heading_deg"])
+    d["v_cm_s"] = ask_float("  velocity cell, cm/s", d["v_cm_s"])
+    d["w_rad_s"] = ask_float("  omega cell, rad/s", d["w_rad_s"])
+    if span is not None:
+        print()
+        show_shape(derived_shape(span[0], span[1], d), ntargets, exact)
+
+    print()
+    print("  Everything else has a sensible default: u16 tables, 400 sweeps,")
+    print("  67 seeded controls, and a lookahead the plan will recommend.")
+    if confirm("Change any of the solver settings?"):
+        rule("Solver")
+        print("  Element type: u8 (1 B, 25 ms steps to 6.3 s), u16 (2 B, 1 ms")
+        print("  to 65.5 s, recommended), f16 (2 B, ~3 digits), f32 (4 B).")
+        dt = ask("  dtype", d["dtype"])
+        while dt not in ("u8", "u16", "f16", "f32"):
+            dt = ask("  dtype (u8/u16/f16/f32)", d["dtype"])
+        d["dtype"] = dt
+        print()
+        d["iterations"] = ask_int("  max sweeps per target", d["iterations"],
+                                  1, 100000)
+        print()
+        print("  Lookahead. Each backup asks 'what is the best command to hold")
+        print("  for a while, and what is left to do afterwards'. How long that")
+        print("  while should be is not one number: at rest the robot barely")
+        print("  moves however long you wait, and at speed it crosses cells")
+        print("  fast. So you say how far a step should reach, in cells, and")
+        print("  the solver derives the seconds for every cell itself.")
+        d["cfl"] = ask_float("  cells advanced per step", d["cfl"])
+        print()
+        print("  Each cell then tries several step lengths around that one and")
+        print("  keeps the best. 5 brackets it widely, which measured best.")
+        d["tau_levels"] = ask_int("  step lengths per cell", d["tau_levels"],
+                                  1, 8)
+        print()
+        print("  Longest step any of them may be. 'auto' is right nearly")
+        print("  always: on a grid that fits the GPU it is the full 0.5 s,")
+        print("  and on one that has to be tiled the solver works out the")
+        print("  knee of the accuracy/time trade for that particular grid.")
+        print("  A number here pins it, including on grids where a short")
+        print(c("  step buys nothing and costs real accuracy.", "33"))
+        raw = ask("  longest step, seconds (or 'auto')", str(d["tau_max"]))
+        if raw.strip().lower() in ("auto", ""):
+            d["tau_max"] = "auto"
+        else:
+            try:
+                d["tau_max"] = float(raw)
+            except ValueError:
+                print(c("    not a number; leaving it on auto", "31"))
+                d["tau_max"] = "auto"
+        print()
+        print("  Control sampling. Bang-bang puts the optimum on the boundary")
+        print("  of the reachable set but not at its corners, so the boundary")
+        print("  is sampled and then refined off-lattice. The lattice only")
+        print("  seeds that search, so a high level costs little.")
+        print("    1 = 7 controls (corners only, not recommended)")
+        print("    2 = 19    3 = 39    4 = 67 (recommended)")
+        d["level"] = ask_int("  control lattice level", d["level"], 1, 4)
+        print()
+        print("  How much space the recommended resolution is allowed to use.")
+        print("  It does not cap anything -- it is what 'recommended' is")
+        print("  recommended against.")
+        d["budget_gb"] = ask_float("  size budget for the recommendation, GB",
+                                   d["budget_gb"])
+
+    return d
+
+
+def config_from(ws: Workspace, run_dir: str, d: dict) -> dict:
+    """The answers, as the JSON the solver reads."""
     return {
         "regression": ws.regression,
         "field": ws.field_file,
         "targets": ws.targets_file,
         "out_dir": run_dir,
-        "grid": {"n": n, "vmax": vmax, "wmax": wmax},
-        "clearance_cm": clearance,
-        "dtype": dtype,
-        "iterations": iters,
-        "dt": dt,
-        "control_level": level,
+        "grid": {
+            "vmax": d["vmax"], "wmax": d["wmax"],
+            "resolution": {
+                "xy_cm": d["xy_cm"], "heading_deg": d["heading_deg"],
+                "v_cm_s": d["v_cm_s"], "w_rad_s": d["w_rad_s"],
+            },
+        },
+        "clearance_cm": d["clearance"],
+        "wall_clearance_cm": d["wall_clearance"],
+        "size_budget_bytes": int(d["budget_gb"] * 2 ** 30),
+        "dtype": d["dtype"],
+        "iterations": d["iterations"],
+        "cfl": d["cfl"],
+        "tau_levels": d["tau_levels"],
+        "tau_max": d["tau_max"],
+        "control_level": d["level"],
         "zero_c": True,
         "backend": "auto",
+        # The scratch file for a tiled solve is the whole value function --
+        # tens of gigabytes. It goes in the workspace, which the user already
+        # chose for exactly this reason, rather than beside the system drive's
+        # temp directory.
+        "scratch_dir": ws.runs,
     }
 
 
 def run_plan(cfgpath: str) -> dict | None:
-    r = subprocess.run([julia_exe(), f"--project={SOLVER_PROJ}", SOLVER,
-                        cfgpath, "plan"], capture_output=True, text=True)
+    # --threads=auto matters here as well as in the solve: `plan` measures
+    # the dependency reach by integrating the model over the whole velocity
+    # envelope, which is embarrassingly parallel and the difference between a
+    # second and a quarter of a minute on every resolution the user tries.
+    r = subprocess.run([julia_exe(), f"--project={SOLVER_PROJ}",
+                        "--threads=auto", SOLVER, cfgpath, "plan"],
+                       capture_output=True, text=True)
     for line in r.stdout.splitlines():
         if line.startswith("PLAN "):
             return json.loads(line[5:])
     print(c("  plan failed:", "31"))
     print((r.stderr or r.stdout).strip()[:2000])
     return None
+
+
+def show_extent(p: dict) -> None:
+    """Where the table starts and stops, and why it is not the whole field."""
+    b = p.get("bounds")
+    if not b:
+        return
+    fx0, fy0, fx1, fy1 = b["field"]
+    tmin, tmax = b["table_min"], b["table_max"]
+    ins = b["inset_cm"]
+    print(f"  field               {fx1-fx0:.0f} x {fy1-fy0:.0f} cm")
+    print(f"  table covers        x {tmin[0]:.1f}..{tmax[0]:.1f}, "
+          f"y {tmin[1]:.1f}..{tmax[1]:.1f} cm")
+    print(f"  inset from the wall {min(ins):.1f}..{max(ins):.1f} cm  "
+          + c(f"({b['cells_saved_frac']*100:.0f}% fewer cells than the "
+              f"whole field)", "2"))
+    print(c("  The robot cannot put its footprint through the wall, so states "
+            "outside", "2"))
+    print(c(f"  that span are not stored. Wall clearance "
+            f"{b['wall_clearance_cm']:.1f} cm, obstacle clearance "
+            f"{b['clearance_cm']:.1f} cm.", "2"))
+
+
+def show_resolution(p: dict) -> None:
+    """What was asked for, what the sample counts realise, and the shape."""
+    r = p.get("resolution")
+    if not r:
+        return
+    req, act, n = r["requested"], r["actual"], p["n"]
+    rows = (("position", "xy_cm", "cm", 2, (n[0], n[1])),
+            ("heading", "heading_deg", "deg", 2, (n[2],)),
+            ("velocity", "v_cm_s", "cm/s", 1, (n[3], n[4])),
+            ("omega", "w_rad_s", "rad/s", 2, (n[5],)))
+    print(f"  {'axis':<10}{'asked':>9}{'actual':>10}   samples")
+    for label, key, unit, dp, counts in rows:
+        got = act[key]
+        flag = "" if abs(got - req[key]) <= 5e-3 * max(req[key], 1e-9) \
+               else c("  <-- rounded", "33")
+        print(f"  {label:<10}{req[key]:>9.{dp}f}{got:>10.{dp}f} {unit:<6}"
+              + " x ".join(str(x) for x in counts) + flag)
+    if r["pinned_by_n"]:
+        print(c("  grid.n is set in the config, so the counts are pinned and "
+                "the cell size falls out of the span instead.", "33"))
+
+
+def show_targets(p: dict) -> bool:
+    """Per-target verdict. Returns True if every target can seed."""
+    ts = p.get("targets") or []
+    ok = True
+    for t in ts:
+        if t["ok"]:
+            print(f"  {c('ok', '32')}   {t['name']}")
+            continue
+        ok = False
+        if t["off_axes"]:
+            why = ("outside the table on " + ", ".join(t["off_axes"]))
+        else:
+            why = "; ".join(t["blocked_by"]) or "blocked"
+        print(f"  {c('BAD', '1;31')}  {t['name']}: {why}")
+    if not ok:
+        print(c("  A target the robot cannot be in seeds nothing, and the "
+                "whole table comes out unreachable -- silently, after the "
+                "full run. Move it, or lower the clearance.", "31"))
+    return ok
+
+
+def show_recommendation(p: dict, d: dict) -> dict:
+    """
+    Print what the settings ought to be, and return the ones on offer.
+
+    Two of them, and they are different kinds of advice. The resolution is
+    arithmetic against a size budget. The lookahead is a measurement: how far
+    one backup reaches, what halo that forces, and what the accuracy is worth
+    against the 0.5 s reference the cost curve was measured at.
+    """
+    rec = p.get("recommend") or {}
+    offer = {}
+
+    r = rec.get("resolution")
+    if r:
+        cur = p["cells"]
+        if r["cells"] > cur * 1.05 or r["cells"] < cur * 0.95:
+            print(f"  resolution          {r['xy_cm']:.1f} cm cells, "
+                  f"{r['heading_deg']:.1f} deg bins, {r['v_cm_s']:.0f} cm/s, "
+                  f"{r['w_rad_s']:.1f} rad/s")
+            print(f"                      -> {'x'.join(str(x) for x in r['n'])}"
+                  f" = {r['cells']:,} cells, {human(r['bytes'])} on the card")
+            bound = ("the GPU, so it still holds whole"
+                     if r.get("bound_by") == "vram"
+                     else f"the {human(rec['size_budget_bytes'])} card budget")
+            print(c(f"                      the finest that clears both "
+                    f"budgets -- limited by {bound}; heading follows the "
+                    f"footprint, velocity is 21 samples with zero on the grid",
+                    "2"))
+            offer["resolution"] = r
+
+    # Reported, never offered. The step length the run will use is derived by
+    # the solver on this plan and on the solve that follows it, from the same
+    # code path, so there is nothing here for the user to accept and nothing
+    # to carry into the next run. Bundling it into an "apply the recommended
+    # settings?" prompt is what made a short step stick to a workspace.
+    applied = rec.get("tau_applied")
+    if applied is not None:
+        acost = rec.get("tau_applied_cost") or 0.0
+        how = "auto" if rec.get("tau_auto") else c("pinned in the config", "33")
+        print(f"  longest step        {applied:.3f} s ({how})"
+              + (c(f"   costs about +{acost:.0f}% on mean value against the "
+                   f"{rec['tau_reference']} s reference", "33")
+                 if acost > 0.5 else c("   full accuracy", "32")))
+        if rec.get("tau_reason"):
+            print(c(f"                      {rec['tau_reason']}", "2"))
+        if rec.get("tau_pinned_waste"):
+            print(c("  This grid fits the GPU whole, so there is no halo for a "
+                    "short step to pay for -- the pinned value is costing "
+                    "accuracy and buying nothing. Set 'longest step' back to "
+                    "auto in the solver settings.", "1;31"))
+
+    # The options table only makes sense next to a pick. `recommend_tau`
+    # returns options without one in no case today, but the two come from
+    # different fields and a nothing-fits grid is exactly when this is being
+    # read most carefully.
+    ic = rec.get("in_core")
+    if ic:
+        print(f"  to avoid tiling      {ic['xy_cm']:.1f} cm cells, "
+              f"{ic['heading_deg']:.1f} deg bins, {ic['v_cm_s']:.0f} cm/s, "
+              f"{ic['w_rad_s']:.2f} rad/s"
+              + c(f"   ({ic['scale']:.2f}x coarser)", "2"))
+        print(f"                      -> {'x'.join(str(x) for x in ic['n'])}"
+              f" = {ic['cells']:,} cells, {human(ic['vram_bytes'])} of VRAM"
+              + c("   holds whole", "32"))
+        print(c("                      tiling is the difference between "
+                "minutes and days, so this is usually the trade worth making",
+                "2"))
+        offer["in_core"] = ic
+
+    # The table is marked against the value actually in force -- `tau_applied`,
+    # what `settle` resolved and what the solve will use -- not against the raw
+    # pick. When the step is pinned the two differ, and marking the pick would
+    # point at a row the run is not on.
+    opts = rec.get("tau_options") or []
+    if applied is not None and len(opts) > 1:
+        print()
+        print(c("  step    reach   loaded/updated    sweeps      i/o   "
+                "per round   value cost", "2"))
+        for o in opts[:8]:
+            mark = c(" <--", "1;32") if abs(o["tau"] - applied) < 1e-3 else ""
+            print(f"  {o['tau']:>5.2f} {o['reach_cm']:>7.0f} cm "
+                  f"{o['amplification']:>10.1f}x {hms(o['compute_s']):>9} "
+                  f"{hms(o['io_s']):>8} {hms(o['round_s']):>11}  "
+                  f"+{o['cost']:>4.0f}%" + mark)
+    return offer
+
+
+def _field_span(ws: Workspace) -> tuple | None:
+    """The field's own width and height, for the size preview."""
+    try:
+        with open(ws.field_file, "rb") as fh:
+            raw = fh.read()
+        f = json.loads(raw.decode("utf-8-sig"))["field"]
+        return (float(f["x_max"]) - float(f["x_min"]),
+                float(f["y_max"]) - float(f["y_min"]))
+    except (OSError, TypeError, KeyError, ValueError):
+        return None
+
+
+def _count_targets(ws: Workspace) -> int:
+    try:
+        with open(ws.targets_file, "rb") as fh:
+            return len(json.loads(fh.read().decode("utf-8-sig"))["targets"])
+    except (OSError, TypeError, KeyError, ValueError):
+        return 1
+
+
+def _cost_preview(rt: dict, target: str, measured: dict) -> None:
+    """What this run would cost to rent, and how much to trust the figure.
+
+    Two independent reasons the number is a ceiling, and both are worth
+    saying because they pull the same way: the estimate spends the whole
+    iteration budget, and unless the box has been benchmarked it spends it at
+    the desktop card's rate. A user who reads "$52" and does not know both of
+    those will over-buy.
+    """
+    spec = TARGET_GPUS.get(target, {})
+    hourly = spec.get("usd_hr", 0.0)
+
+    # The prefetch, when the tiled driver is going to use it. Reported as what
+    # it saves rather than as a flag, because on a slow card it saves nothing
+    # and on a fast one it is the difference between two very different bills.
+    if rt.get("prefetch"):
+        saved = rt.get("prefetch_saves_s", 0.0)
+        if saved > 1.0:
+            line = f"  prefetch            on, hiding {hms(saved)} of reads"
+            if hourly:
+                line += f" ({c(f'${saved / 3600 * hourly:,.2f}', '32')})"
+            print(line)
+    elif rt.get("prefetch_off_because"):
+        why = rt["prefetch_off_because"]
+        if why not in ("not tiled",):
+            print(c(f"  prefetch            off -- {why}", "33"))
+
+    if not hourly:
+        return
+    cost = rt["total_s"] / 3600.0 * hourly
+    print(f"  {c('rental cost', '1;33')}         "
+          f"{c(f'up to ${cost:,.2f}', '1;33')} at ${hourly:.2f}/hr "
+          f"on {spec['label']}")
+    if not measured.get(target, {}).get("cell_rate"):
+        print(c("                      ...but that is at THIS machine's cell "
+                "rate. The card is", "2"))
+        print(c("                      faster, so the real bill is lower. "
+                "Measure it once with", "2"))
+        print(c("                      peregrine_remote.py benchmark and this "
+                "becomes arithmetic.", "2"))
+
+
+def _pick_target(default: str) -> str:
+    """Which card the plan should answer for."""
+    print()
+    print("  Plan for which GPU?")
+    keys = list(TARGET_GPUS)
+    rates = load_settings().get("gpu_rates", {})
+    for i, k in enumerate(keys, 1):
+        spec = TARGET_GPUS[k]
+        bits = []
+        if spec["vram_gb"]:
+            bits.append(f"{spec['vram_gb']:.0f} GB")
+        if spec["usd_hr"]:
+            bits.append(f"${spec['usd_hr']:.2f}/hr")
+        if rates.get(k, {}).get("cell_rate"):
+            bits.append(c(f"measured {rates[k]['cell_rate']/1e6:.0f}M cells/s",
+                          "32"))
+        elif spec["vram_gb"]:
+            bits.append(c("rate not measured -- estimates are ceilings", "33"))
+        mark = "*" if k == default else " "
+        print(f"   {mark}{i}. {spec['label']:<24s} {'  '.join(bits)}")
+    print(c("     Measure a rented box with: julia --project=solver -t auto "
+            "solver/cloud/benchmark.jl", "2"))
+    raw = ask("  choice", str(keys.index(default) + 1 if default in keys else 1))
+    try:
+        return keys[int(raw) - 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def _pick_where(target: str) -> str:
+    """Solve here, solve on the droplet, or go back and change something."""
+    spec = TARGET_GPUS.get(target, {})
+    print()
+    if spec.get("vram_gb"):
+        print(f"   1. Solve on the rented {spec['label']} "
+              + c("(uploads and runs there)", "2"))
+        print("   2. Solve on this machine instead")
+        print("   3. Change settings")
+        raw = ask("  choice", "1")
+        return {"1": "remote", "2": "local"}.get(raw.strip(), "back")
+    return "local" if confirm("Start solving with these settings?") else "back"
+
+
+def _solve_remote(cfgpath: str, run_dir: str, target: str) -> None:
+    """Hand the run to solver/cloud/peregrine_remote.py.
+
+    The config written for the plan carries this machine's idea of the rented
+    card -- `vram_budget_bytes` above all. The remote driver drops that and
+    lets the real card speak for itself, which is why the override is safe to
+    leave in the file the plan was made from.
+    """
+    tool = os.path.join(REPO, "solver", "cloud", "peregrine_remote.py")
+    if not os.path.isfile(tool):
+        print(c("  solver/cloud/peregrine_remote.py is missing", "31")); return
+    spec = TARGET_GPUS.get(target, {})
+    cmd = [sys.executable, tool, "--rate", str(spec.get("usd_hr", 0.0)),
+           "run", cfgpath]
+    print()
+    print(c("  handing the run to the droplet...", "36"))
+    print(c("    " + " ".join(cmd), "2"))
+    print()
+    try:
+        rc = subprocess.run(cmd).returncode
+    except OSError as e:
+        print(c(f"  could not start the remote driver: {e}", "31")); return
+    if rc != 0:
+        print(c(f"  remote run failed (exit {rc})", "31"))
+        print("  If it could not reach the box, set one with:")
+        print(c(f"    {sys.executable} {tool} host root@<ip>", "36"))
+        return
+    print(c(f"  tables are in {run_dir}", "32"))
 
 
 def step_solve(ws: Workspace) -> None:
@@ -626,10 +1134,37 @@ def step_solve(ws: Workspace) -> None:
 
     run_dir = os.path.join(ws.runs, datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
+    cfgpath = os.path.join(run_dir, "config.json")
 
+    answers = dict(load_settings().get("solver", {}))
+    # The step length is derived per run, so it is never restored from the
+    # last one -- and a workspace saved by an older wizard may well have a
+    # short one baked in, which is the exact failure this is undoing. Pinning
+    # it stays possible, in the solver settings, for the current session.
+    answers.pop("tau_max", None)
+    # The field's own span, until a plan reports the real one. It is an upper
+    # bound -- the table is inset from the wall -- which is the right way for
+    # a preview to be wrong.
+    span, span_exact = _field_span(ws), False
+    ntargets = _count_targets(ws)
+
+    st0 = load_settings()
+    target = _pick_target(st0.get("target_gpu", "local"))
+    st0["target_gpu"] = target
+    save_settings(st0)
+    measured = load_settings().get("gpu_rates", {})
+    over = target_overrides(target, measured)
+
+    ask_again = True
     while True:
-        cfg = gather_solver_config(ws, run_dir)
-        cfgpath = os.path.join(run_dir, "config.json")
+        if ask_again:
+            answers = gather_solver_config(ws, run_dir, answers, span,
+                                           span_exact, ntargets)
+        ask_again = True
+        cfg = config_from(ws, run_dir, answers)
+        # The plan answers for the target card; the solve config on disk does
+        # not carry the override any further than that.
+        cfg.update(over)
         with open(cfgpath, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
 
@@ -637,34 +1172,259 @@ def step_solve(ws: Workspace) -> None:
         if p is None:
             return
 
-        rule()
+        ooc = p.get("out_of_core") or {}
+        tiled = ooc.get("mode") == "ooc"
+        free = ws.free()
+        # From here on the preview uses the span the solver actually computed,
+        # not the field's.
+        b = p.get("bounds")
+        if b:
+            span = (b["table_max"][0] - b["table_min"][0],
+                    b["table_max"][1] - b["table_min"][1])
+            span_exact = True
+        ntargets = p["n_targets"]
+
+        rule("Table")
+        show_extent(p)
+        print()
+        show_resolution(p)
+        print()
         print(f"  cells per table     {p['cells']:,}")
         print(f"  bytes per table     {human(p['bytes_per_target'])}")
-        print(f"  targets             {p['n_targets']}")
         print(f"  TOTAL on card       {c(human(p['bytes_total']), '1;33')}"
-              f"   ({p['chunks_per_target']} chunk(s) each)")
-        free = ws.free()
+              f"   ({p['n_targets']} target(s), "
+              f"{p['chunks_per_target']} chunk(s) each)")
         print(f"  workspace free      {human(free)}"
               + ("" if p["bytes_total"] < free else c("   <-- NOT ENOUGH", "31")))
+        occ = p.get("occupancy")
+        if occ:
+            print(f"  blocked by geometry {occ['blocked_frac']*100:.0f}% of "
+                  f"(x, y, heading) cells"
+                  + c(f"   ({occ['best_heading_blocked_frac']*100:.0f}% at the "
+                      f"easiest heading, "
+                      f"{occ['worst_heading_blocked_frac']*100:.0f}% at the "
+                      f"hardest)", "2"))
+
+        rule("Targets")
+        targets_ok = show_targets(p)
+
+        rule("Machine")
         if p["gpu_available"]:
             print(f"  GPU                 needs {p['gpu_need_gb']:.2f} GB of "
                   f"{p['gpu_free_gb']:.2f} GB free"
-                  + ("" if p["gpu_fits"] else c("   <-- WILL NOT FIT", "31")))
+                  + ("" if p["gpu_fits"] else c("   <-- too big to hold whole",
+                                                "33")))
         else:
             print(c("  GPU                 not available; will run on CPU "
                     "(much slower)", "33"))
-        rule()
 
-        if p["bytes_total"] >= free:
-            print(c("  Not enough space in the workspace. Reduce the grid.", "31"))
-        elif p["gpu_available"] and not p["gpu_fits"]:
-            print(c("  Grid will not fit in VRAM. Reduce the grid.", "31"))
-        elif confirm("Start solving with these settings?"):
-            break
-        if not confirm("Adjust settings and try again?"):
+        # How well the position resolution matches the velocity resolution.
+        # A backup only learns from a step that leaves its own cell, and the
+        # distance covered while the speed changes by one velocity cell is
+        # dv^2 / (2a). Far below one position cell means near-stationary
+        # states are heavily smoothed and their times come out pessimistic;
+        # far above means position cells are being paid for without buying
+        # accuracy. Reported, not enforced -- the right answer depends on how
+        # much time the robot spends near rest.
+        bal = p.get("grid_balance")
+        if bal is not None and bal == bal:          # not NaN
+            note = ""
+            if bal < 0.05:
+                note = c("   coarse in position near rest", "33")
+            elif bal > 4.0:
+                note = c("   finer in position than the dynamics can use", "33")
+            print(f"  grid balance        {bal:.3f}"
+                  f"   ({p['cell_cm']:.1f} cm cells, {p['cell_cm_s']:.0f} cm/s "
+                  f"cells, {p['max_accel_cm_s2']:.0f} cm/s^2)" + note)
+
+        # A grid too big for the card is solved a tile at a time, out of a
+        # scratch file. What that costs is the amplification: how many cells
+        # have to be loaded per cell updated, set by how far one backup can
+        # reach against how big a tile the card can hold.
+        if tiled and ooc.get("fits"):
+            hx, hy = ooc["halo_cells"]
+            tx, ty = ooc["tile_cells"]
+            amp = ooc["amplification"]
+            note = c("   <-- most of the work is halo", "33") if amp > 3 else ""
+            print()
+            print(f"  too big to hold whole: solving {ooc['tiles_per_round']} "
+                  f"tiles of {tx}x{ty} cells at a time")
+            print(f"  reach               {ooc['reach_cm']:.0f} cm "
+                  f"= {ooc['reach_cells']:.0f} cells  -> halo {hx}x{hy}")
+            print(f"  loaded per updated  {amp:.2f}x" + note)
+            print(f"  scratch file        {human(ooc['store_bytes'])} in the "
+                  f"workspace, {human(ooc['io_bytes_per_round'])} moved per round")
+
+        # How long this is going to take. It is the ceiling -- the full
+        # iteration budget, which `tolerance` usually cuts short -- built from
+        # two rates measured on one machine, so it separates "overnight" from
+        # "next week" rather than being trusted to the hour.
+        rt = p.get("runtime")
+        if rt and rt.get("unit") not in (None, "none"):
+            print()
+            print(f"  expected run time   up to {hms(rt['total_s'])} for "
+                  f"{p['n_targets']} target(s)"
+                  + c("   (budget; tolerance usually stops sooner)", "2"))
+            _cost_preview(rt, target, measured)
+            print(f"  per {rt['unit']:<15} {hms(rt['unit_s'])} x "
+                  f"{rt['units']} {rt['unit']}s per target")
+            if rt["unit"] == "round":
+                # A round pays for both halves in sequence -- load, sweep,
+                # store -- so this says which half is the larger, not which
+                # one "limits". Nothing is hidden behind anything else.
+                lim = "disk" if rt["io_bound"] else "GPU"
+                print(f"  mostly              {c(lim, '1')}  "
+                      f"(sweeps {hms(rt['compute_s'])} + "
+                      f"i/o {hms(rt['io_s'])} per round)")
+
+        rule("Recommended")
+        offer = show_recommendation(p, answers)
+        if not offer:
+            print(c("  Nothing to change -- these settings are already at the "
+                    "recommendation.", "32"))
+
+        rule()
+        need = p["bytes_total"] + (ooc.get("store_bytes", 0) if tiled else 0)
+        blocked = not targets_ok
+        if need >= free:
+            blocked = True
+            print(c("  Not enough space in the workspace. Use a bigger "
+                    "position cell.", "31"))
+        elif tiled and not ooc.get("fits"):
+            _no_tiling_advice(ooc, offer)
+            blocked = True
+
+        # Offered whether or not the settings can run, and *especially* when
+        # they cannot. The recommendation comes from the same reach scan that
+        # decided nothing fits, so when it names a step length it is naming one
+        # that does fit -- which makes it the fix, not a polish step. Printing
+        # it above a wall of red and then refusing to apply it was backwards.
+        #
+        # Asked as two questions rather than one because the offers conflict:
+        # "coarsen until it holds whole" and "the finest that fits the card"
+        # are different targets and applying both means applying whichever was
+        # written last. The bigger win goes first.
+        def _apply_res(r):
+            answers.update(xy_cm=r["xy_cm"], heading_deg=r["heading_deg"],
+                           v_cm_s=r["v_cm_s"], w_rad_s=r["w_rad_s"])
+
+        if "in_core" in offer:
+            if confirm("Coarsen to hold the whole grid on the GPU and re-plan?",
+                       default_yes=True):
+                _apply_res(offer["in_core"])
+                ask_again = False
+                continue
+        # Only ever a resolution: the step length is derived, not offered.
+        rest = {k: v for k, v in offer.items() if k != "in_core"}
+        if rest:
+            lead = ("Apply the recommended settings and re-plan?" if not blocked
+                    else "Apply the recommended settings and try again?")
+            if confirm(lead, default_yes=True):
+                _apply_res(rest["resolution"])
+                ask_again = False
+                continue
+        if not blocked:
+            where = _pick_where(target)
+            if where == "remote":
+                st = load_settings()
+                st["solver"] = {k: v for k, v in answers.items()
+                                if k != "tau_max"}
+                save_settings(st)
+                _solve_remote(cfgpath, run_dir, target)
+                return
+            if where == "local":
+                break
+        # If the settings cannot run, going back is the only useful move, so
+        # that is what Enter should do. Only when the user has declined a
+        # perfectly workable plan does leaving become the likelier intent.
+        if not confirm("Adjust settings and try again?", default_yes=blocked):
             return
 
+    # Remembered across runs: the next solve starts from what worked last time
+    # rather than from the defaults. Everything except the step length, which
+    # is a consequence of the grid rather than a preference about it.
+    st = load_settings()
+    st["solver"] = {k: v for k, v in answers.items() if k != "tau_max"}
+    save_settings(st)
+    if over:
+        # Planned for a rented card, solving on this one. The budget and the
+        # rates belong to the other machine and would mis-route this run --
+        # the whole class of bug this strip exists to prevent is a config that
+        # claims a grid fits in VRAM this card does not have.
+        cfg = config_from(ws, run_dir, answers)
+        with open(cfgpath, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        print(c("  planning override dropped -- solving against this card",
+                "2"))
     _stream_solve(cfgpath, run_dir)
+
+
+def _no_tiling_advice(ooc: dict, offer: dict) -> None:
+    """
+    Nothing fits at the configured step length. Say why, then list *every*
+    lever rather than the first one that happens to apply.
+
+    The old version was an if/elif chain, so a grid where both a shorter step
+    and dropping the warm start would have worked only ever heard about the
+    step -- and the step is the one that costs accuracy, so it was reliably
+    naming the worst of the available fixes first.
+    """
+    # The smallest tile is one column of interior inside the halo, so it costs
+    # (1 + 2h)^2 columns -- and h is set by the longest step, not by the grid.
+    h = ooc.get("halo_cells", [0, 0])[0]
+    w = ooc.get("min_window_cells", 1 + 2 * h)
+    print(c(f"  No tiling fits at this step length. The reach is "
+            f"{ooc.get('reach_cm', 0):.0f} cm = {ooc.get('reach_cells', 0):.0f}"
+            f" cells, so the halo is {h} and the smallest tile is {w}x{w} "
+            f"columns of {human(ooc.get('column_bytes', 0))} -- against "
+            f"{human(ooc.get('budget_bytes', 0))} of usable VRAM.", "31"))
+    print()
+    print("  Three levers, cheapest first:")
+
+    # 1. The column, which is the real constraint and the only lever that
+    #    costs nothing but resolution on axes that are usually over-resolved.
+    lever1 = ("  1. A coarser heading bin, velocity cell or omega cell. Those "
+              "three multiply out to the column, the column sets the smallest "
+              "tile, and halving it doubles the tile you can hold at the same "
+              "step length. This is almost always the right fix.")
+    ic = offer.get("in_core")
+    if ic:
+        lever1 += (f" Coarsening everything {ic['scale']:.2f}x -- "
+                   f"{ic['xy_cm']:.1f} cm, {ic['heading_deg']:.1f} deg, "
+                   f"{ic['v_cm_s']:.0f} cm/s, {ic['w_rad_s']:.2f} rad/s -- "
+                   f"drops it to {ic['cells']:,} cells, which holds whole and "
+                   f"skips tiling altogether.")
+    print(c(lever1, "1;33"))
+
+    # 2. Free, and costs only convergence rate.
+    if ooc.get("warm_start_would_help"):
+        print(c("  2. Set warm_start_tiled to false: it drops the resident "
+                "cost from 7 bytes a cell to 4, which is enough on its own "
+                "here. It costs convergence rate, not accuracy -- the "
+                "self-test measured 144 rounds warm against 250 cold.", "1;33"))
+    else:
+        print(c("  2. warm_start_tiled is already off, or would not be enough "
+                "on its own.", "2"))
+
+    # 3. Last, because it is the only one that makes the answer worse.
+    if "suggest_tau_max" in ooc:
+        bits = []
+        for pre, lead in (("suggest", "fits from"),
+                          ("comfortable", "worth starting at")):
+            if pre + "_tau_max" not in ooc:
+                continue
+            bits.append(f"{lead} {ooc[pre+'_tau_max']} s "
+                        f"({ooc[pre+'_amplification']:.1f}x loaded per updated, "
+                        f"about {hms(ooc[pre+'_total_s'])} to run, "
+                        f"+{ooc[pre+'_value_cost']:.0f}% on mean value)")
+        print(c("  3. A shorter 'longest step': " + "; ".join(bits) + ".",
+                "1;33"))
+        print(c("     This is the only lever that makes the answers worse, "
+                "and it is a steep trade: 0.2 s costs about +6% on mean "
+                "value, 0.1 s about +21%, 0.06 s about +56%.", "33"))
+    else:
+        print(c("  3. Even the shortest step will not fit, so the step is not "
+                "the problem -- the column is. See lever 1.", "1;33"))
 
 
 def _stream_solve(cfgpath: str, run_dir: str) -> None:
@@ -673,11 +1433,32 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
     bar = Bar("solving")
     n_targets = 1
     done_targets = 0
+    tiled = False
     started = time.time()
+    solve_started = [None]      # when the first target actually began
+
+    def show(frac: float, note: str) -> None:
+        """Draw the bar with a whole-run estimate rather than a per-target one.
+
+        The solver's own `eta_s` only covers the target it is on, which on a
+        three-target run understates by a factor of three near the start. This
+        measures the rate the whole run has actually achieved since the first
+        target began -- setup and occupancy excluded, because they happen once
+        and would flatter the rest -- and extrapolates from that.
+        """
+        frac = min(1.0, max(0.0, frac))
+        if solve_started[0] is None:
+            solve_started[0] = time.time()
+        el = time.time() - solve_started[0]
+        eta = (f"  left {hms(el * (1.0 - frac) / frac)}"
+               if frac > 0.01 and el > 5.0 else "")
+        bar.update(frac, note + eta)
+
     print()
 
     proc = subprocess.Popen(
-        [julia_exe(), f"--project={SOLVER_PROJ}", SOLVER, cfgpath, "solve"],
+        [julia_exe(), f"--project={SOLVER_PROJ}", "--threads=auto", SOLVER,
+         cfgpath, "solve"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     with open(logpath, "w", encoding="utf-8") as log:
@@ -697,21 +1478,43 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
             elif ph == "occupancy":
                 print(f"  obstacles block {ev['blocked_frac']*100:.1f}% of the "
                       f"xy plane")
+            elif ph == "decompose":
+                # Too big to hold whole, so it is being solved a tile at a
+                # time. An "iteration" below is then a round over every tile.
+                tiled = True
+                tx, ty = ev["tile_cells"]
+                hx, hy = ev["halo_cells"]
+                print(f"  tiled: {ev['tiles']} tiles of {tx}x{ty} cells, "
+                      f"halo {hx}x{hy} ({ev['reach_cells']:.0f} cell reach), "
+                      f"{ev['amplification']:.1f}x loaded per updated")
+                print(f"  scratch file {human(ev['store_bytes'])}, "
+                      f"{human(ev['resident_bytes'])} resident on the GPU")
             elif ph == "backend":
                 print(f"  backend: {c(ev['backend'].upper(), '1;32')}")
                 print()
             elif ph == "solve":
                 frac = (done_targets + ev["iter"] / max(1, ev["iters"])) / n_targets
-                bar.update(frac,
-                           f"{ev['target_name']}  it {ev['iter']}/{ev['iters']}  "
-                           f"eta {hms(ev['eta_s'] + 0)}")
+                unit = "round" if tiled else "it"
+                show(frac, f"{ev['target_name']}  {unit} "
+                           f"{ev['iter']}/{ev['iters']}")
+            elif ph == "tile":
+                # A round over a full-scale grid can be tens of minutes, so
+                # the bar has to move inside one or it looks hung. The tile
+                # index is a genuine fraction of the round, so this is real
+                # progress rather than a spinner.
+                rounds = max(1, ev.get("rounds", 1))
+                within = (ev["round"] - 1 + ev["tile"] / max(1, ev["tiles"])) / rounds
+                show((done_targets + within) / n_targets,
+                     f"{ev['target_name']}  round {ev['round']}/{rounds}  "
+                     f"tile {ev['tile']}/{ev['tiles']}")
             elif ph == "encode":
-                bar.update((done_targets + 1) / n_targets,
-                           f"{ev['target_name']}  writing "
-                           f"({ev['reached_frac']*100:.0f}% reachable)")
+                show((done_targets + 1) / n_targets,
+                     f"{ev['target_name']}  writing")
             elif ph == "target_done":
                 done_targets += 1
-                bar.update(done_targets / n_targets, f"{ev['target_name']} done")
+                show(done_targets / n_targets,
+                           f"{ev['target_name']} done "
+                           f"({ev['reached_frac']*100:.0f}% reachable)")
             elif ph == "done":
                 bar.done(f"{ev['targets']} table(s) in {hms(time.time()-started)}")
         err = proc.stderr.read()

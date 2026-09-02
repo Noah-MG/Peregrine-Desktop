@@ -29,6 +29,13 @@ Chunk filenames are `T` + two-digit target + `C` + four-digit chunk + `.BIN`,
 which is a strict 8.3 name. On FAT32 a long filename consumes several
 directory entries; an 8.3 name consumes one.
 
+That naming caps a target at 10000 chunks and the card at 100 targets. At the
+default `chunk_elements` of 2^23 those are not close: a full-resolution grid
+of `[161, 161, 64, 21, 21, 21]` is 15.4 billion cells, which is 1832 chunks
+and 28.6 GB per target at `u16`. What a card that size *does* run into is
+sheer file count -- a few thousand entries in `/TABLES` -- so it is worth
+formatting exFAT rather than FAT32 when the tables get past a few gigabytes.
+
 Nothing else belongs on the card.
 
 ---
@@ -47,11 +54,12 @@ Nothing else belongs on the card.
   "grid": {
     "axes":  ["x", "y", "h", "vx", "vy", "w"],
     "n":     [46, 46, 24, 13, 13, 13],
-    "min":   [0.0, 0.0, -3.14159265, -150.0, -150.0, -10.0],
-    "max":   [366.0, 366.0, 3.14159265, 150.0, 150.0, 10.0],
+    "min":   [23.0, 23.0, -3.14159265, -170.0, -170.0, -8.0],
+    "max":   [343.0, 343.0, 3.14159265, 170.0, 170.0, 8.0],
     "wrap":  [false, false, true, false, false, false],
     "units": ["cm", "cm", "rad", "cm/s", "cm/s", "rad/s"],
     "frame": "field",
+    "field_bounds": [0.0, 0.0, 366.0, 366.0],
     "total_cells": 111572448,
     "index_formula": "((((ix*Ny+iy)*Nh+ih)*Nvx+ivx)*Nvy+ivy)*Nw+iw"
   },
@@ -104,12 +112,42 @@ Every name used in the rest of this document comes from that file:
 Read these from the file rather than hard-coding them. The grid is expected to
 change as the resolution gets tuned; that should not require a firmware change.
 
+### The table is narrower than the field
+
+`min[0..1]` and `max[0..1]` are **not** the field boundary, and in the example
+above they are 23 cm inside it on every side. They span the positions the
+robot can legally *occupy*: the field, inset by the robot's own footprint and
+by `solver.wall_clearance_cm`. A state outside that span is one where part of
+the chassis is through the perimeter wall, which is not a place the robot can
+be, so no value is stored for it.
+
+`grid.field_bounds` carries the field the inset was taken from, as
+`[x_min, y_min, x_max, y_max]`. It is informational — every lookup uses
+`min`/`max` — and it is there so a table can be matched back to the field it
+was cut from without re-deriving the inset.
+
+Nothing about the lookup changes. §3 clamps `x` and `y` into `min..max` as it
+always has, and for a position between the table edge and the wall that clamp
+now lands on the nearest state the robot could actually hold, which is the
+right answer to give. The inset is heading-dependent — a rectangular chassis
+needs more room across its diagonal — so the span is the union over headings
+and the headings that need more are marked unreachable cell by cell, exactly
+as an obstacle is.
+
 Three fields are informational rather than needed for lookup:
 `sha256` covers the concatenated logical table in index order, so it does not
 change if the chunking does; `reached_frac` is the fraction of cells that got
 a real answer, and a low value warns that much of the state space could not
 reach that target; `regression_sha256` and `field_sha256` identify which
 drivetrain fit and field description produced the tables.
+
+Everything under `solver` is informational too, and the robot reads none of
+it. `solver.driver` says whether the table came from a whole-grid solve or a
+tiled out-of-core one, and `solver.tiling` records how it was cut if so. The
+two converge to the same fixed point, so a tiled table is not a different
+kind of table -- the field is there because "which driver produced this" is
+the first thing worth being able to answer without guessing when a table does
+look wrong.
 
 ---
 
@@ -154,10 +192,16 @@ wrap[k] == false:   i = clamp(round(c), 0, n[k] - 1)
 wrap[k] == true:    i = mod(round(c), n[k])
 ```
 
-Clamping is correct behaviour, not a fallback. A position off the field is
-meaningless, and a velocity past the edge of the grid means the robot is
-moving faster than the drivetrain model was ever fitted for; the nearest edge
-cell is the best answer available in both cases.
+Clamping is correct behaviour on the position axes, not a fallback. `min` and
+`max` bound the positions the robot can legally occupy (see §2), so a query
+beyond them is a state with part of the chassis through a wall; the nearest
+edge cell is the nearest state it could actually be in, and that is the best
+answer available.
+
+The velocity axes are **not** the same case. Clamping there would price
+exceeding the envelope at zero, and the drivetrain really can exceed it — see
+the note in §9. Treat a velocity query outside `min`/`max` as "no value
+available" rather than clamping it.
 
 `mod` on the heading axis is what makes index `n[2]` fold back to `0`. Use it
 for neighbours too: index `n[2] - 1` and index `0` are adjacent, not opposite
@@ -234,9 +278,16 @@ Integers compare exactly, so `==` is safe there. Floats need `isnan`, because
 
 Unreachable must be treated as `+infinity`, not as a large finite number, so
 it loses every comparison against a real route. It covers three situations —
-inside an obstacle, off the field, or no route found within the solved horizon
-— which are deliberately not distinguished, since all three mean the same
-thing to the robot.
+the footprint overlapping an obstacle or the perimeter wall at that heading,
+a state outside the solved envelope, or no route found within the solved
+horizon — which are deliberately not distinguished, since all three mean the
+same thing to the robot.
+
+The wall case is worth calling out because it is new as of 2026-08-31 and it
+is common: cells within roughly a footprint of the table edge are unreachable
+at the headings whose chassis would not fit there, and reachable at the
+headings whose would. A robot that finds `unreachable` while hugging a wall
+is being told to turn, not that the table is broken.
 
 The default `u16` with `scale = 0.001` is plain milliseconds: exact to 1 ms up
 to 65.534 s, in half the space of `f32`. `f16` is the same size but carries
@@ -251,26 +302,27 @@ byte, which is worth it when the horizon is short and the grid is large.
 Using the manifest shown in §2, and the state
 
 ```
-x = 100 cm, y = 200 cm, h = 1.0 rad, vx = 50 cm/s, vy = -30 cm/s, w = 2.0 rad/s
+x = 100 cm, y = 200 cm, h = 1.0 rad, vx = 50 cm/s, vy = -30 cm/s, w = 2.5 rad/s
 ```
 
-**Steps** (§3), with `n = [46, 46, 24, 13, 13, 13]`:
+**Steps** (§3), with `n = [46, 46, 24, 13, 13, 13]`. Note that `step[0]` comes
+from the *table* span, 23..343, not from the 366 cm field:
 
 ```
-step[0] = (366 - 0) / (46 - 1)   = 8.133333    step[3] = 300 / 12 = 25.0
-step[1] = (366 - 0) / (46 - 1)   = 8.133333    step[4] = 300 / 12 = 25.0
-step[2] = 2*pi / 24              = 0.261799    step[5] =  20 / 12 =  1.666667
+step[0] = (343 - 23) / (46 - 1)  = 7.111111    step[3] = 340 / 12 = 28.333333
+step[1] = (343 - 23) / (46 - 1)  = 7.111111    step[4] = 340 / 12 = 28.333333
+step[2] = 2*pi / 24              = 0.261799    step[5] =  16 / 12 =  1.333333
 ```
 
 **Indices** (§3):
 
 ```
-ix  = round((100 - 0)      / 8.133333) = round(12.2951) = 12
-iy  = round((200 - 0)      / 8.133333) = round(24.5902) = 25
-ih  = round((1.0 - -pi)    / 0.261799) = round(15.8197) = 16   (mod 24)
-ivx = round((50 - -150)    / 25.0)     = round( 8.0000) =  8
-ivy = round((-30 - -150)   / 25.0)     = round( 4.8000) =  5
-iw  = round((2.0 - -10)    / 1.666667) = round( 7.2000) =  7
+ix  = round((100 - 23)     / 7.111111)  = round(10.8281) = 11
+iy  = round((200 - 23)     / 7.111111)  = round(24.8906) = 25
+ih  = round((1.0 - -pi)    / 0.261799)  = round(15.8197) = 16   (mod 24)
+ivx = round((50 - -170)    / 28.333333) = round( 7.7647) =  8
+ivy = round((-30 - -170)   / 28.333333) = round( 4.9412) =  5
+iw  = round((2.5 - -8)     / 1.333333)  = round( 7.8750) =  8
 ```
 
 **Flat index** (§4):
@@ -278,22 +330,22 @@ iw  = round((2.0 - -10)    / 1.666667) = round( 7.2000) =  7
 Evaluated from the inside out, one axis per line:
 
 ```
-     12 * 46 + 25  =        577      folded in iy
-    577 * 24 + 16  =      13864      folded in ih
-  13864 * 13 +  8  =     180240      folded in ivx
- 180240 * 13 +  5  =    2343125      folded in ivy
-2343125 * 13 +  7  =   30460632      folded in iw   -> idx
+     11 * 46 + 25  =        531      folded in iy
+    531 * 24 + 16  =      12760      folded in ih
+  12760 * 13 +  8  =     165888      folded in ivx
+ 165888 * 13 +  5  =    2156549      folded in ivy
+2156549 * 13 +  8  =   28035145      folded in iw   -> idx
 ```
 
 **File and offset** (§5), with `chunk_shift = 23`:
 
 ```
-chunk         = 30460632 >> 23      = 3          -> TABLES/T00C0003.BIN
-elem_in_chunk = 30460632 & 8388607  = 5294808
-byte_offset   = 5294808 * 2         = 10589616
+chunk         = 28035145 >> 23      = 3          -> TABLES/T00C0003.BIN
+elem_in_chunk = 28035145 & 8388607  = 2869321
+byte_offset   = 2869321 * 2         = 5738642
 ```
 
-**Decode** (§6): read 2 bytes little-endian at 10589616. If they read `65535`,
+**Decode** (§6): read 2 bytes little-endian at 5738642. If they read `65535`,
 the state is unreachable; otherwise the answer is `raw * 0.001` seconds.
 
 ---
@@ -355,12 +407,21 @@ a = A_u   * u
 Read the shapes from the declared `state`, `control` and `output` vectors
 rather than hard-coding 3 and 6.
 
-Several blocks are usually zero. The dynamics have no position dependence, so
-the `x, y, h` columns of every state block are zero; there are no
-control-squared terms, so `A_uu` is zero; and `A_ss` is zero whenever the
-`omega²` term is off, which is the normal case. **`nonzero_blocks` lists the
-ones actually carrying anything** — skip the rest if you want the speed. They
-are all emitted regardless so the equation never changes shape.
+Several blocks are always or usually zero:
+
+- The `x, y, h` columns of every state block are **always** zero. The dynamics
+  have no position dependence, and the command reaches position only through
+  velocity: `u` enters as an acceleration and nothing else. Both the writer
+  and `verify_tables.py` refuse a file that breaks this.
+- `A_uu` is **always** zero. Control-squared terms are not part of this model
+  and cannot be fitted — a `u²` column is even in `u`, so it would claim the
+  same force for full forward and full reverse, and the command curvature that
+  is really there is already carried by the traction knee (§8.3).
+- `A_ss` is zero whenever the `omega²` term is off, which is the normal case.
+
+**`nonzero_blocks` lists the ones actually carrying anything** — skip the rest
+if you want the speed. They are all emitted regardless so the equation never
+changes shape.
 
 ### 8.3 The two helper functions
 
@@ -371,12 +432,17 @@ delivering and extra command buys no extra force.
 knee = MODEL.JSON -> control.saturation.knee
 
 traction_gain(u_raw):
-    if knee is null or knee <= 0:  return 1
     m = sqrt(fwd² + strafe² + turn²)         # one shared traction budget
     r = m / knee
     if r < 1e-6:                   return 1  # avoid 0/0
     return tanh(r) / r
 ```
+
+`knee` is **required and always positive**. There is no "no saturation" case
+to branch on: the gains in `A_u` were fitted against the saturated command, so
+a file without a knee would describe dynamics nothing evaluates. A card whose
+knee is missing, null or ≤ 0 is rejected by `verify_tables.py` — treat it as a
+bad card rather than defaulting the gain to 1.
 
 It is 1 for small demand, falls off smoothly past the knee, and never changes
 the *direction* of the command — only its magnitude. Because it is derived
@@ -455,11 +521,110 @@ when reading a file:
   odometry tracking point leaking in.
 - The traction knee is fitted per run and **describes that floor**. A grippier
   surface slips later. Re-measure when the surface changes; a knee measured on
-  a slippery practice floor will make the robot look weaker than it is.
+  a slippery practice floor will make the robot look weaker than it is. The
+  fitter always chooses one — the search picks the best knee rather than
+  deciding whether to have a knee — and prints what it bought over an
+  unsaturated reference. A small gain there means the run never crossed the
+  traction limit, so read the knee as an upper bound and re-measure on a run
+  that does cross it.
+- There is no control-squared block to fit, and no flag that adds one. See
+  §8.2.
 - `A_s`, `A_sgn` and `A_absv` are collinear — linear `v`, `csign(v)` and
   `|v|·v` are all odd monotonic functions of the same variable, so how the fit
   splits a given behaviour between them is somewhat arbitrary. Use them
   together; do not read one coefficient on its own as physics.
+
+### 8.7 A complete example
+
+A real `/MODEL.JSON`, cm units, wrapped for readability. Numbers are from a
+run with Coulomb friction and drag on and `omega²` off — the normal case.
+
+```json
+{
+  "schema_version": 2,
+  "generator": "peregrine-desktop",
+  "regression_sha256": "9f1c0a3e5b7d2e48a6c1f0b93d7e5a2c4b8f6013d29e7a5c1b0f4e8d3a6c9b72",
+  "equation": "a = A_s*s + A_u*u + A_ss*(s.*s) + A_uu*(u.*u) + A_sgn*csign(s) + A_absv*(abs(s).*s) + k",
+  "csign": {
+    "formula": "csign(s)_i = clamp(s_i / coulomb_eps_i, -1, 1)",
+    "coulomb_eps": [0.0, 0.0, 0.0, 5.0, 5.0, 0.15],
+    "why": "Coulomb friction is smoothed instead of using a hard sign(), which would flip discontinuously at zero and make an integrator chatter. Use exactly this form."
+  },
+  "output": {
+    "vector": ["a_x", "a_y", "alpha"],
+    "units": ["cm/s^2", "cm/s^2", "rad/s^2"],
+    "frame": "robot body"
+  },
+  "state": {
+    "vector": ["x", "y", "h", "vx", "vy", "w"],
+    "units": ["cm", "cm", "rad", "cm/s", "cm/s", "rad/s"],
+    "frame_note": "IMPORTANT: vx and vy must be rotated into the ROBOT BODY frame before use here. The value tables index field-frame velocity, so rotate by -h between the two. Motor forces act along the body axes, which is why the model cannot be written with constant matrices in the field frame. x, y and h have zero coefficients throughout."
+  },
+  "control": {
+    "vector": ["fwd", "strafe", "turn"],
+    "note": "mecanum projection of the wheel powers; the admissible set is |fwd| + |strafe| + |turn| <= 1",
+    "saturation": {
+      "knee": 0.55,
+      "formula": "m = norm(u_raw); u = u_raw * tanh(m/knee) / (m/knee)",
+      "why": "Past the knee the tyres stop delivering, so extra command buys no extra force. APPLY THIS BEFORE A_u -- the gains were fitted against the saturated command. The knee is always present and positive."
+    }
+  },
+
+  "A_s": [
+    [0.0, 0.0, 0.0, -2.418,  0.061,  1.472],
+    [0.0, 0.0, 0.0,  0.037, -3.106, -0.884],
+    [0.0, 0.0, 0.0,  0.0021, 0.0009, -4.233]
+  ],
+  "A_u": [
+    [318.44,   6.12,  -4.87],
+    [ -5.33, 241.07,   3.94],
+    [  0.128, -0.061, 13.706]
+  ],
+  "A_ss":  [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+  "A_uu":  [[0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0]],
+  "A_sgn": [
+    [0.0, 0.0, 0.0, -21.66,  -0.42,   0.53],
+    [0.0, 0.0, 0.0,  -0.31, -27.94,  -0.18],
+    [0.0, 0.0, 0.0,  0.004, -0.002, -1.882]
+  ],
+  "A_absv": [
+    [0.0, 0.0, 0.0, -0.00417,  0.00008,  0.0312],
+    [0.0, 0.0, 0.0,  0.00011, -0.00583, -0.0204],
+    [0.0, 0.0, 0.0,  0.0,      0.0,     -0.2461]
+  ],
+  "k": [0.0, 0.0, 0.0],
+
+  "constant_zeroed": true,
+  "nonzero_blocks": ["A_s", "A_u", "A_sgn", "A_absv"]
+}
+```
+
+Reading it back against the rules above:
+
+- `A_uu` is all zeros and is not in `nonzero_blocks` — as it always is.
+- Every state block's first three columns (`x`, `y`, `h`) are zero, so nothing
+  in the file couples the command or the state to *where* the robot is.
+- `k` is zero and `constant_zeroed` is true: the solve zeroed the fitted
+  constant, so the file reports what the tables were actually solved with.
+- `A_ss` is present but zero because `omega²` was off. Evaluate it anyway if
+  you are not consulting `nonzero_blocks`; the answer is the same.
+- The off-diagonal `A_u` entries are small but not zero. That is normal — a
+  real chassis is not perfectly symmetric — and they must not be rounded away.
+
+Worked step, using §8.4 with `u_raw = [1.0, 0.0, 0.0]` from rest:
+
+```
+m = 1.0,  r = 1.0/0.55 = 1.8182,  gain = tanh(1.8182)/1.8182 = 0.5218
+u = [0.5218, 0, 0]
+a = A_u * u = [166.2, -2.78, 0.067]        (s = 0, so every other block drops)
+```
+
+166 cm/s², not the 318 that `A_u` alone suggests. Skipping step 4 would have
+the robot plan for nearly double the acceleration it can produce.
 
 ## 9. Notes for the robot side
 
@@ -471,6 +636,41 @@ two, so a small cache keyed by chunk number is enough.
 which is fine for ranking candidate directions. For a continuous value,
 interpolate between neighbouring cells — wrapping on the heading axis and
 clamping on the other five, per §3.
+
+**The table is solved with the interpolant you read it with.** As of
+2026-08-25 the solver's Bellman backup uses 6D Kuhn (Freudenthal) simplex
+interpolation — the same 7-vertex simplex the online optimizer locates to
+recover `grad(V)`. That is deliberate: `V` is the fixed point of whichever
+interpolant the backup is written with, so a table solved with 64-point
+multilinear and read with simplex differences is self-consistent under an
+operator nobody applies. `MANIFEST.JSON` records which was used under
+`solver.interpolant`. If the robot-side gradient recovery ever changes, the
+solver's `simplex` flag has to change with it.
+
+If you *do* choose a command by minimising `T + V(state after holding it for
+T)` rather than by the gradient rule, note that `T` must be a real planning
+horizon, not the loop period. A minimum-time value function satisfies
+`V(s) − V(s′) = T` along an optimal path: the value earned is proportional to
+`T`, while from a standstill the *state* only moves as `T²`. Too small and
+every command loses to standing still — a 0.02 s horizon parks the robot a
+few centimetres short and holds it there indefinitely, while 0.15 s drives in
+cleanly.
+
+**The wall is an obstacle, and the table already knows it.** As of 2026-08-31
+the solver sweeps the robot footprint against the perimeter exactly as it does
+against every other obstacle, and holds `solver.wall_clearance_cm` off it. Two
+consequences for the robot side. The stored span is smaller than the field, so
+read `grid.min`/`grid.max` and do not substitute the field dimensions for them
+(§2). And a wall-hugging state can be unreachable at one heading and fine at
+the heading 90° from it, which is the table correctly describing a chassis
+that does not fit sideways into a gap — not a hole in the solve.
+
+**Stay inside the velocity envelope.** `grid.min` and `grid.max` bound `vx`,
+`vy` and `ω`, and the table says nothing outside them — states beyond the box
+are unreachable, not merely expensive. The drivetrain can exceed those speeds
+(the fitted model's terminal speed is far above a typical `vmax`), so this is
+a live constraint, not a theoretical one. Treat a query outside the envelope
+as "no value available" and fall back, rather than clamping it to the edge.
 
 ---
 

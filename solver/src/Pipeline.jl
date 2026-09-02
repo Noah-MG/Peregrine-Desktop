@@ -136,6 +136,121 @@ function point_too_close(px::Float64, py::Float64, B::Matrix{Float64}, d::Real)
 end
 
 """
+The heading angles `build_occupancy` rasterises, bin by bin.
+
+Kept as its own function because three things have to agree on it exactly:
+the occupancy build, the feasible-bounds calculation that sizes the grid, and
+the self-test that checks one against the other. A bin whose bounds came from
+one angle set and whose occupancy came from another would show up as a thin
+ring of cells that the grid calls legal and the mask calls blocked -- or, far
+worse, the other way round.
+
+`nh` bins span the full turn from -pi with step `2pi/nh`, matching
+`axisvalue(g, 3, k)`. Each bin is covered by `substeps` angles spanning it,
+so a heading between two bin centres cannot sneak through.
+"""
+function heading_bin_angles(nh::Integer, substeps::Integer)
+    step = 2pi / nh
+    half = step / 2
+    map(0:(Int(nh) - 1)) do k
+        c = -pi + k * step
+        substeps <= 1 ? [c] :
+        [c - half + 2half * (s - 1) / (substeps - 1) for s in 1:Int(substeps)]
+    end
+end
+
+"""
+How far the footprint reaches past the tracking point at heading `theta`, on
+each of the four sides: `(xlo, xhi, ylo, yhi)`.
+
+`xlo` is the reach in the *negative* x direction, reported positive, because
+that is the form the wall constraint wants: the tracking point has to sit at
+least `xlo` inboard of the left wall.
+"""
+function footprint_reach(robot::Union{Nothing,Matrix{Float64}}, theta::Real)
+    (robot === nothing || size(robot, 2) < 3) && return (0.0, 0.0, 0.0, 0.0)
+    c, s = cos(theta), sin(theta)
+    xlo = -Inf; xhi = -Inf; ylo = -Inf; yhi = -Inf
+    @inbounds for i in 1:size(robot, 2)
+        rx = c * robot[1, i] - s * robot[2, i]
+        ry = s * robot[1, i] + c * robot[2, i]
+        xlo = max(xlo, -rx); xhi = max(xhi, rx)
+        ylo = max(ylo, -ry); yhi = max(yhi, ry)
+    end
+    (xlo, xhi, ylo, yhi)
+end
+
+"""
+The box of tracking-point positions that keep the whole footprint inside the
+field, with `clearance` held off the wall, at one heading.
+
+The exterior wall is an obstacle like any other, and this is what "like any
+other" has to mean for it. An obstacle gets the robot's own shape swept in
+and the safety gap held around it; the field boundary now gets exactly the
+same two things, from the inside. Before this existed the boundary was a
+constraint on the tracking *point* alone, so a 36 cm chassis could park with
+18 cm of itself outside the field -- a rule strictly looser than the one
+applied to a wall-hugging obstacle one centimetre inboard of it.
+
+Returned as `(xlo, xhi, ylo, yhi)`. A heading the field cannot accommodate at
+all comes back with `xlo` above `xhi`, which the callers test for rather than
+silently building an empty grid from.
+"""
+function wall_box(bounds::NTuple{4,Float64},
+                  robot::Union{Nothing,Matrix{Float64}},
+                  clearance::Real, theta::Real)
+    rxlo, rxhi, rylo, ryhi = footprint_reach(robot, theta)
+    d = Float64(clearance)
+    (bounds[1] + d + rxlo, bounds[3] - d - rxhi,
+     bounds[2] + d + rylo, bounds[4] - d - ryhi)
+end
+
+"""
+The x/y span the value table actually has to cover.
+
+Every state outside it is one the robot cannot legally hold at any heading,
+so storing it would be storing `unreachable` -- and in six dimensions that
+saving is not marginal. On a 366 cm field with a 36 cm chassis and 5 cm of
+clearance the span drops to 320 cm a side, which is 76% of the cells.
+
+The box is the bounding box of the *union* over heading bins, not their
+intersection: a cell only one heading can occupy is still a real state and
+has to be in the table. Cells inside the box that no heading can occupy, and
+cells legal at some headings but not others, are handled where every other
+obstacle is -- per heading bin, in `build_occupancy`.
+
+Computed from the same bin angle sets the occupancy build uses, so the two
+cannot drift apart. Each bin is an intersection over its substep angles
+(blocked at any of them means blocked for the bin); the bins are then
+unioned.
+"""
+function feasible_bounds(bounds::NTuple{4,Float64},
+                         robot::Union{Nothing,Matrix{Float64}},
+                         clearance::Real, nh::Integer, substeps::Integer)
+    xlo = Inf; xhi = -Inf; ylo = Inf; yhi = -Inf
+    nfeas = 0
+    for angles in heading_bin_angles(nh, substeps)
+        bxlo = -Inf; bxhi = Inf; bylo = -Inf; byhi = Inf
+        for th in angles
+            a, b, c, d = wall_box(bounds, robot, clearance, th)
+            bxlo = max(bxlo, a); bxhi = min(bxhi, b)
+            bylo = max(bylo, c); byhi = min(byhi, d)
+        end
+        (bxlo <= bxhi && bylo <= byhi) || continue      # impossible heading
+        nfeas += 1
+        xlo = min(xlo, bxlo); xhi = max(xhi, bxhi)
+        ylo = min(ylo, bylo); yhi = max(yhi, byhi)
+    end
+    nfeas == 0 && error(
+        "the robot does not fit inside the field at any heading: the field " *
+        "is $(round(bounds[3] - bounds[1], digits = 1)) x " *
+        "$(round(bounds[4] - bounds[2], digits = 1)) cm, and the footprint " *
+        "plus $(clearance) cm of clearance needs more than that. Check the " *
+        "units on the robot polygon, or lower the clearance")
+    (xlo = xlo, xhi = xhi, ylo = ylo, yhi = yhi, headings = nfeas)
+end
+
+"""
 Rasterise the configuration-space obstacle onto the (x, y, h) grid.
 
 The C-obstacle of a polygonal robot among polygonal obstacles is **not** a
@@ -159,11 +274,21 @@ distance independent of how big the robot is. `margin_cm` is different and
 generally left at zero: it dilates the finished grid, which is only useful to
 force a very thin obstacle to occupy at least one cell.
 
+**The exterior wall is one of the obstacles.** Pass `bounds` and the boundary
+is enforced the same way the polygons are: the rotated footprint has to fit
+inside the field with `wall_clearance_cm` to spare, at every angle the bin
+covers. The constraint is separable in x and y, so it costs a comparison
+rather than a polygon test -- but it is the identical rule, and taking it
+from `wall_box` is what keeps it identical. Omit `bounds` and only the
+polygons are rasterised, which is how the self-test isolates the two.
+
 Result is Nx*Ny*Nh booleans -- still tiny next to the 6D value table.
 """
 function build_occupancy(g::Grid6, polys::Vector{Matrix{Float64}},
                          margin_cm::Real, robot::Union{Nothing,Matrix{Float64}},
-                         substeps::Int = 3, clearance_cm::Real = 0.0)
+                         substeps::Int = 3, clearance_cm::Real = 0.0;
+                         bounds::Union{Nothing,NTuple{4,Float64}} = nothing,
+                         wall_clearance_cm::Real = clearance_cm)
     nx, ny, nh = Int(g.n[1]), Int(g.n[2]), Int(g.n[3])
     occ = falses(nx, ny, nh)
     point_robot = robot === nothing || size(robot, 2) < 3
@@ -171,12 +296,47 @@ function build_occupancy(g::Grid6, polys::Vector{Matrix{Float64}},
     # Bounding radius, to skip cells that cannot possibly touch an obstacle.
     rad = point_robot ? 0.0 : maximum(sqrt.(robot[1, :] .^ 2 .+ robot[2, :] .^ 2))
 
+    # A tolerance, not a fudge, and it has to clear Float32. `feasible_bounds`
+    # puts the grid edge exactly on the most permissive heading's limit, so
+    # the outermost cell sits *on* the constraint -- and `axisvalue`
+    # reconstructs that limit in Float32, whose spacing is 2e-6 cm at 20 and
+    # 3e-5 cm at field scale. A tolerance below that blanks the entire outer
+    # ring of the table, which is a whole row of legal wall-hugging states
+    # thrown away over floating-point noise. Ten microns clears it by two
+    # orders of magnitude and is far below anything mechanical.
+    tol = 1.0e-3
+
     for k in 0:nh-1
         θc = Float64(axisvalue(g, 3, k))
         half = Float64(g.step[3]) / 2
         angles = substeps <= 1 ? (θc,) :
                  ntuple(s -> θc - half + 2half * (s - 1) / (substeps - 1),
                         substeps)
+
+        # The wall first. It is separable, so one pass along each axis marks
+        # every cell the footprint would hang out of the field at this
+        # heading. Blocked at any substep angle means blocked for the bin --
+        # the same union over substeps the polygon loop below builds.
+        if bounds !== nothing
+            for θ in angles
+                bxlo, bxhi, bylo, byhi = wall_box(bounds, robot,
+                                                  wall_clearance_cm, θ)
+                for i in 0:nx-1
+                    px = Float64(axisvalue(g, 1, i))
+                    (px < bxlo - tol || px > bxhi + tol) || continue
+                    for j in 0:ny-1
+                        occ[i+1, j+1, k+1] = true
+                    end
+                end
+                for j in 0:ny-1
+                    py = Float64(axisvalue(g, 2, j))
+                    (py < bylo - tol || py > byhi + tol) || continue
+                    for i in 0:nx-1
+                        occ[i+1, j+1, k+1] = true
+                    end
+                end
+            end
+        end
 
         for θ in angles
             Rr = point_robot ? zeros(2, 0) :
@@ -259,13 +419,18 @@ function load_model(path::AbstractString)
     D = haskey(mb, "D") ?
         NTuple{9,Float32}(Float32(mb["D"][r][cc]) for r in 1:3 for cc in 1:3) :
         NTuple{9,Float32}(ntuple(_ -> 0.0f0, 9))
-    # TOML cannot express null, so a disabled knee comes through as NaN.
-    # Normalise both spellings to 0, which the kernel reads as "off".
-    knee = 0.0f0
-    if haskey(mb, "traction_knee") && mb["traction_knee"] !== nothing
-        kv = Float32(mb["traction_knee"])
-        knee = isnan(kv) ? 0.0f0 : kv
-    end
+    # A traction knee is required. The gains were fitted against the saturated
+    # command, so a fit that arrives without one describes dynamics the solver
+    # would then not reproduce -- it would overestimate what the robot can do
+    # near full stick, which is exactly where the routes are planned. TOML
+    # cannot express null, so an absent knee shows up as NaN here.
+    haskey(mb, "traction_knee") && mb["traction_knee"] !== nothing ||
+        error("regression has no traction_knee; refit with " *
+              "fit_drivetrain.py --traction-knee auto")
+    knee = Float32(mb["traction_knee"])
+    (isnan(knee) || knee <= 0.0f0) &&
+        error("regression traction_knee is $(mb["traction_knee"]); a " *
+              "positive knee is required")
     eps = haskey(mb, "coulomb_eps") ?
         NTuple{3,Float32}(Float32(v) for v in mb["coulomb_eps"]) :
         (5.0f0, 5.0f0, 0.15f0)
@@ -384,16 +549,18 @@ waiting for the next one. The races this introduces are benign: every write
 only ever lowers a cell, so the iteration stays monotone and still converges
 to the same fixed point. This is standard asynchronous value iteration.
 """
-function sweep_cpu!(V, occ, g, m, ctl, nctl, dt, nsub, checks, nearest, cap)
+function sweep_cpu!(V, occ, pol, g, m, ctl, nctl, p::Params, phase::Integer;
+                    rev::Bool = false)
     n = ncells(g)
     total = Threads.Atomic{Float64}(0.0)
     Threads.@threads for i in 1:n
-        idx = Int64(i) - 1
-        c = cell_update(idx, V, occ, g, m, ctl, Int32(nctl), dt,
-                        Int32(nsub), Int32(checks), nearest, Float32(cap))
-        @inbounds old = V[i]
+        idx = rev ? Int64(n) - Int64(i) : Int64(i) - 1
+        c, u1, u2, u3 = cell_update(idx, V, occ, pol, g, m, ctl, Int32(nctl),
+                                    p, Int32(phase))
+        @inbounds old = V[idx + 1]
         if c < old
-            @inbounds V[i] = c
+            @inbounds V[idx + 1] = c
+            pol === nothing || pol_set!(pol, idx, Int64(n), u1, u2, u3)
             Threads.atomic_add!(total, Float64(old - c))
         end
     end
@@ -419,38 +586,67 @@ unreachable sentinel. Anything that saturates the integer range becomes the
 sentinel too -- from the robot's point of view "longer than this table can
 express" and "no route" are the same instruction: don't go there.
 """
-function encode(V::Vector{Float32}, dtype::String, scale::Float64, cap::Float32)
+function encode(V::AbstractVector{Float32}, dtype::String, scale::Float64,
+                cap::Float32)
+    buf = Vector{UInt8}(undef, length(V) * DTYPES[dtype].bytes)
+    encode_into!(buf, V, Int64(firstindex(V)), Int64(lastindex(V)), dtype,
+                 scale, cap)
+    buf
+end
+
+"""
+Encode `V[lo:hi]` into the front of `buf`, and count how many of those cells
+were reached.
+
+The range form is what lets a table be written without ever holding it, or
+its encoding, in memory at once: a full-scale grid is tens of gigabytes per
+target, so `encode` allocating a second copy of it is not a detail. The
+counting rides along because the alternative is a second pass over the same
+tens of gigabytes to learn one number.
+"""
+function encode_into!(buf::Vector{UInt8}, V::AbstractVector{Float32},
+                      lo::Int64, hi::Int64, dtype::String, scale::Float64,
+                      cap::Float32)
     unreached(v) = v >= cap || isinf(v) || isnan(v)
+    n = hi - lo + 1
+    reached = 0
     if dtype == "f32"
-        out = Vector{Float32}(undef, length(V))
-        @inbounds for i in eachindex(V)
-            out[i] = unreached(V[i]) ? NaN32 : V[i]
+        out = reinterpret(Float32, view(buf, 1:4n))
+        @inbounds for i in 1:n
+            v = V[lo + i - 1]
+            u = unreached(v)
+            reached += !u
+            out[i] = u ? NaN32 : v
         end
-        return reinterpret(UInt8, out)
     elseif dtype == "f16"
-        out = Vector{Float16}(undef, length(V))
-        @inbounds for i in eachindex(V)
-            out[i] = unreached(V[i]) ? Float16(NaN) : Float16(V[i])
+        out = reinterpret(Float16, view(buf, 1:2n))
+        @inbounds for i in 1:n
+            v = V[lo + i - 1]
+            u = unreached(v)
+            reached += !u
+            out[i] = u ? Float16(NaN) : Float16(v)
         end
-        return reinterpret(UInt8, out)
     elseif dtype == "u16"
-        out = Vector{UInt16}(undef, length(V))
-        @inbounds for i in eachindex(V)
-            v = V[i]
-            r = unreached(v) ? 0xffff : round(UInt32, v / scale)
+        out = reinterpret(UInt16, view(buf, 1:2n))
+        @inbounds for i in 1:n
+            v = V[lo + i - 1]
+            u = unreached(v)
+            reached += !u
+            r = u ? 0xffff : round(UInt32, v / scale)
             out[i] = r >= 0xffff ? 0xffff : UInt16(r)
         end
-        return reinterpret(UInt8, out)
     elseif dtype == "u8"
-        out = Vector{UInt8}(undef, length(V))
-        @inbounds for i in eachindex(V)
-            v = V[i]
-            r = unreached(v) ? 0xff : round(UInt32, v / scale)
-            out[i] = r >= 0xff ? 0xff : UInt8(r)
+        @inbounds for i in 1:n
+            v = V[lo + i - 1]
+            u = unreached(v)
+            reached += !u
+            r = u ? 0xff : round(UInt32, v / scale)
+            buf[i] = r >= 0xff ? 0xff : UInt8(r)
         end
-        return out
+    else
+        error("unknown dtype '$dtype'")
     end
-    error("unknown dtype '$dtype'")
+    reached
 end
 
 """
@@ -459,24 +655,52 @@ Write one target's table as chunked 8.3-named files.
 `chunk_elements` is a power of two so the robot resolves a cell with a shift
 and a mask rather than a division. See docs/TABLE_FORMAT.md.
 """
-function write_table(dir::AbstractString, target_index::Int, V::Vector{Float32},
+function write_table(dir::AbstractString, target_index::Int, V,
                      dtype::String, scale::Float64, chunk_elements::Int,
                      cap::Float32)
-    raw = encode(V, dtype, scale, cap)
     eb = DTYPES[dtype].bytes
     mkpath(dir)
-    chunk_bytes = chunk_elements * eb
-    nchunks = cld(length(raw), chunk_bytes)
+    cells = table_cells(V)
+    nchunks = Int(cld(cells, Int64(chunk_elements)))
+    # One chunk of values, and one chunk of encoded bytes, allocated once and
+    # refilled. The chunk is the unit the card is written in anyway, so
+    # streaming through it costs nothing and bounds what this needs in memory
+    # at a few tens of megabytes however large the table is -- which at full
+    # scale is the difference between writing the card and not.
+    vals = Vector{Float32}(undef, chunk_elements)
+    buf = Vector{UInt8}(undef, chunk_elements * eb)
     ctx = SHA.SHA256_CTX()
+    reached = Int64(0)
+    total = Int64(0)
     for ci in 0:nchunks-1
-        lo = ci * chunk_bytes + 1
-        hi = min(length(raw), (ci + 1) * chunk_bytes)
-        part = view(raw, lo:hi)
+        lo = Int64(ci) * Int64(chunk_elements) + 1
+        hi = min(cells, Int64(ci + 1) * Int64(chunk_elements))
+        n = hi - lo + 1
+        table_chunk!(vals, V, lo, n)
+        nb = Int(n * eb)
+        reached += encode_into!(buf, vals, Int64(1), n, dtype, scale, cap)
+        part = view(buf, 1:nb)
         name = @sprintf("T%02dC%04d.BIN", target_index, ci)
         open(joinpath(dir, name), "w") do io
             write(io, part)
         end
-        SHA.update!(ctx, collect(part))
+        SHA.update!(ctx, part)
+        total += nb
     end
-    (nchunks = nchunks, bytes = length(raw), sha256 = bytes2hex(SHA.digest!(ctx)))
+    (nchunks = nchunks, bytes = total, sha256 = bytes2hex(SHA.digest!(ctx)),
+     reached = reached, cells = cells)
 end
+
+"""
+How many values a table has, and how to get one chunk of them.
+
+Two implementations, because a table is written either straight out of an
+array -- device or host, whole grid in memory -- or out of the out-of-core
+store, which is a file. `write_table` is written once against these so that
+the two paths cannot drift apart in the chunking, the hashing or the
+unreachable count.
+"""
+table_cells(V::AbstractVector{Float32}) = Int64(length(V))
+
+table_chunk!(buf::Vector{Float32}, V::AbstractVector{Float32}, lo::Int64,
+             n::Int64) = (copyto!(buf, 1, V, Int(lo), Int(n)); nothing)

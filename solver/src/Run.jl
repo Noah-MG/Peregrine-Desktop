@@ -1,8 +1,13 @@
 # Orchestration: plan, solve every target, write tables and manifest.
 # Included into the PeregrineSolver module.
 
-const DEFAULT_VMAX = 150.0     # cm/s   -- a brisk but ordinary FTC chassis
-const DEFAULT_WMAX = 10.0      # rad/s  -- ~1.6 rev/s, matches the spin logs
+# The velocity envelope the table covers. These are not measurements of the
+# drivetrain -- the fitted model's terminal speed is far above either -- they
+# are a statement of how fast the robot is *allowed* to be planned to. Outside
+# the box the table says nothing at all (see `interp`), so raising them buys
+# reachable states and costs cells, and lowering them is a real speed limit.
+const DEFAULT_VMAX = 170.0     # cm/s   -- a quick FTC chassis, with headroom
+const DEFAULT_WMAX = 8.0       # rad/s  -- ~1.3 rev/s
 
 """Emit one machine-readable progress line for the Python wizard."""
 function progress(; kw...)
@@ -12,36 +17,813 @@ end
 
 getc(cfg, key, default) = haskey(cfg, key) && cfg[key] !== nothing ? cfg[key] : default
 
-"""
-Build the grid from the field bounds plus the velocity envelope.
+# Default resolution, in the units the axes are actually measured in. These
+# reproduce the sample counts the solver shipped with -- 41 x 41 x 16 x 11 x
+# 11 x 11 on a 366 cm field -- so they are a coarse starting point rather than
+# a recommendation. `plan` computes a recommendation from the field, the
+# footprint and a size budget; see `suggest_resolution`.
+const DEFAULT_XY_CM      = 8.0
+const DEFAULT_HEADING_DEG = 22.5
+const DEFAULT_V_CM_S     = 34.0
+const DEFAULT_W_RAD_S    = 1.6
 
-Heading always spans a full turn, so its bounds are implicit.
 """
-function build_grid(cfg, bounds)
-    n = NTuple{6,Int}(Int.(getc(cfg, "n", [41, 41, 16, 11, 11, 11])))
+Turn a physical resolution into sample counts and the exact span that
+realises it.
+
+**The cell size is the input and it is honoured exactly.** Asking for 5 cm
+pixels and getting 5.13 cm because the span did not divide by five is the
+behaviour this replaces: resolution is a property of the robot and the
+geometry it has to resolve, not of how wide the field happens to be. So the
+count is rounded up and the *span* moves to suit, never the other way round.
+
+Each axis rounds outward, and each in the way that suits it:
+
+  * `x`, `y` -- `ceil(span / cell) + 1` samples, and the surplus is split
+    evenly either side, so the table stays centred on the region the robot
+    can actually occupy. The surplus is under one cell and lands outside the
+    feasible box, where the wall rule marks it blocked anyway.
+  * `h` -- periodic, so the bin has to divide the full turn exactly. The
+    requested angle is the closest that does.
+  * `vx`, `vy`, `w` -- `2*ceil(limit / cell) + 1` samples, which does two
+    things at once: it holds the cell exactly, and it puts **zero on the
+    grid**. That matters more than it looks. Every target is a state at rest,
+    and rest is where the robot spends the approach; on an even count zero
+    falls between two samples and every value near it is an interpolation.
+    The envelope rounds up to suit, so `vmax` is a floor, never a ceiling.
+"""
+function axis_samples(span::Float64, cell::Float64)
+    cell > 0 || error("resolution must be positive, got $cell")
+    n = max(2, ceil(Int, span / cell - 1.0e-9) + 1)
+    (n = n, span = (n - 1) * cell)
+end
+
+function symmetric_samples(limit::Float64, cell::Float64)
+    cell > 0 || error("resolution must be positive, got $cell")
+    half = max(1, ceil(Int, limit / cell - 1.0e-9))
+    (n = 2 * half + 1, limit = half * cell)
+end
+
+"""The resolution block, with every axis in its own physical unit."""
+function grid_resolution(cfg)
+    r = getc(cfg, "resolution", Dict())
+    (xy_cm = Float64(getc(r, "xy_cm", DEFAULT_XY_CM)),
+     heading_deg = Float64(getc(r, "heading_deg", DEFAULT_HEADING_DEG)),
+     v_cm_s = Float64(getc(r, "v_cm_s", DEFAULT_V_CM_S)),
+     w_rad_s = Float64(getc(r, "w_rad_s", DEFAULT_W_RAD_S)))
+end
+
+"""
+Build the grid from the field, the robot, the velocity envelope and the
+resolution.
+
+The x and y bounds are **computed, not copied from the field file**. A table
+cell is a state the robot can hold, and it cannot hold a state whose
+footprint is outside the field -- so the span that has to be stored is the
+field inset by the footprint plus the wall clearance, at the most permissive
+heading. See `feasible_bounds`; on a 366 cm field with a 36 cm chassis that
+is 76% of the cells the old full-field span cost, describing exactly the same
+set of legal states.
+
+`MANIFEST.JSON` reports the span that is actually stored, which is what the
+robot reads, so a table narrower than the field is not something the robot
+side has to be told separately. A position between the table edge and the
+wall clamps to the edge cell, per section 3 of the format spec, and that edge
+cell is the nearest legal state -- which is the right answer to give.
+
+Two escape hatches, both for reproducing an older table rather than for
+ordinary use: `grid.n` sets the sample counts directly and the resolution
+falls out of the span instead of the other way round, and `grid.bounds`
+overrides the inset calculation with `[x_min, y_min, x_max, y_max]`.
+"""
+function build_grid(cfg, bounds::NTuple{4,Float64},
+                    robot::Union{Nothing,Matrix{Float64}} = nothing,
+                    wall_clearance::Real = 0.0, hsub::Integer = 3)
     vmax = Float64(getc(cfg, "vmax", DEFAULT_VMAX))
     wmax = Float64(getc(cfg, "wmax", DEFAULT_WMAX))
-    lo = (bounds[1], bounds[2], -π, -vmax, -vmax, -wmax)
-    hi = (bounds[3], bounds[4],  π,  vmax,  vmax,  wmax)
+    res = grid_resolution(cfg)
+    nfix = getc(cfg, "n", nothing)
+
+    # The heading count is needed before the box, because the box is a union
+    # over heading bins and the bins are what the count defines.
+    nh = nfix !== nothing ? Int(nfix[3]) :
+         max(4, round(Int, 360.0 / res.heading_deg))
+
+    ov = getc(cfg, "bounds", nothing)
+    fb = ov !== nothing ?
+        (xlo = Float64(ov[1]), ylo = Float64(ov[2]),
+         xhi = Float64(ov[3]), yhi = Float64(ov[4]), headings = nh) :
+        feasible_bounds(bounds, robot, wall_clearance, nh, hsub)
+
+    if nfix !== nothing
+        n = NTuple{6,Int}(Int.(nfix))
+        lo = (fb.xlo, fb.ylo, -π, -vmax, -vmax, -wmax)
+        hi = (fb.xhi, fb.yhi,  π,  vmax,  vmax,  wmax)
+        return Grid6(n, lo, hi)
+    end
+
+    ax = axis_samples(fb.xhi - fb.xlo, res.xy_cm)
+    ay = axis_samples(fb.yhi - fb.ylo, res.xy_cm)
+    av = symmetric_samples(vmax, res.v_cm_s)
+    aw = symmetric_samples(wmax, res.w_rad_s)
+    # Surplus split evenly, so the stored span stays centred on the feasible
+    # one rather than growing off one side.
+    padx = (ax.span - (fb.xhi - fb.xlo)) / 2
+    pady = (ay.span - (fb.yhi - fb.ylo)) / 2
+
+    n = (ax.n, ay.n, nh, av.n, av.n, aw.n)
+    lo = (fb.xlo - padx, fb.ylo - pady, -π, -av.limit, -av.limit, -aw.limit)
+    hi = (fb.xhi + padx, fb.yhi + pady,  π,  av.limit,  av.limit,  aw.limit)
     Grid6(n, lo, hi)
 end
 
-"""Size and feasibility report, cheap enough to run before committing."""
+"""
+Everything `build_grid` needs that does not come out of the `grid` block.
+
+`plan` and `run_solve` both build the same grid and have to agree on it to
+the last bit -- a plan that sized the table from one inset and a solve that
+used another would disagree about how many cells there are. One reader, used
+by both.
+"""
+function grid_inputs(cfg::AbstractDict, bounds::NTuple{4,Float64},
+                     robot::Union{Nothing,Matrix{Float64}})
+    clearance = Float64(getc(cfg, "clearance_cm", 5.0))
+    (bounds = bounds, robot = robot,
+     clearance = clearance,
+     # The wall is an obstacle, so by default it holds the obstacle gap. It is
+     # separately settable because the two are not always the same thing in
+     # practice: a perimeter wall is a surface a chassis may legitimately run
+     # close to, while a scoring structure usually is not.
+     wall_clearance = Float64(getc(cfg, "wall_clearance_cm", clearance)),
+     hsub = Int(getc(cfg, "heading_substeps", 3)))
+end
+
+build_grid(cfg, gi::NamedTuple) =
+    build_grid(cfg, gi.bounds, gi.robot, gi.wall_clearance, gi.hsub)
+
+"""
+How well the grid's position resolution matches its velocity resolution.
+
+A Bellman backup only learns from a step that leaves the cell it started in.
+For a drivetrain that can pull `a`, the distance covered while the speed
+changes by one velocity cell is `dv^2 / (2a)`. Compare that with the position
+cell:
+
+  * far below 1 -- resolving the velocity axis leaves position almost
+    stationary, so near-stationary states are heavily diffused and their
+    values come out pessimistic. This is the normal case near a target, and
+    the step-length ladder is what covers it.
+  * far above 1 -- the position axis is finer than the dynamics can use, and
+    the cells are being paid for without buying accuracy.
+
+Reported rather than enforced: the right resolution is a memory decision as
+much as an accuracy one, and the number is only meaningful next to how much
+time the robot actually spends near rest.
+"""
+function grid_balance(g::Grid6, m::Model)
+    ax = maximum(abs.(m.B[1:3])); ay = maximum(abs.(m.B[4:6]))
+    a = max(ax, ay)
+    a <= 0 && return (ratio = NaN, dv_distance_cm = NaN, accel_cm_s2 = 0.0)
+    dv = Float64(min(g.step[4], g.step[5]))
+    d = dv * dv / (2 * Float64(a))
+    (ratio = d / Float64(min(g.step[1], g.step[2])),
+     dv_distance_cm = d, accel_cm_s2 = Float64(a))
+end
+
+"""
+Every solver knob, read once.
+
+`plan` and `run_solve` both need these, and they must agree exactly: the plan
+report includes the dependency halo, and the halo is a function of the
+horizon ladder, the CFL number and the control set. A plan computed from a
+second reading of the config is a plan that can disagree with the run it is
+supposed to describe, and the way that failure shows up -- a halo one cell
+too small -- is silent.
+"""
+function solver_params(cfg::AbstractDict, g::Grid6)
+    dt = Float32(getc(cfg, "dt", 0.05))
+    nsub = Int(getc(cfg, "substeps", 4))
+    checks = Int(getc(cfg, "sweep_checks", 3))
+    nearest = Bool(getc(cfg, "nearest", false))
+    iters = Int(getc(cfg, "iterations", 400))
+    tol = Float64(getc(cfg, "tolerance", 1e-3))
+    # The lattice now only seeds the pattern search, and each sweep looks at
+    # `control_scan` entries of it rather than all of them, so a denser
+    # lattice costs sweeps-to-converge rather than time-per-sweep. That makes
+    # level 4 affordable where it used to be the expensive option. Corners
+    # alone (level 1) remain a bad idea: they made every cell pessimistic by
+    # ~1.8 s on a real model, because a plain diagonal was not in the menu.
+    level = Int(getc(cfg, "control_level", 4))
+    margin = Float64(getc(cfg, "margin_cm", 0.0))
+    # Safety gap held around every obstacle, applied before the robot's own
+    # footprint is swept in.
+    clearance = Float64(getc(cfg, "clearance_cm", 5.0))
+    # Half a cell, so the seed is normally the single nearest cell. The online
+    # optimizer owns the real arrival test; this only has to plant the seed.
+    ttol = NTuple{6,Float32}(Float32.(getc(cfg, "target_tol",
+              [g.step[k] * 0.5 for k in 1:6])))
+    # Unreached cells hold this finite value rather than Inf; see `interp`.
+    # It also bounds what the table can express, so keep it inside the dtype's
+    # range: u16 at 1 ms tops out at 65.5 s.
+    cap = Float32(getc(cfg, "value_cap", 60.0))
+
+    # Control search. `control_scan` is how many lattice entries each sweep
+    # looks at; 0 means all of them, which is the old behaviour. The lattice
+    # is only a seed for `refine_rounds` of pattern search, so a small scan
+    # plus refinement beats a big scan on both counts -- see `cell_update`.
+    scan = Int(getc(cfg, "control_scan", 8))
+    rounds = Int(getc(cfg, "refine_rounds", 2))
+    delta0 = Float64(getc(cfg, "refine_delta", 0.35))
+    warm = Bool(getc(cfg, "warm_start", true))
+    # Lookahead horizon. `cfl` is how many grid cells one backup should
+    # advance; the solver derives the seconds per cell from that and from how
+    # fast the robot is going, so `dt` is only the fallback for cfl = 0.
+    # `tau_levels` is how many horizons each cell brackets around it -- the
+    # accuracy dial the user actually sets.
+    # cfl 2 / 5 rungs measured best on both the dev and production grids:
+    # it is the ladder's REACH that pays, not its base, and longer steps also
+    # carry information across the grid faster, so it converges in fewer
+    # sweeps as well (248 -> 184 on the production grid).
+    ntau = Int(getc(cfg, "tau_levels", 5))
+    tau_ratio = Float64(getc(cfg, "tau_ratio", 2.0))
+    cfl = Float64(getc(cfg, "cfl", 2.0))
+    tau_min = Float64(getc(cfg, "tau_min", 0.004))
+    # `settle` resolves "auto" before this is reached, and is the only thing
+    # that should. Tolerating a leftover string here rather than throwing keeps
+    # a hand-written config that says "auto" from failing deep inside the
+    # parameter reader with a `Float64("auto")`; it lands on the reference,
+    # which is what "auto" means everywhere the grid holds whole.
+    _tm = getc(cfg, "tau_max", TAU_REF)
+    tau_max = _tm isa Real ? Float64(_tm) : TAU_REF
+    # Longest integration substep. Tying substeps to this rather than fixing
+    # their count keeps a long horizon from also being a less accurate one.
+    hmax = Float64(getc(cfg, "substep_max", dt / max(nsub, 1)))
+    achecks = Bool(getc(cfg, "adaptive_checks", true))
+    rk2 = Bool(getc(cfg, "rk2", true))
+    # Clamping out-of-envelope speeds prices leaving the velocity box at
+    # zero; see `interp`. Left available only to reproduce old tables.
+    vclamp = Bool(getc(cfg, "velocity_clamp", false))
+    # Kuhn simplex interpolation: 7 reads per lookup instead of 64, and --
+    # the reason it is the default -- the same interpolant the robot uses to
+    # recover grad(V) from the finished table. V is the fixed point of
+    # whichever interpolant the backup is written with, so solving with one
+    # and reading with another gives a table that is self-consistent under an
+    # operator nobody applies. `simplex: false` restores multilinear.
+    simplex = Bool(getc(cfg, "simplex", true))
+
+    p = Params(dt = dt, nsub = Int32(nsub), checks = Int32(checks),
+               adaptive_checks = achecks, nearest = nearest, cap = cap,
+               ntau = Int32(ntau), tau_ratio = Float32(tau_ratio),
+               cfl = Float32(cfl), tau_min = Float32(tau_min),
+               tau_max = Float32(tau_max), hmax = Float32(hmax),
+               ncoarse = Int32(scan), rounds = Int32(rounds),
+               delta0 = Float32(delta0), rk2 = rk2, vclamp = vclamp,
+               simplex = simplex)
+
+    ctl_t = control_set(level)
+    nctl = length(ctl_t)
+    ctl_h = Float32[getindex.(ctl_t, 1); getindex.(ctl_t, 2); getindex.(ctl_t, 3)]
+
+    (p = p, level = level, nctl = nctl, ctl_h = ctl_h, warm = warm,
+     iters = iters, tol = tol, cap = cap, nearest = nearest, dt = dt,
+     nsub = nsub, checks = checks, margin = margin, clearance = clearance,
+     ttol = ttol, scan = scan, rounds = rounds, delta0 = delta0, ntau = ntau,
+     tau_ratio = tau_ratio, cfl = cfl, tau_min = tau_min, tau_max = tau_max,
+     hmax = hmax, achecks = achecks, rk2 = rk2, vclamp = vclamp,
+     simplex = simplex)
+end
+
+"""
+Decide how the grid is going to be solved, and on what.
+
+Three outcomes:
+
+  * `:incore` -- the whole grid fits in the device budget. Nothing changes;
+    this is the original driver.
+  * `:ooc` -- it does not, so the value function lives in a file and the GPU
+    sees one tile of it at a time. See `Tiles.jl` and `OutOfCore.jl`.
+  * `:cpu` -- no usable device; the caller falls back to host sweeps.
+
+`out_of_core` in the config forces the choice (`true`/`false`), and the
+default `"auto"` picks by whether it fits. Forcing it on is how the tiled
+driver gets tested against the in-core one on a grid small enough to run
+both.
+
+The reach scan is only run when it is going to be used. It costs seconds, and
+seconds are worth avoiding in `plan`, which the wizard calls interactively
+every time the user nudges a resolution.
+"""
+function decompose(cfg::AbstractDict, g::Grid6, m::Model, sp)
+    want = getc(cfg, "out_of_core", "auto")
+    force_on  = want === true || want == "true" || want == "always"
+    force_off = want === false || want == "false" || want == "never"
+
+    budget = Int64(getc(cfg, "vram_budget_bytes", 0))
+    if budget <= 0
+        budget = gpu_budget(headroom = Float64(getc(cfg, "vram_headroom", 0.85)))
+    end
+    whole, _, _, col = _tile_bytes(g, Int(g.n[1]), Int(g.n[2]), 0, 0, sp.warm)
+
+    if !CUDA.functional() && Int64(getc(cfg, "vram_budget_bytes", 0)) <= 0
+        return (mode = :cpu, tp = nothing, budget = budget,
+                whole_bytes = whole, col = col)
+    end
+    if force_off || (!force_on && whole <= budget)
+        return (mode = :incore, tp = nothing, budget = budget,
+                whole_bytes = whole, col = col)
+    end
+
+    nang = Int(getc(cfg, "halo_scan_angles", 16))
+    ncmd = Int(getc(cfg, "halo_scan_commands", 128))
+    margin = Int(getc(cfg, "halo_margin", 2))
+    # `warm_start` is the in-core setting; tiled, the policy is bytes rather
+    # than floats and competes with the tile for residency, so it has its own.
+    warm = Bool(getc(cfg, "warm_start_tiled", true))
+
+    dxy, dh = reach_extent(g, m, sp.p, sp.ctl_h, sp.nctl;
+                           nangle = nang, nsample = ncmd)
+    hx, hy = halo_cells(g, dxy; margin = margin)
+    tp = plan_tiles(g, budget, hx, hy; warm = warm, dxy_cm = dxy, dh_rad = dh)
+    tp !== nothing &&
+        return (mode = :ooc, tp = tp, budget = budget, whole_bytes = whole,
+                col = col, dxy_cm = dxy, hx = hx, hy = hy, advice = nothing)
+
+    # It does not fit even at one cell of interior. That is nearly always the
+    # halo rather than the grid -- the smallest possible tile is a single
+    # column wrapped in `2h` columns of border, so the cost goes as `(1+2h)^2`
+    # and `h` comes straight from the longest lookahead. Saying "reduce
+    # something" here would be useless, so work out which something: search
+    # for the longest step that would fit, and report it.
+    (mode = :ooc, tp = nothing, budget = budget, whole_bytes = whole,
+     col = col, dxy_cm = dxy, hx = hx, hy = hy,
+     advice = fit_advice(cfg, g, m, sp, budget, warm, margin, nang, ncmd))
+end
+
+"""
+When no tiling fits, work out what would.
+
+Two levers, reported with numbers rather than named: the longest lookahead
+`tau_max`, which sets the halo, and `warm_start_tiled`, which sets the bytes
+per resident cell. Both ends of the first are reported -- the most accurate
+step that fits at all, and the first that is actually worth starting -- since
+the longest step that squeezes in is usually a bad place to run: it fits with
+a single column of interior inside a wall of halo, which is arithmetically a
+fit and practically a machine reading the same cells sixty times over.
+
+`tau_options` does the search on one shared reach scan, so the whole ladder
+costs about what a single rung used to.
+"""
+function fit_advice(cfg, g::Grid6, m::Model, sp, budget::Int64, warm::Bool,
+                    margin::Int, nang::Int, ncmd::Int)
+    col = ncells(g) ÷ (Int64(g.n[1]) * Int64(g.n[2]))
+    # The largest halo the budget admits at all, from `(1+2h)^2` columns.
+    per = cell_bytes(warm)
+    maxcols = budget ÷ (col * per)
+    hmax = maxcols <= 0 ? -1 : (isqrt(maxcols) - 1) ÷ 2
+    ts = Int(getc(cfg, "tile_sweeps", 4))
+    rate = Float64(getc(cfg, "cell_rate", 23.4e6))
+    disk = Float64(getc(cfg, "disk_rate", 500e6))
+
+    opts = filter(o -> o.tau < Float64(sp.p.tau_max),
+                  tau_options(g, m, sp, budget, warm, margin, nang, ncmd,
+                              Float64(per), ts, rate, disk))
+    # "Worth starting" is not "lowest amplification". A round costs the
+    # greater of its compute and its I/O, and on this class of machine --
+    # ~23M cell-updates/s against a SATA SSD -- the two only cross at around
+    # eight cells loaded per cell updated. Below that the extra reads are
+    # free, hidden behind arithmetic that has to happen anyway, so buying
+    # amplification with `tau_max` past this point is paying accuracy for
+    # nothing. Measured on a 145x145 grid at the cell size a full-scale run
+    # uses: `tau_max` 0.2 costs +6% on mean value, 0.1 costs +21%, and 0.06
+    # costs +56%. That is the whole reason this threshold is not tighter.
+    comfy = findfirst(o -> o.amplification <= 8.0, opts)
+    (column_bytes = col * per, budget_bytes = budget, max_halo = hmax,
+     warm_helps = warm && !warm_fits(g, budget, sp, m, margin, nang, ncmd),
+     tau_max = isempty(opts) ? nothing : opts[1],
+     tau_comfortable = comfy === nothing ? nothing : opts[comfy])
+end
+
+"""Would dropping the warm-start policy, and nothing else, make it fit?"""
+function warm_fits(g::Grid6, budget::Int64, sp, m::Model, margin::Int,
+                   nang::Int, ncmd::Int)
+    dxy, dh = reach_extent(g, m, sp.p, sp.ctl_h, sp.nctl;
+                           nangle = nang, nsample = ncmd)
+    hx, hy = halo_cells(g, dxy; margin = margin)
+    plan_tiles(g, budget, hx, hy; warm = false, dxy_cm = dxy,
+               dh_rad = dh) !== nothing
+end
+
+"""
+Should the tiled driver prefetch, and what does it need to?
+
+The prefetch holds one whole tile window in host RAM so the read of the next
+tile can run while the GPU sweeps this one. That buffer is the only cost, and
+it is not small -- at full scale it is tens of gigabytes -- so `"auto"` says
+yes only when it fits in `prefetch_ram_frac` of what the machine has free.
+
+It also needs a second thread to read on. One thread means the read would run
+on the same task that is waiting for the kernel, which is exactly the
+serialisation this is trying to remove, so a single-threaded Julia gets the
+old path and is told why.
+
+Returns `(on, bytes, why)`; `why` is the reason it is off, or "" when it is on.
+"""
+function prefetch_plan(cfg::AbstractDict, dec, warm::Bool)
+    want = getc(cfg, "prefetch", "auto")
+    force_off = want === false || want == "false" || want == "never"
+    force_on  = want === true || want == "true" || want == "always"
+    dec.mode == :ooc && dec.tp !== nothing || return (false, Int64(0), "not tiled")
+    tp = dec.tp
+    win = Int64(tp.nxl) * Int64(tp.nyl) * tp.col
+    bytes = win * cell_bytes(warm)
+    force_off && return (false, bytes, "turned off in the config")
+    if Threads.nthreads() < 2
+        return (force_on, bytes,
+                force_on ? "" : "julia has one thread; start it with -t auto")
+    end
+    force_on && return (true, bytes, "")
+    frac = Float64(getc(cfg, "prefetch_ram_frac", 0.5))
+    free = try
+        Int64(Sys.free_memory())
+    catch
+        Int64(0)
+    end
+    free <= 0 && return (false, bytes, "cannot read free memory")
+    bytes <= free * frac && return (true, bytes, "")
+    # Naming the lever matters here, because the obvious reading of this
+    # message is "buy more RAM" and the actual fix is usually free. The host
+    # buffer is one tile window, so it is the same size as the VRAM budget:
+    # a machine whose RAM is not comfortably larger than its card cannot
+    # prefetch a full-budget tile. Shrinking the budget shrinks both, and a
+    # smaller tile with its reads hidden can beat a larger one without --
+    # `vram_budget_bytes` is the knob, and re-planning prices the trade.
+    want = round(bytes / frac / 2^30, digits = 1)
+    (false, bytes,
+     "the window buffer is $(round(bytes / 2^30, digits = 1)) GB, which needs " *
+     "$(want) GB of RAM and only $(round(free / 2^30, digits = 1)) GB is free; " *
+     "lower vram_budget_bytes to shrink the tile, or raise prefetch_ram_frac " *
+     "(now $(frac)) if the RAM really is spare")
+end
+
+"""
+How long the whole thing is likely to take, in seconds.
+
+Both rates are measurements of the machine this was developed against -- an
+8 GB card sustaining about 23M cell-updates/s, and a SATA SSD at about
+500 MB/s -- so the answer is an order of magnitude, not a promise. After
+watching one run, put the real numbers in `cell_rate` and `disk_rate` and
+every later estimate sharpens.
+
+It also assumes the full iteration budget is spent. `tolerance` usually stops
+a target earlier, so treat this as the ceiling.
+"""
+function runtime_estimate(cfg, g::Grid6, dec, iters::Int, ntargets::Int)
+    rate = Float64(getc(cfg, "cell_rate", 23.4e6))
+    disk = Float64(getc(cfg, "disk_rate", 500e6))
+    cells = Float64(ncells(g))
+    out = Dict{String,Any}("cell_rate" => rate, "assumes_full_budget" => true)
+    # Nothing fits, so there is no run to time. Saying "sweep" here would
+    # quote the in-core cost of a solve that cannot start.
+    dec.mode == :ooc && dec.tp === nothing &&
+        return merge!(out, Dict{String,Any}("unit" => "none"))
+    if dec.mode != :ooc
+        per = cells / rate
+        merge!(out, Dict{String,Any}(
+            "unit" => "sweep", "units" => iters, "unit_s" => per,
+            "per_target_s" => per * iters,
+            "total_s" => per * iters * ntargets, "io_bound" => false))
+        return out
+    end
+    ts = Int(getc(cfg, "tile_sweeps", 4))
+    rounds = max(1, cld(iters, ts))
+    sb = Float64(cell_bytes(Bool(getc(cfg, "warm_start_tiled", true))))
+    pf, pfb, pfwhy = prefetch_plan(cfg, dec, Bool(getc(cfg, "warm_start_tiled", true)))
+    r = round_seconds(cells, ts, dec.tp.amplification, sb, rate, disk;
+                      prefetch = pf)
+    # What the prefetch is worth on this grid, for the report. Costed against
+    # the same round rather than asserted, because it is entirely a function
+    # of how the compute and the reads compare, and that flips with the card.
+    plain = round_seconds(cells, ts, dec.tp.amplification, sb, rate, disk)
+    merge!(out, Dict{String,Any}(
+        "prefetch" => pf, "prefetch_bytes" => pfb,
+        "prefetch_saves_s" => (plain.total - r.total) * rounds * ntargets,
+        "prefetch_off_because" => pfwhy,
+        "unit" => "round", "units" => rounds, "unit_s" => r.total,
+        "per_target_s" => r.total * rounds,
+        "total_s" => r.total * rounds * ntargets,
+        # Which half is the larger, not which one "limits": a round pays for
+        # both, one after the other. See `round_seconds`.
+        "io_bound" => r.io > r.compute, "compute_s" => r.compute,
+        "io_s" => r.io, "disk_rate" => disk))
+    out
+end
+
+"""
+Settle `tau_max`, then decide how the grid is going to be solved.
+
+**`tau_max` defaults to `"auto"`, and that is the point of this function.** It
+is not a preference; it is a consequence. In core it should always be the
+reference, because there is no halo for it to pay for. Tiled it should be the
+knee of the reach/accuracy trade, which depends on the resolution, the field,
+the model and how much VRAM the machine has. A number carried in a config file
+cannot track any of that, and a stale one is invisible: a `tau_max` of 0.12
+left over from a tiled experiment costs about 17% on mean value forever after,
+including on grids that hold whole and have nothing to gain from it.
+
+So it is derived here, on every plan and every solve, from the same code path,
+which is the other half of the point -- a plan that reported one lookahead and
+a solve that used another would be a table nobody could account for.
+
+Pin it to a number in the config and that number is honoured exactly; `plan`
+then says so, and says what it is costing.
+
+Costs two reach scans on the tiled path (one to size the tiles at the
+reference, one to re-size them at the pick) plus the shared curve. In core it
+costs nothing at all -- whether the grid fits whole is a byte count, not a
+scan -- which is the case the interactive loop spends its time in.
+"""
+function settle(cfg::AbstractDict, g::Grid6, m::Model)
+    want = getc(cfg, "tau_max", "auto")
+    auto = want isa AbstractString && lowercase(String(want)) == "auto"
+    withtau(t) = merge(Dict{String,Any}(String(k) => v for (k, v) in pairs(cfg)),
+                       Dict{String,Any}("tau_max" => Float64(t)))
+
+    if !auto
+        sp = solver_params(cfg, g)
+        return (sp = sp, dec = decompose(cfg, g, m, sp), auto = false,
+                rec = nothing)
+    end
+
+    cfg0 = withtau(TAU_REF)
+    sp0 = solver_params(cfg0, g)
+    dec0 = decompose(cfg0, g, m, sp0)
+    wt = Bool(getc(cfg, "warm_start_tiled", true))
+    rec = recommend_tau(dec0.mode, g, m, sp0, dec0.budget, wt,
+                        Int(getc(cfg, "halo_margin", 2)),
+                        Int(getc(cfg, "halo_scan_angles", 16)),
+                        Int(getc(cfg, "halo_scan_commands", 128)),
+                        wt ? 7.0 : 4.0, Int(getc(cfg, "tile_sweeps", 4)),
+                        Float64(getc(cfg, "cell_rate", 23.4e6)),
+                        Float64(getc(cfg, "disk_rate", 500e6)))
+    # Nothing to change: in core, or no tiling fits at any step length (in
+    # which case the caller reports the failure and the reference is the
+    # honest thing to have been trying).
+    (rec.tau_max === nothing || rec.tau_max >= TAU_REF) &&
+        return (sp = sp0, dec = dec0, auto = true, rec = rec)
+
+    cfg1 = withtau(rec.tau_max)
+    sp1 = solver_params(cfg1, g)
+    (sp = sp1, dec = decompose(cfg1, g, m, sp1), auto = true, rec = rec)
+end
+
+"""
+Size and feasibility report, cheap enough to run before committing.
+
+It answers four questions, and the last two are the ones worth having:
+
+  * how big the table is, and whether it fits -- on the card, in VRAM, in the
+    workspace;
+  * how long the solve will take, and which of compute or disk bounds it;
+  * what the settings **should** be: a resolution for the size budget, and a
+    `tau_max` with the accuracy it costs, since that one is otherwise a knob
+    with two opposed effects and no visible units;
+  * whether the targets are states the robot can actually be in. A target off
+    the table or hanging through a wall produces an entirely empty table --
+    quietly, and at the end of a full-length run.
+"""
 function plan(cfg::AbstractDict)
-    bounds, _, _, _ = load_field(String(cfg["field"]))
-    names, _, _ = load_targets(String(cfg["targets"]))
-    g = build_grid(get(cfg, "grid", Dict()), bounds)
+    bounds, polys, robot, _ = load_field(String(cfg["field"]))
+    names, states, _ = load_targets(String(cfg["targets"]))
+    gi = grid_inputs(cfg, bounds, robot)
+    g = build_grid(get(cfg, "grid", Dict()), gi)
+    mdl, _ = load_model(String(cfg["regression"]))
+    # The reach depends on the model the solver will actually integrate, so
+    # the constant has to be zeroed here too if the run is going to zero it.
+    if Bool(getc(cfg, "zero_c", true))
+        mdl = Model(mdl.B, mdl.A, mdl.q, mdl.S, mdl.D, (0.0f0, 0.0f0, 0.0f0),
+                    mdl.eps, mdl.knee)
+    end
+    bal = grid_balance(g, mdl)
     dtype = String(getc(cfg, "dtype", "u16"))
     haskey(DTYPES, dtype) || error("unknown dtype '$dtype'")
     eb = DTYPES[dtype].bytes
     cells = ncells(g)
     per = cells * eb
     chunk_elements = Int(getc(cfg, "chunk_elements", 1 << 23))
-    ok, need, free = gpu_fits(g)
+    ok, need, free = gpu_fits(g; warm = Bool(getc(cfg, "warm_start", true)))
+
+    st = settle(cfg, g, mdl)
+    sp = st.sp; dec = st.dec
+    iters = Int(getc(cfg, "iterations", 400))
+    ooc_rounds = max(1, cld(iters, Int(getc(cfg, "tile_sweeps", 4))))
+    ooc = Dict{String,Any}("mode" => String(dec.mode))
+    if dec.mode == :ooc
+        tp = dec.tp
+        if tp === nothing
+            # The smallest tile the driver can hold is one column of interior
+            # wrapped in the halo, so it costs `(1 + 2h)^2` columns and it is
+            # `h` -- the longest lookahead -- that usually decides. `advice`
+            # carries the numbers for what would fit instead.
+            a = dec.advice
+            ooc["fits"] = false
+            ooc["reach_cm"] = dec.dxy_cm
+            ooc["reach_cells"] = dec.dxy_cm / Float64(min(g.step[1], g.step[2]))
+            ooc["halo_cells"] = [dec.hx, dec.hy]
+            ooc["column_bytes"] = a === nothing ? dec.col * 4 : a.column_bytes
+            ooc["budget_bytes"] = dec.budget
+            if a !== nothing
+                ooc["max_halo_cells"] = a.max_halo
+                ooc["min_window_cells"] = 1 + 2 * max(dec.hx, dec.hy)
+                ooc["warm_start_would_help"] = a.warm_helps
+                for (pre, o) in (("suggest", a.tau_max),
+                                 ("comfortable", a.tau_comfortable))
+                    o === nothing && continue
+                    ooc[pre * "_tau_max"] = o.tau
+                    ooc[pre * "_halo_cells"] = o.halo
+                    ooc[pre * "_reach_cm"] = o.reach_cm
+                    ooc[pre * "_tile_cells"] = o.tile
+                    ooc[pre * "_amplification"] = o.amplification
+                    ooc[pre * "_value_cost"] = o.cost
+                    ooc[pre * "_total_s"] =
+                        o.round_s * ooc_rounds * length(names)
+                end
+            end
+        else
+            # 4 bytes a cell for V, and 3 more for the quantised warm-start
+            # policy when it is kept across rounds.
+            # Named apart from `eb` above: an `if` block is not a scope in
+            # Julia, so reusing that name here would quietly rewrite the
+            # element size the manifest and the size report are built from.
+            wt = Bool(getc(cfg, "warm_start_tiled", true))
+            sb = cell_bytes(wt)
+            store = cells * sb
+            # Bytes moved between the store and the device in one round: every
+            # loaded cell read, every interior cell written back.
+            per_round = Int64(round(dec.col * sb *
+                (Float64(tp.nxl) * tp.nyl * cld(Int(g.n[1]), tp.wx) *
+                 cld(Int(g.n[2]), tp.wy)))) + store
+            ooc["fits"] = true
+            ooc["halo_cells"] = [tp.hx, tp.hy]
+            ooc["tile_cells"] = [tp.wx, tp.wy]
+            ooc["loaded_cells"] = [tp.nxl, tp.nyl]
+            ooc["tiles_per_round"] = tp.ntiles
+            ooc["resident_bytes"] = tp.bytes
+            ooc["amplification"] = tp.amplification
+            ooc["reach_cm"] = tp.dxy_cm
+            ooc["reach_rad"] = tp.dh_rad
+            ooc["reach_cells"] = tp.dxy_cm / Float64(min(g.step[1], g.step[2]))
+            ooc["store_bytes"] = store
+            ooc["io_bytes_per_round"] = per_round
+            ooc["tile_sweeps"] = Int(getc(cfg, "tile_sweeps", 4))
+        end
+    end
+
+    # The occupancy the solver will use, built here so the target check can
+    # ask the authoritative question -- "will this seed anything" -- instead
+    # of a geometric approximation of it. Even on the biggest grids it is a
+    # few tenths of a second, against a reach scan measured in seconds.
+    occ = build_occupancy(g, polys, Float64(getc(cfg, "margin_cm", 0.0)),
+                          robot, gi.hsub, gi.clearance;
+                          bounds = bounds,
+                          wall_clearance_cm = gi.wall_clearance)
+    osum = occupancy_summary(g, occ)
+    tchk = check_targets(g, occ, names, states, sp.ttol, bounds, polys, robot,
+                         gi.clearance, gi.wall_clearance)
+
+    # What the settings ought to be. The resolution suggestion is arithmetic;
+    # the `tau_max` one runs a reach scan, and only when the grid is actually
+    # tiled -- in core there is no halo, so there is nothing to trade and
+    # nothing worth measuring.
+    rec_budget = Float64(getc(cfg, "size_budget_bytes", 8 * 2^30))
+    reach_cm = (robot === nothing || size(robot, 2) < 3) ? 0.0 :
+               maximum(sqrt.(robot[1, :] .^ 2 .+ robot[2, :] .^ 2))
+    gcfg = get(cfg, "grid", Dict())
+    res = grid_resolution(gcfg)
+    vmax = Float64(getc(gcfg, "vmax", DEFAULT_VMAX))
+    wmax = Float64(getc(gcfg, "wmax", DEFAULT_WMAX))
+    # Both budgets. Without the VRAM one the suggestion could recommend its
+    # way from an in-core run into a tiled one, which is a far bigger cost
+    # than any resolution it was buying.
+    bpc = cell_bytes(Bool(getc(cfg, "warm_start", true)))
+    sugg = suggest_resolution(Float64(g.step[1]) * (Int(g.n[1]) - 1),
+                              Float64(g.step[2]) * (Int(g.n[2]) - 1),
+                              reach_cm, vmax, wmax, eb, length(names),
+                              rec_budget;
+                              vram_bytes = dec.budget > 0 ? Float64(dec.budget) : Inf,
+                              bytes_per_cell = bpc)
+    # And, when it will not hold whole, the nearest resolution that would.
+    # Tiling is the difference between minutes and days, so "how close am I to
+    # not needing it" is worth answering without making the user bisect it by
+    # hand. Uses the same VRAM budget `decompose` used, so the two agree.
+    incore = dec.mode == :incore || dec.budget <= 0 ? nothing :
+        coarsen_to_fit(Float64(g.step[1]) * (Int(g.n[1]) - 1),
+                       Float64(g.step[2]) * (Int(g.n[2]) - 1), vmax, wmax,
+                       (xy_cm = Float64(min(g.step[1], g.step[2])),
+                        heading_deg = rad2deg(Float64(g.step[3])),
+                        v_cm_s = Float64(g.step[4]),
+                        w_rad_s = Float64(g.step[6])),
+                       Float64(dec.budget);
+                       bytes_per_cell = cell_bytes(Bool(getc(cfg, "warm_start", true))))
+
+    wt = Bool(getc(cfg, "warm_start_tiled", true))
+    # On the auto path `settle` has already run the scan and used the answer;
+    # reusing it costs nothing and guarantees the report describes the run.
+    rtau = st.rec !== nothing ? st.rec :
+        recommend_tau(dec.mode, g, mdl, sp, dec.budget, wt,
+                      Int(getc(cfg, "halo_margin", 2)),
+                      Int(getc(cfg, "halo_scan_angles", 16)),
+                      Int(getc(cfg, "halo_scan_commands", 128)),
+                      wt ? 7.0 : 4.0,
+                      Int(getc(cfg, "tile_sweeps", 4)),
+                      Float64(getc(cfg, "cell_rate", 23.4e6)),
+                      Float64(getc(cfg, "disk_rate", 500e6)))
+
     Dict(
         "cells" => cells,
         "axes" => collect(AXES),
         "n" => collect(Int.(g.n)),
+        # The span the table actually stores, and how it was arrived at. The
+        # field is wider: the difference is the footprint plus the wall
+        # clearance, which is exactly the inset the robot cannot cross.
+        "bounds" => Dict(
+            "field" => [bounds[1], bounds[2], bounds[3], bounds[4]],
+            "table_min" => [Float64(g.lo[k]) for k in 1:6],
+            "table_max" => [Float64(g.lo[k] +
+                                    g.step[k] * (k == 3 ? g.n[k] : g.n[k] - 1))
+                            for k in 1:6],
+            "inset_cm" => [Float64(g.lo[1]) - bounds[1],
+                           Float64(g.lo[2]) - bounds[2],
+                           bounds[3] - Float64(g.lo[1] + g.step[1] * (g.n[1] - 1)),
+                           bounds[4] - Float64(g.lo[2] + g.step[2] * (g.n[2] - 1))],
+            "cells_saved_frac" => 1.0 -
+                (Float64(g.step[1]) * (Int(g.n[1]) - 1) *
+                 Float64(g.step[2]) * (Int(g.n[2]) - 1)) /
+                max((bounds[3] - bounds[1]) * (bounds[4] - bounds[2]), 1.0e-9),
+            "wall_clearance_cm" => gi.wall_clearance,
+            "clearance_cm" => gi.clearance,
+        ),
+        # The resolution as physically set, in the unit each axis is measured
+        # in, alongside what the sample counts actually realise. The two agree
+        # unless `grid.n` was given, which pins the counts and lets the cell
+        # size fall out of the span instead.
+        "resolution" => Dict(
+            "requested" => Dict("xy_cm" => res.xy_cm,
+                                "heading_deg" => res.heading_deg,
+                                "v_cm_s" => res.v_cm_s,
+                                "w_rad_s" => res.w_rad_s),
+            "actual" => Dict("xy_cm" => Float64(min(g.step[1], g.step[2])),
+                             "heading_deg" => rad2deg(Float64(g.step[3])),
+                             "v_cm_s" => Float64(g.step[4]),
+                             "w_rad_s" => Float64(g.step[6])),
+            "pinned_by_n" => getc(gcfg, "n", nothing) !== nothing,
+        ),
+        "occupancy" => Dict(
+            "blocked_frac" => osum.frac,
+            "blocked_cells" => osum.blocked,
+            "xyh_cells" => osum.cells,
+            "worst_heading_blocked_frac" => osum.worst_heading_frac,
+            "best_heading_blocked_frac" => osum.best_heading_frac,
+        ),
+        "targets" => tchk,
+        "targets_ok" => all(t -> t["ok"], tchk),
+        "recommend" => Dict(
+            "size_budget_bytes" => rec_budget,
+            "resolution" => sugg === nothing ? nothing : Dict(
+                "xy_cm" => sugg.xy_cm, "heading_deg" => sugg.heading_deg,
+                "v_cm_s" => sugg.v_cm_s, "w_rad_s" => sugg.w_rad_s,
+                "n" => sugg.n, "cells" => sugg.cells, "bytes" => sugg.bytes,
+                "vram_bytes" => sugg.vram_bytes, "bound_by" => sugg.bound_by),
+            "tau_max" => rtau.tau_max,
+            "tau_value_cost" => rtau.cost,
+            "tau_current" => rtau.current,
+            "tau_current_cost" => rtau.current_cost,
+            "tau_io_minor" => rtau.io_minor,
+            "tau_reason" => rtau.reason,
+            "tau_reference" => TAU_REF,
+            # Whether the value in `solver.tau_max` was derived or pinned, and
+            # what a pinned one is costing. A pinned step below the reference
+            # on a grid that holds whole is pure loss, and it is the failure
+            # this whole mechanism exists to make impossible.
+            "tau_auto" => st.auto,
+            "tau_applied" => Float64(sp.p.tau_max),
+            "tau_applied_cost" => value_cost(TAU_REF, Float64(sp.p.tau_max)),
+            "tau_pinned_waste" => !st.auto && dec.mode != :ooc &&
+                                  Float64(sp.p.tau_max) < TAU_REF,
+            # The nearest resolution that would not need tiling at all.
+            "in_core" => incore === nothing ? nothing : Dict(
+                "scale" => incore.scale, "xy_cm" => incore.xy_cm,
+                "heading_deg" => incore.heading_deg,
+                "v_cm_s" => incore.v_cm_s, "w_rad_s" => incore.w_rad_s,
+                "n" => incore.n, "cells" => incore.cells,
+                "vram_bytes" => incore.vram_bytes),
+            "tau_options" => [Dict("tau" => o.tau, "cost" => o.cost,
+                                   "round_s" => o.round_s,
+                                   "compute_s" => o.compute_s,
+                                   "io_s" => o.io_s,
+                                   "amplification" => o.amplification,
+                                   "reach_cm" => o.reach_cm)
+                              for o in rtau.options],
+        ),
         "dtype" => dtype,
         "elem_bytes" => eb,
         "bytes_per_target" => per,
@@ -52,6 +834,17 @@ function plan(cfg::AbstractDict)
         "gpu_fits" => ok,
         "gpu_need_gb" => need,
         "gpu_free_gb" => free,
+        # Not fitting whole is no longer a refusal: it selects the tiled
+        # driver. `out_of_core.fits` is the question that can still be no.
+        "out_of_core" => ooc,
+        "grid_balance" => bal.ratio,
+        "dv_distance_cm" => bal.dv_distance_cm,
+        "max_accel_cm_s2" => bal.accel_cm_s2,
+        "cell_cm" => Float64(min(g.step[1], g.step[2])),
+        "cell_cm_s" => Float64(min(g.step[4], g.step[5])),
+        # Ceiling on wall clock, from the configured iteration budget. See
+        # `runtime_estimate` for what the two rates are worth.
+        "runtime" => runtime_estimate(cfg, g, dec, iters, length(names)),
     )
 end
 
@@ -84,12 +877,32 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
     # Only omega^2 is fitted, and it lands in the w column of s.*s.
     A_ss = [[0.0, 0.0, 0.0, 0.0, 0.0, Float64(m.q[r])] for r in 1:3]
     A_u  = Bm
+    # Structurally zero: control-squared terms are not fitted, and there is no
+    # flag that can turn them on. A u^2 column is even in u -- it claims the
+    # same force for full forward and full reverse -- and command curvature is
+    # already carried by the traction knee. The block is still emitted so the
+    # robot-side reader never changes shape.
     A_uu = [[0.0, 0.0, 0.0] for _ in 1:3]
     Sm   = [row3(m.S, r) for r in 1:3]
     Dm   = [row3(m.D, r) for r in 1:3]
     A_sgn = [[0.0, 0.0, 0.0, Sm[r][1], Sm[r][2], Sm[r][3]] for r in 1:3]
     A_abs = [[0.0, 0.0, 0.0, Dm[r][1], Dm[r][2], Dm[r][3]] for r in 1:3]
     k    = [Float64(m.c[r]) for r in 1:3]
+
+    # Control reaches position only through velocity, and velocity only
+    # through acceleration. Enforced, not assumed: `A_u` maps the command to
+    # the three accelerations and nothing else, and no block may carry an
+    # x, y or h column. A regressor that quietly grew one would otherwise
+    # ship as a robot that thinks its field position drives its dynamics.
+    length(A_u) == 3 && all(length(r) == 3 for r in A_u) ||
+        error("A_u must be 3x3: the command feeds the three accelerations " *
+              "only, never a position")
+    for (nm, blk) in (("A_s", A_s), ("A_ss", A_ss),
+                      ("A_sgn", A_sgn), ("A_absv", A_abs))
+        all(all(iszero, r[1:3]) for r in blk) ||
+            error("$nm has a non-zero x/y/h column; the dynamics must not " *
+                  "depend on where the robot is")
+    end
 
     Dict(
         "schema_version" => 2,
@@ -125,13 +938,13 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
             "note" => "mecanum projection of the wheel powers; the " *
                       "admissible set is |fwd| + |strafe| + |turn| <= 1",
             "saturation" => Dict(
-                "knee" => m.knee > 0 ? Float64(m.knee) : nothing,
+                "knee" => Float64(m.knee),
                 "formula" => "m = norm(u_raw); " *
                              "u = u_raw * tanh(m/knee) / (m/knee)",
                 "why" => "Past the knee the tyres stop delivering, so extra " *
                          "command buys no extra force. APPLY THIS BEFORE " *
                          "A_u -- the gains were fitted against the saturated " *
-                         "command. A null knee means no saturation.",
+                         "command. The knee is always present and positive.",
             ),
         ),
         "A_s" => A_s,      # 3x6
@@ -151,6 +964,58 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
             ("A_absv", any(any(!iszero, r) for r in A_abs)),
             ("k", any(!iszero, k))) if nz],
     )
+end
+
+"""
+Run value iteration for one target until it converges or runs out of sweeps.
+
+Split out of `run_solve` so that anything measuring or testing the solver
+drives exactly the same loop the CLI does. A harness that reimplements the
+driver eventually measures the reimplementation instead of the solver.
+
+`tidx` holds the 1-based flat indices of the seeded target cells. Returns
+`(iterations_done, final_delta)`.
+"""
+function solve_value!(V, occ, g::Grid6, m::Model, tidx, ctl, nctl, p::Params;
+                      iters::Int, tol::Float64, use_gpu::Bool, pol = nothing,
+                      total = nothing, on_progress = nothing)
+    fill!(V, p.cap)
+    @views V[tidx] .= 0.0f0
+    pol === nothing || fill!(pol, 0.0f0)
+
+    # How many consecutive quiet sweeps count as converged.
+    #
+    # With the full lattice scanned every sweep, one quiet sweep proves no
+    # control improves any cell, and that is the fixed point. With a rotating
+    # slice it proves only that the controls in *this* slice do not help, so
+    # the run must stay quiet for a whole rotation before the same claim
+    # holds. Getting this wrong would stop early and silently ship a table
+    # that a later slice would still have improved.
+    quiet_needed = p.ncoarse <= Int32(0) ? 1 :
+                   max(1, cld(Int(nctl) - 1, Int(p.ncoarse)))
+
+    last_delta = Inf
+    done_iters = 0
+    quiet = 0
+    for it in 1:iters
+        d = use_gpu ?
+            sweep_gpu!(V, occ, pol, g, m, ctl, nctl, p, it - 1, total;
+                       rev = isodd(it)) :
+            sweep_cpu!(V, occ, pol, g, m, ctl, nctl, p, it - 1;
+                       rev = isodd(it))
+        # The seed must be reasserted: a sweep can lower a target cell below
+        # zero-cost only through interpolation noise, and letting it drift
+        # would corrupt the whole basin.
+        @views V[tidx] .= 0.0f0
+        done_iters = it
+        last_delta = d
+        quiet = d <= tol ? quiet + 1 : 0
+        if on_progress !== nothing && (it % 5 == 0 || it == 1 || quiet >= quiet_needed)
+            on_progress(it, d)
+        end
+        quiet >= quiet_needed && break
+    end
+    (done_iters, last_delta)
 end
 
 """
@@ -178,7 +1043,8 @@ function run_solve(cfg::AbstractDict)
     names, states, _ = load_targets(targ_path)
 
     gcfg = get(cfg, "grid", Dict())
-    g = build_grid(gcfg, bounds)
+    gi = grid_inputs(cfg, bounds, robot)
+    g = build_grid(gcfg, gi)
     cells = ncells(g)
 
     dtype = String(getc(cfg, "dtype", "u16"))
@@ -187,109 +1053,266 @@ function run_solve(cfg::AbstractDict)
     chunk_elements = Int(getc(cfg, "chunk_elements", 1 << 23))
     ispow2(chunk_elements) || error("chunk_elements must be a power of two")
 
-    dt = Float32(getc(cfg, "dt", 0.05))
-    nsub = Int(getc(cfg, "substeps", 4))
-    checks = Int(getc(cfg, "sweep_checks", 3))
-    nearest = Bool(getc(cfg, "nearest", false))
-    iters = Int(getc(cfg, "iterations", 400))
-    tol = Float64(getc(cfg, "tolerance", 1e-3))
-    # 3 samples the octahedron boundary properly. Corners alone (level 1)
-    # made every cell pessimistic by ~1.8 s on a real model, because a plain
-    # diagonal was not in the control set at all.
-    level = Int(getc(cfg, "control_level", 3))
-    margin = Float64(getc(cfg, "margin_cm", 0.0))
-    # Safety gap held around every obstacle, applied before the robot's own
-    # footprint is swept in.
-    clearance = Float64(getc(cfg, "clearance_cm", 5.0))
-    # Half a cell, so the seed is normally the single nearest cell. The online
-    # optimizer owns the real arrival test; this only has to plant the seed.
-    ttol = NTuple{6,Float32}(Float32.(getc(cfg, "target_tol",
-              [g.step[k] * 0.5 for k in 1:6])))
-    # Unreached cells hold this finite value rather than Inf; see `interp`.
-    # It also bounds what the table can express, so keep it inside the dtype's
-    # range: u16 at 1 ms tops out at 65.5 s.
-    cap = Float32(getc(cfg, "value_cap", 60.0))
-
-    ctl_t = control_set(level)
-    nctl = length(ctl_t)
-    ctl_h = Float32[getindex.(ctl_t, 1); getindex.(ctl_t, 2); getindex.(ctl_t, 3)]
+    # Same settlement the plan reported, from the same function, so the table
+    # cannot be solved with a lookahead the plan never mentioned.
+    st = settle(cfg, g, m)
+    sp = st.sp
+    p = sp.p; level = sp.level; nctl = sp.nctl; ctl_h = sp.ctl_h
+    warm = sp.warm; iters = sp.iters; tol = sp.tol; cap = sp.cap
+    nearest = sp.nearest; dt = sp.dt; nsub = sp.nsub; checks = sp.checks
+    margin = sp.margin; clearance = sp.clearance; ttol = sp.ttol
+    scan = sp.scan; rounds = sp.rounds; delta0 = sp.delta0; ntau = sp.ntau
+    tau_ratio = sp.tau_ratio; cfl = sp.cfl; tau_min = sp.tau_min
+    tau_max = sp.tau_max; hmax = sp.hmax; achecks = sp.achecks
+    rk2 = sp.rk2; vclamp = sp.vclamp; simplex = sp.simplex
 
     progress(phase = "setup", cells = cells, n = collect(Int.(g.n)),
              controls = nctl, dtype = dtype,
              bytes_per_target = cells * DTYPES[dtype].bytes,
              n_targets = length(names))
 
-    hsub = Int(getc(cfg, "heading_substeps", 3))
-    occ_h = build_occupancy(g, polys, margin, robot, hsub, clearance)
+    hsub = gi.hsub
+    # The field boundary is rasterised with the obstacles, from the same
+    # footprint sweep and the same clearance rule. Before this, the boundary
+    # constrained the tracking *point* only, so a 36 cm chassis was free to
+    # park with half of itself outside the field -- a looser rule than the one
+    # applied to an obstacle standing one centimetre inboard of that wall.
+    occ_h = build_occupancy(g, polys, margin, robot, hsub, clearance;
+                            bounds = bounds,
+                            wall_clearance_cm = gi.wall_clearance)
     blocked = count(occ_h)
     progress(phase = "occupancy", blocked_cells = blocked,
              blocked_frac = blocked / length(occ_h),
              robot_vertices = robot === nothing ? 0 : size(robot, 2),
-             heading_substeps = hsub, clearance_cm = clearance)
+             heading_substeps = hsub, clearance_cm = clearance,
+             wall_clearance_cm = gi.wall_clearance)
+
+    # A target that seeds nothing produces a table that is `unreachable`
+    # everywhere, and does it quietly: the sweeps converge, `delta` goes to
+    # zero, and the only symptom is `reached_frac` at the very end of a run
+    # that may have taken all night. Refuse before starting instead.
+    tchk = check_targets(g, occ_h, names, states, ttol, bounds, polys, robot,
+                         clearance, gi.wall_clearance)
+    bad = filter(t -> !t["ok"], tchk)
+    isempty(bad) || error(
+        "these targets are states the robot cannot be in, so they would seed " *
+        "nothing and the whole table would come out unreachable:\n" *
+        join(["  '$(t["name"])' " *
+              (isempty(t["off_axes"]) ?
+               join(t["blocked_by"], "; ") :
+               "is outside the table on " * join(t["off_axes"], ", ") *
+               " (the table spans " *
+               join([@sprintf("%s %.1f..%.1f", AXES[k], Float64(g.lo[k]),
+                              Float64(g.lo[k] + g.step[k] * (g.n[k] - 1)))
+                     for k in (1, 2, 4, 5, 6)], ", ") * ")")
+              for t in bad], "\n"))
 
     backend = String(getc(cfg, "backend", "auto"))
     use_gpu = backend == "cuda" || (backend == "auto" && CUDA.functional())
-    if use_gpu
-        ok, need, free = gpu_fits(g)
-        ok || error("grid needs $(round(need, digits=2)) GB of VRAM but only " *
-                    "$(round(free, digits=2)) GB is free; reduce the grid, or " *
-                    "set backend to \"cpu\"")
-    end
-    progress(phase = "backend", backend = use_gpu ? "cuda" : "cpu")
 
-    if use_gpu
+    # How the grid is going to be cut up, if at all. A grid too big for the
+    # card is now a decomposition rather than an error; the only remaining
+    # refusal is a grid whose velocity and heading axes alone overflow it,
+    # because those cannot be cut. See `decompose`.
+    dec = use_gpu ? st.dec :
+                    (mode = :cpu, tp = nothing, budget = Int64(0),
+                     whole_bytes = Int64(0), col = Int64(0))
+    ooc = dec.mode == :ooc
+    if ooc && dec.tp === nothing
+        a = dec.advice
+        msg = "no tiling of this grid fits in " *
+              "$(round(dec.budget / 2^30, digits = 2)) GB of VRAM. The " *
+              "smallest tile is one column of interior inside a halo of " *
+              "$(dec.hx) cells, so it needs $((1 + 2 * dec.hx)^2) columns at " *
+              "$(round((a === nothing ? dec.col * 4 : a.column_bytes) / 2^20, digits = 2)) MB each"
+        if a !== nothing && a.tau_max !== nothing
+            msg *= ". Set tau_max to $(a.tau_max.tau) (reach " *
+                   "$(round(a.tau_max.reach_cm, digits = 0)) cm, halo " *
+                   "$(a.tau_max.halo), tiles $(a.tau_max.tile)x$(a.tau_max.tile), " *
+                   "$(round(a.tau_max.amplification, digits = 1))x amplification, " *
+                   "about +$(round(a.tau_max.cost, digits = 0))% on mean value)"
+        elseif a !== nothing && a.warm_helps
+            msg *= ". Set warm_start_tiled to false"
+        else
+            msg *= ". Reduce n[3..6] (h, vx, vy, w) -- those set the column, " *
+                   "and they are the axes that cannot be tiled"
+        end
+        error(msg)
+    end
+    pf_on, pf_bytes, pf_why =
+        prefetch_plan(cfg, dec, Bool(getc(cfg, "warm_start_tiled", true)))
+    if ooc
+        v = verify_halo(g, dec.tp)
+        v.ok || error("halo of $(dec.tp.hx)x$(dec.tp.hy) cells does not cover " *
+                      "a reach of $(round(dec.tp.dxy_cm, digits = 1)) cm " *
+                      "($(v.need_x)x$(v.need_y) cells needed)")
+        progress(phase = "decompose", tiles = dec.tp.ntiles,
+                 tile_cells = [dec.tp.wx, dec.tp.wy],
+                 halo_cells = [dec.tp.hx, dec.tp.hy],
+                 loaded_cells = [dec.tp.nxl, dec.tp.nyl],
+                 reach_cm = dec.tp.dxy_cm,
+                 reach_cells = dec.tp.dxy_cm / Float64(min(g.step[1], g.step[2])),
+                 amplification = dec.tp.amplification,
+                 resident_bytes = dec.tp.bytes,
+                 # Both scratch files: V at four bytes a cell, and the
+                 # warm-start policy at three more when it is kept.
+                 store_bytes = cells *
+                     cell_bytes(Bool(getc(cfg, "warm_start_tiled", true))),
+                 prefetch = pf_on, prefetch_bytes = pf_bytes,
+                 prefetch_off_because = pf_why)
+    end
+    progress(phase = "backend",
+             backend = ooc ? "cuda_tiled" : use_gpu ? "cuda" : "cpu")
+
+    # The warm-start policy is three more floats per cell. In core that is a
+    # good trade -- the table is a few hundred megabytes against several
+    # gigabytes of VRAM, and carrying the previous sweep's command lets each
+    # sweep skip most of the lattice. Tiled it costs a second store on disk,
+    # at a byte per component rather than a float, and is worth it for the
+    # same reason and by a wider margin: it is what keeps the round count in
+    # the hundreds rather than the thousands. See `PolicyStore`.
+    store = nothing
+    pstore = nothing
+    if ooc
+        warm = Bool(getc(cfg, "warm_start_tiled", true))
+        scratch = String(getc(cfg, "scratch_dir", out_dir))
+        mkpath(scratch)
+        # Checked before the file is created, not discovered while filling it.
+        # Creating the scratch only reserves space on a filesystem that does
+        # not do sparse files, so on NTFS the first sign of trouble would
+        # otherwise be an IOError part way through the initial fill -- after
+        # the occupancy build, which on a full-scale grid is not quick.
+        # The scratch on disk holds the same two things a resident cell
+        # does, in the same layout, so it is the same number.
+        need = cells * cell_bytes(warm)
+        free = try
+            Int64(Base.Filesystem.diskstat(scratch).available)
+        catch
+            typemax(Int64)         # unknown; let the write find out
+        end
+        need > free && error(
+            "the tiled solve needs $(round(need / 2^30, digits = 1)) GB of " *
+            "scratch in $scratch but only $(round(free / 2^30, digits = 1)) " *
+            "GB is free; point scratch_dir at a bigger volume, set " *
+            "warm_start_tiled to false to drop it to " *
+            "$(round(cells * 4 / 2^30, digits = 1)) GB, or reduce the grid")
+        do_prefetch = pf_on
+        store = open_store(cells;
+                           path = joinpath(scratch, "PEREGRINE_V.SCRATCH"))
+        pstore = warm ? open_policy_store(cells;
+                     path = joinpath(scratch, "PEREGRINE_P.SCRATCH")) : nothing
+        occ = occ_h
+        V = nothing            # the tiled driver takes the store, not an array
+        ctl = ctl_h
+        total = nothing
+        pol = nothing
+    elseif use_gpu
+        # Checked before anything is allocated, for the same reason the tiled
+        # branch above checks the scratch before creating it: the failure it
+        # replaces is a bare CUDA out-of-memory raised somewhere inside the
+        # allocator, after the occupancy build, with nothing in it that says
+        # what to change.
+        #
+        # And on Windows there is no failure at all to replace. WDDM lets an
+        # allocation past the end of VRAM page into host RAM, so an oversized
+        # grid runs -- at a fraction of the speed, over PCIe, with no warning.
+        # That is worse than an error, and it is why this checks the number
+        # rather than trusting `cudaMalloc` to object.
+        need = cells * cell_bytes(warm)
+        free, _ = CUDA.memory_info()
+        if need > free
+            error("the whole-grid solve needs " *
+                  "$(round(need / 2^30, digits = 1)) GB on the card but only " *
+                  "$(round(free / 2^30, digits = 1)) GB is free. Lower the " *
+                  "resolution, set warm_start to false to drop it to " *
+                  "$(round(cells * value_bytes_per_cell() / 2^30, digits = 1)) GB, " *
+                  "or force the tiled driver with out_of_core: true. " *
+                  "(On Windows this would otherwise page into host RAM and " *
+                  "run, slowly, rather than fail.)")
+        end
         V = CUDA.fill(cap, cells)
         occ = CuArray(occ_h)
         ctl = CuArray(ctl_h)
         total = CUDA.zeros(Float32, 1)
+        # Bytes, matching the tiled driver. `cell_update` dispatches on the
+        # element type through `pol_get`/`pol_set!`, so this is the whole
+        # change -- and it is what makes `cell_bytes` true of both drivers
+        # rather than of one. See `cell_bytes` for what the disagreement cost.
+        pol = warm ? CUDA.zeros(Int8, 3 * cells) : nothing
     else
         V = fill(cap, cells)
         occ = occ_h
         ctl = ctl_h
+        total = nothing
+        pol = warm ? zeros(Int8, 3 * cells) : nothing
     end
 
     tables_dir = joinpath(out_dir, "TABLES")
     mkpath(tables_dir)
     entries = Any[]
 
+    tile_sweeps = Int(getc(cfg, "tile_sweeps", 4))
+    # `iterations` is a budget of sweeps over the grid, and a round is
+    # `tile_sweeps` of them, so the tiled driver gets proportionally fewer
+    # rounds. Otherwise the same config would quietly buy several times as
+    # much work from one driver as from the other, and the two would not be
+    # comparable on either time or quality.
+    ooc_rounds = max(1, cld(iters, tile_sweeps))
+    try
     for (ti, s) in enumerate(states)
         tcells = target_cells(g, s, ttol)
-        tidx = use_gpu ? CuArray(Int64.(tcells) .+ 1) : (Int64.(tcells) .+ 1)
-
-        fill!(V, cap)
-        @views V[tidx] .= 0.0f0
+        seeds = Int64.(tcells) .+ 1
+        tidx = (use_gpu && !ooc) ? CuArray(seeds) : seeds
 
         t0 = time()
-        last_delta = Inf
-        done_iters = 0
-        for it in 1:iters
-            d = use_gpu ?
-                sweep_gpu!(V, occ, g, m, ctl, nctl, dt, nsub, checks, nearest,
-                           cap, total) :
-                sweep_cpu!(V, occ, g, m, ctl, nctl, dt, nsub, checks, nearest, cap)
-            # The seed must be reasserted: a sweep can lower a target cell
-            # below zero-cost only through interpolation noise, and letting it
-            # drift would corrupt the whole basin.
-            @views V[tidx] .= 0.0f0
-            done_iters = it
-            last_delta = d
-            el = time() - t0
-            if it % 5 == 0 || it == 1 || d <= tol
-                progress(phase = "solve", target = ti - 1, target_name = names[ti],
-                         iter = it, iters = iters, delta = d,
-                         elapsed_s = el, sweep_s = el / it,
-                         eta_s = (iters - it) * el / it)
-            end
-            d <= tol && break
+        if ooc
+            done_iters, last_delta = solve_value_ooc!(
+                store, occ, g, m, seeds, ctl, nctl, p, dec.tp;
+                rounds = ooc_rounds, tol = tol, tile_sweeps = tile_sweeps,
+                warm = warm, pstore = pstore, prefetch = do_prefetch,
+                on_progress = (rd, d) -> begin
+                    el = time() - t0
+                    progress(phase = "solve", target = ti - 1,
+                             target_name = names[ti], iter = rd,
+                             iters = ooc_rounds, delta = d, elapsed_s = el,
+                             sweep_s = el / rd,
+                             eta_s = (ooc_rounds - rd) * el / rd)
+                end,
+                # A round over a full-scale grid is thousands of tiles and
+                # tens of minutes; without this the bar would sit still for
+                # all of it. Capped at about a hundred reports a round so the
+                # log does not fill with them. `rounds` rides along because
+                # the caller needs it to place this inside the whole run.
+                on_tile = (rd, k, n) ->
+                    (k % max(1, n ÷ 100) == 0 || k == n) &&
+                    progress(phase = "tile", target = ti - 1,
+                             target_name = names[ti], round = rd,
+                             rounds = ooc_rounds, tile = k, tiles = n,
+                             elapsed_s = time() - t0))
+        else
+            done_iters, last_delta = solve_value!(
+                V, occ, g, m, tidx, ctl, nctl, p; iters = iters, tol = tol,
+                use_gpu = use_gpu, pol = pol, total = total,
+                on_progress = (it, d) -> begin
+                    el = time() - t0
+                    progress(phase = "solve", target = ti - 1, target_name = names[ti],
+                             iter = it, iters = iters, delta = d,
+                             elapsed_s = el, sweep_s = el / it,
+                             eta_s = (iters - it) * el / it)
+                end)
         end
 
-        Vh = use_gpu ? Array(V) : copy(V)
-        reached = count(v -> v < cap, Vh)
+        # The table is encoded straight out of whatever holds V -- device
+        # array, host array or the memory-mapped store -- one chunk at a time.
+        # Materialising it first would mean a second full-size copy, which at
+        # this scale is the difference between running and not.
+        Vout = ooc ? store : use_gpu ? Array(V) : V
         progress(phase = "encode", target = ti - 1, target_name = names[ti],
-                 iters_done = done_iters, delta = last_delta,
-                 reached_frac = reached / length(Vh))
+                 iters_done = done_iters, delta = last_delta)
 
-        info = write_table(tables_dir, ti - 1, Vh, dtype, scale, chunk_elements, cap)
+        info = write_table(tables_dir, ti - 1, Vout, dtype, scale,
+                           chunk_elements, cap)
+        reached_frac = info.reached / info.cells
         push!(entries, Dict(
             "index" => ti - 1,
             "name" => names[ti],
@@ -300,11 +1323,19 @@ function run_solve(cfg::AbstractDict)
             "sha256" => info.sha256,
             "iterations" => done_iters,
             "final_delta" => last_delta,
-            "reached_frac" => reached / length(Vh),
+            "reached_frac" => reached_frac,
         ))
         progress(phase = "target_done", target = ti - 1, target_name = names[ti],
                  chunks = info.nchunks, bytes = info.bytes,
-                 elapsed_s = time() - t0)
+                 reached_frac = reached_frac, elapsed_s = time() - t0)
+    end
+    finally
+        # The scratch file is the size of the value function -- tens of
+        # gigabytes. Leaving one behind because a solve threw half way is how
+        # a workspace fills up silently, so the cleanup is unconditional.
+        keep = Bool(getc(cfg, "keep_scratch", false))
+        store === nothing || close_store!(store; keep = keep)
+        pstore === nothing || close_store!(pstore; keep = keep)
     end
 
     manifest = Dict(
@@ -324,6 +1355,19 @@ function run_solve(cfg::AbstractDict)
             "frame" => "field",
             "frame_note" => "x, y, h and the vx, vy velocity axes are all " *
                             "field frame; omega is frame independent",
+            # The table is narrower than the field, on purpose: a state whose
+            # footprint hangs outside the field is not one the robot can hold,
+            # so storing it would be storing `unreachable`. `min`/`max` above
+            # are the authority for lookup -- this is here so that a table can
+            # be matched back to the field it was cut from without re-deriving
+            # the inset.
+            "field_bounds" => [bounds[1], bounds[2], bounds[3], bounds[4]],
+            "field_note" => "grid.min/max span the positions the robot can " *
+                            "legally occupy, which is the field inset by the " *
+                            "footprint plus wall_clearance_cm. Clamp x and y " *
+                            "into that span as section 3 of TABLE_FORMAT.md " *
+                            "describes; the edge cell is the nearest legal " *
+                            "state to anything beyond it",
             "total_cells" => cells,
             "index_formula" => "((((ix*Ny+iy)*Nh+ih)*Nvx+ivx)*Nvy+ivy)*Nw+iw",
         ),
@@ -343,12 +1387,51 @@ function run_solve(cfg::AbstractDict)
             "dt" => Float64(dt), "substeps" => nsub, "controls" => nctl,
             "control_level" => level, "iterations_max" => iters,
             "tolerance" => tol, "nearest" => nearest,
+            "control_scan" => scan, "refine_rounds" => rounds,
+            "refine_delta" => delta0, "warm_start" => warm,
+            "tau_levels" => ntau, "tau_ratio" => tau_ratio,
+            "cfl" => cfl, "tau_min" => tau_min, "tau_max" => tau_max,
+            # Derived per run unless pinned; see `settle`. Recorded because
+            # "why is this table 17% slower than that one" is otherwise an
+            # unanswerable question.
+            "tau_max_auto" => st.auto,
+            "tau_max_value_cost_pct" => value_cost(TAU_REF, Float64(tau_max)),
+            "substep_max" => hmax,
+            "adaptive_checks" => achecks, "rk2" => rk2,
+            "simplex" => simplex,
+            "interpolant" => simplex ? "kuhn_simplex_7pt" : "multilinear_64pt",
+            "velocity_clamp" => vclamp,
+            "integrator" => rk2 ? "midpoint_rk2" : "semi_implicit_euler",
+            # How the table was produced. Provenance rather than something the
+            # robot reads: a tiled solve and a whole-grid solve converge to
+            # the same fixed point, so the table is the same table. It is here
+            # because when a table does look wrong, "which driver made it" is
+            # the first thing worth being able to answer without guessing.
+            "driver" => ooc ? "tiled" : use_gpu ? "whole_grid" : "cpu",
+            "tiling" => ooc ? Dict(
+                "tile_cells" => [dec.tp.wx, dec.tp.wy],
+                "halo_cells" => [dec.tp.hx, dec.tp.hy],
+                "loaded_cells" => [dec.tp.nxl, dec.tp.nyl],
+                "tiles_per_round" => dec.tp.ntiles,
+                "tile_sweeps" => tile_sweeps,
+                "reach_cm" => dec.tp.dxy_cm,
+                "reach_rad" => dec.tp.dh_rad,
+                "amplification" => dec.tp.amplification,
+                "warm_start_tiled" => warm,
+            ) : nothing,
             "sweep_checks" => checks, "zero_c" => Bool(getc(cfg, "zero_c", true)),
             "margin_cm" => margin, "clearance_cm" => clearance,
+            "wall_clearance_cm" => gi.wall_clearance,
             "value_cap_s" => Float64(cap),
             "heading_substeps" => hsub,
             "robot_vertices" => robot === nothing ? 0 : size(robot, 2),
-            "occupancy" => "per heading bin (x, y, h)",
+            "occupancy" => "per heading bin (x, y, h), obstacles and the " *
+                           "field boundary alike",
+            "resolution" => Dict(
+                "xy_cm" => Float64(min(g.step[1], g.step[2])),
+                "heading_deg" => rad2deg(Float64(g.step[3])),
+                "v_cm_s" => Float64(g.step[4]),
+                "w_rad_s" => Float64(g.step[6])),
         ),
         "model_file" => "MODEL.JSON",
         "targets" => entries,

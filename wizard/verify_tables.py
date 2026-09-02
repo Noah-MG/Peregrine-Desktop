@@ -160,12 +160,30 @@ def check_model(root: str, fails: list, warns: list) -> None:
         else:
             print("    coulomb_eps = %s" % [round(e, 3) for e in eps])
 
+    # The knee is mandatory: the gains describe force delivered, not force
+    # requested, so a card without one drives a robot that thinks it is
+    # stronger than it is at full stick.
     sat = (m.get("control") or {}).get("saturation") or {}
-    if sat.get("knee"):
-        print("    traction knee = %.3f (saturate the command first)"
-              % sat["knee"])
+    knee = sat.get("knee")
+    if not isinstance(knee, (int, float)) or knee <= 0:
+        fails.append("MODEL.JSON has no positive traction knee; the gains "
+                     "were fitted against the saturated command")
+    else:
+        print("    traction knee = %.3f (saturate the command first)" % knee)
         if "tanh" not in str(sat.get("formula", "")):
             fails.append("MODEL.JSON declares a traction knee but no formula")
+
+    # Control reaches position only through velocity: it enters as an
+    # acceleration and nothing else. A_u carrying a position row, or any state
+    # block carrying an x/y/h column, would break that.
+    for name in ("A_s", "A_ss", "A_sgn", "A_absv"):
+        blk = m.get(name) or []
+        if any(any(c != 0 for c in r[:3]) for r in blk if len(r) >= 3):
+            fails.append(f"MODEL.JSON {name} has a non-zero x/y/h column; "
+                         "the dynamics must not depend on where the robot is")
+    if any(any(c != 0 for c in r) for r in (m.get("A_uu") or [])):
+        fails.append("MODEL.JSON A_uu is non-zero; control-squared terms are "
+                     "not part of this model")
 
     # The tables index field-frame velocity but this model is body-frame; that
     # mismatch is the easiest thing to get wrong on the robot, so make sure the
@@ -190,6 +208,33 @@ def main(root: str) -> int:
     total_cells = m["grid"]["total_cells"]
     if math.prod(card.n) != total_cells:
         fails.append(f"total_cells {total_cells} != prod(n) {math.prod(card.n)}")
+
+    # The stored x/y span is the field inset by the footprint and the wall
+    # clearance, so it has to sit inside the field it was cut from -- and it
+    # has to be strictly inside, because a span equal to the field is the old
+    # bug back again: a boundary enforced on the tracking point alone, letting
+    # the chassis hang through the wall. See section 2 of TABLE_FORMAT.md.
+    fb = m["grid"].get("field_bounds")
+    if fb is None:
+        warns.append("manifest has no grid.field_bounds; written by a solver "
+                     "from before the wall was treated as an obstacle")
+    else:
+        inset = [card.lo[0] - fb[0], card.lo[1] - fb[1],
+                 fb[2] - m["grid"]["max"][0], fb[3] - m["grid"]["max"][1]]
+        print(f"  field                {fb[2]-fb[0]:.0f} x {fb[3]-fb[1]:.0f} cm, "
+              f"table inset {min(inset):.1f}..{max(inset):.1f} cm")
+        if min(inset) < -1e-6:
+            fails.append(
+                f"the table spans {card.lo[0]:.1f}..{m['grid']['max'][0]:.1f} x "
+                f"{card.lo[1]:.1f}..{m['grid']['max'][1]:.1f}, which reaches "
+                f"outside the field {fb}: states are stored that the robot "
+                "cannot occupy")
+        wc = (m.get("solver") or {}).get("wall_clearance_cm")
+        if wc is not None and min(inset) + 1e-6 < wc:
+            fails.append(
+                f"the table is inset {min(inset):.1f} cm but the manifest "
+                f"claims {wc} cm of wall clearance; the footprint would reach "
+                "the wall")
 
     for t in m["targets"]:
         ti = t["index"]

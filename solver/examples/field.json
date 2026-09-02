@@ -20,7 +20,13 @@
     "",
     "Polygons may be concave. Vertex order does not matter. Units are cm,",
     "matching the calibration regression. Omit 'robot' entirely to treat the",
-    "robot as a point."
+    "robot as a point.",
+    "",
+    "'field' is the REAL perimeter, un-inset, for the same reason obstacles",
+    "are un-inflated: the wall is an obstacle, and the solver sweeps the",
+    "footprint against it per heading and holds wall_clearance_cm off it. The",
+    "value table then spans only the positions the robot can occupy, which is",
+    "this rectangle inset by the footprint plus that clearance."
   ],
   "units": { "distance": "cm", "angle": "rad" },
 

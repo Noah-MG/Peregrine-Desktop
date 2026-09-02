@@ -48,6 +48,7 @@ Everything the wizard drives can also be run directly — see *Layout*.
 | `calibration/fit_drivetrain.py` | fits the drivetrain model from a driving log |
 | `calibration/diagnose_fit.py` | optional: plots the fit and recommends a model form |
 | `solver/solve.jl` | Julia/CUDA minimum-time value-table solver |
+| `solver/cloud/` | running a solve on a rented GPU, when the card here is the limit |
 | `docs/TABLE_FORMAT.md` | **the contract the robot firmware reads** |
 
 ## Requirements
@@ -57,6 +58,10 @@ Everything the wizard drives can also be run directly — see *Layout*.
 - Julia 1.12 with `CUDA.jl` and `JSON3` — `julia --project=solver -e 'using
   Pkg; Pkg.instantiate()'`.
 - An NVIDIA GPU for the solver. It falls back to CPU, much more slowly.
+- Optional: an SSH key and a rented GPU box, if the grid you want is bigger
+  than the card here. See `solver/cloud/README.md` — the 8 GB card is what
+  forces tiling, and tiling is what makes a long lookahead expensive, so a
+  bigger card buys accuracy as well as speed.
 
 ## The steps
 
@@ -135,6 +140,139 @@ bin so nothing slips through in between.
 size and VRAM fit before committing, since these tables get very large very
 quickly.
 
+Three things about the Bellman backup are worth knowing, because they are
+where the accuracy actually comes from:
+
+- **The command is continuous, not a lattice point.** The admissible set is
+  the octahedron `|fwd| + |strafe| + |turn| ≤ 1`, and the optimum lies on its
+  surface but not at a corner — the traction term `tanh(|u|/knee)/(|u|/knee)`
+  depends on the Euclidean length of the command, which varies from 1.0 at a
+  corner to 0.577 at a face centre, so a face point can deliver more useful
+  force than the corner beside it. The lattice now only *seeds* a pattern
+  search that then moves off-lattice, and each cell keeps its answer as a
+  warm start for the next sweep. `control_scan` sets how much of the lattice
+  each sweep looks at; `refine_rounds` sets how far the search then refines.
+- **Each cell picks its own lookahead.** A single global `dt` is wrong almost
+  everywhere: a step that does not leave its own cell teaches the backup
+  nothing and converges to something too pessimistic, while one that spans
+  several cells smears the interpolation. `cfl` says how many grid cells one
+  backup should advance and the solver derives the seconds from that and from
+  how fast the robot is going; `tau_levels` is how many horizons each cell
+  brackets around it. Substep count follows the horizon so a longer step is
+  never a less accurate one. Set `cfl: 0` to go back to a fixed `dt`.
+- **Leaving the velocity box is not free.** A state outside the grid's
+  velocity envelope is rejected, exactly like a state whose footprint is
+  through a wall. It used to be clamped, which priced exceeding the envelope
+  at zero — and since the fitted model's terminal speed is far above a typical
+  `vmax`, the minimisation took that offer. Set `vmax` and `wmax` to what you
+  actually want the robot to do, because the table will not exceed them.
+- **The perimeter wall is an obstacle like any other.** It gets the robot's
+  own footprint swept in and the clearance held off it, per heading, exactly
+  as a scoring structure does. It did not always: the boundary used to
+  constrain the tracking *point* alone, so a 36 cm chassis was free to park
+  with 18 cm of itself outside the field — a looser rule than the one applied
+  to an obstacle standing one centimetre inboard of that wall. `wall_clearance_cm`
+  defaults to `clearance_cm`; set it separately if you are willing to run
+  closer to the perimeter than to a structure.
+- **You set the cell size, not the sample count.** `grid.resolution` is four
+  numbers in four different units — `xy_cm`, `heading_deg`, `v_cm_s`,
+  `w_rad_s` — and each is honoured exactly. The extent follows from them
+  rather than the other way round, so changing the field or the speed
+  envelope leaves the resolution alone and moves the counts. The velocity
+  axes always come out odd, which puts **zero exactly on the grid**: every
+  target is a state at rest, and on an even count rest falls between two
+  samples and every value near it is an interpolation.
+- **The table is narrower than the field, and says so.** Its x/y span is the
+  field inset by the footprint and the wall clearance — the positions the
+  robot can actually occupy — which on a 366 cm field with a 36 cm chassis is
+  24% fewer cells for exactly the same set of legal states. `MANIFEST.JSON`
+  reports the stored span under `grid.min`/`grid.max` and the field it was cut
+  from under `grid.field_bounds`.
+
+**A grid too big for the card is solved a tile at a time.** At full
+resolution the value function runs to tens of gigabytes, well past any
+consumer GPU, so the solver keeps it in a scratch file and gives the card one
+window of it at a time: load a tile plus a halo, update the middle, write the
+middle back, move on. Value iteration does not care what order cells are
+updated in, only that they keep being updated, so this converges to the same
+answer as the whole-grid solve — verified against it in the self-test, to
+within the spread the solver already has between two runs of itself.
+
+The cut is over `x` and `y` and can only be over `x` and `y`. Heading and
+`ω` are too short to cut without the halo eating them, and `vx`/`vy` cannot
+be cut at all: the successor's velocity is rotated back to the field frame
+through the *new* heading, so a step that turns a quarter turn carries
+`(vx, 0)` to `(0, vx)` and the reach spans the whole velocity plane.
+
+A **round** is one pass over every tile: each is loaded, swept `tile_sweeps`
+times against a frozen halo, and written back. So a round is `tile_sweeps`
+sweeps of the whole grid, and `iterations` — which is a budget of sweeps —
+buys `iterations / tile_sweeps` rounds, keeping the two drivers comparable on
+both time and quality.
+
+The tile boundaries **move between rounds**, which is why the tile count
+changes: a shifted tiling starts partly off the edge and picks up an extra
+partial row and column. That was for seams — a cell frozen on a boundary this
+round is mid-tile the next — and it is load-bearing. With no halo and the
+tiling pinned, mean value went 1.80 s to 14.33 s in the self-test; allowed to
+shift, it came back to 1.79 s.
+
+`plan` also estimates the wall clock. It is a ceiling — the full iteration
+budget, which `tolerance` usually cuts short — and it comes from two rates
+measured on one machine: about 23M cell-updates/s on an 8 GB card, and about
+500 MB/s of scratch. After one run, put the real numbers in `cell_rate` and
+`disk_rate` and every later estimate sharpens.
+
+A round costs its compute **plus** its I/O, not the greater of the two. The
+driver loads a tile, sweeps it, stores it, and moves on — strictly in
+sequence, with no prefetch and no second staging buffer — so nothing hides
+behind anything else. (Writes are the exception: they land in the page cache
+and the kernel flushes them behind us, so they are partly hidden in practice.)
+That makes the halo a real, visible cost at every size, which is why `plan`
+reports the two halves separately.
+
+The number to watch in `plan` is **loaded per updated** — how many cells come
+off disk for each one the sweep improves. It is set by how far one backup can
+reach compared with how big a tile the card can hold, so the lever on it is
+`tau_max`, the longest lookahead the step-length ladder may try.
+
+`plan` no longer leaves that to you. It costs out the whole ladder on a
+single shared reach scan and recommends one, with the accuracy it costs
+against the 0.5 s reference the cost curve was measured at:
+
+```
+  step    reach   loaded/updated    sweeps      i/o   per round   value cost
+   0.50      87 cm       29.2x      3m 47s   9m 22s     13m 09s  +   0%
+   0.40      72 cm       11.4x      3m 47s   3m 50s      7m 38s  +   1%
+   0.30      57 cm        6.0x      3m 47s   2m 10s      5m 58s  +   3%
+   0.20      40 cm        3.7x      3m 47s   1m 27s      5m 15s  +   6% <--
+   0.10      21 cm        2.2x      3m 47s   1m 00s      4m 48s  +  21%
+```
+
+The rule behind the arrow is one objective: lowest `round time × (1 + value
+cost)`. Both are multiplicative penalties on the same run — one lengthens it,
+the other makes every answer in it worse by a measured percentage — so the
+product has a real minimum, and it sits at the knee rather than at either end.
+In core there is no halo at all, so the answer is simply the reference and no
+scan is run.
+
+When the grid will not hold whole, `plan` also reports **the nearest
+resolution that would** — the same cell sizes, uniformly coarsened, with the
+factor named. Tiling is the difference between minutes and days, so that is
+usually the trade worth making before any of the others, and the resolution
+suggestion is bounded by VRAM as well as by card space so that taking it can
+never move a run from in-core to tiled.
+
+**`tau_max` defaults to `auto` and is derived on every plan and every solve**,
+from the same code path so the two cannot disagree. In core it resolves to the
+full 0.5 s, because there is no halo for a shorter step to pay for; tiled it
+resolves to the knee for that particular grid. It is deliberately not a
+remembered setting: a number carried in a config cannot track the resolution,
+the field, the model or the machine, and a stale short step is invisible —
+0.12 s left over from a tiled experiment costs about 17% on mean value on
+every run afterwards, including ones with nothing to gain from it. Pin it to a
+number if you want to, and `plan` will tell you what the pin is costing.
+
 **4. Write the SD card.** Wipes the card and writes the tables, plus
 `MANIFEST.JSON` describing them and `MODEL.JSON` carrying the drivetrain
 model itself — the online optimizer needs both. Nothing else goes on the
@@ -170,6 +308,36 @@ A caution the report repeats: the residual-vs-regressor plots are more
 sensitive than the rollout comparison, and estimating acceleration by
 smoothing leaves a signal-dependent bias behind that looks like curvature. The
 report only recommends adding a term when the rollout score agrees.
+
+## Checking the solver
+
+```bash
+julia --project=solver solver/solve.jl --self-test
+```
+
+Seven checks, and the two that matter most exist to keep the solver honest
+about its own optimisations:
+
+- On a **double integrator**, where the minimum time from rest at distance `d`
+  is exactly `2·√(d/a)`, does the solver recover it? The solver knows nothing
+  about that formula, so agreeing with it exercises the control set, the
+  integration, the interpolation, the seeding and the iteration at once. The
+  remaining error is reported split into a **fixed part** (the terminal
+  approach, where the robot is slow and the interpolation is most diffusive)
+  and a **per-second part** (the cruise) — a flat percentage cannot tell those
+  two apart, and only the second would signal a real regression.
+- Is the **fast control search ever worse** than scanning the whole lattice?
+  Measured: worse on 0 of 606,368 cells, and 36% tighter on average.
+- Does **widening the step-length ladder ever raise a value**? It must not —
+  minimising over more horizons is only sound if the horizons are *added* to
+  the existing one rather than substituted for it. Measured: 0 of 617,400
+  cells raised.
+
+The self-test also prints the minimum-time excess split into a **fixed** part
+(the terminal approach, where the robot is slow and the interpolation is most
+diffusive) and a **per-second** part (the cruise). Those have different causes
+and only the second would signal a regression in the backup, so a single
+percentage tolerance cannot police both.
 
 ## Safety
 

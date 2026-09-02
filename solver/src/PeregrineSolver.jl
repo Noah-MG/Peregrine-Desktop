@@ -27,7 +27,7 @@ using Printf
 using SHA
 using JSON3
 
-export Grid6, Model, solve_target, load_field, load_targets, load_model
+export Grid6, Model, solve_value!, load_field, load_targets, load_model
 
 const AXES = ("x", "y", "h", "vx", "vy", "w")
 const INF32 = Float32(Inf)
@@ -135,12 +135,21 @@ result scales all three.
     tanh(r) / r
 end
 
-@inline function body_accel(m::Model, u1r, u2r, u3r, vx, vy, w)
+"""Apply the traction saturation to a raw command, once.
+
+Split out of `body_accel` because the command is constant across the
+substeps of one Bellman lookahead, while the velocity is not: computing
+`sqrt` and `tanh` inside the substep loop repeated the same answer `nsub`
+times per control. Hoisting it is exactly value-preserving.
+"""
+@inline function saturate(m::Model, u1r, u2r, u3r)
+    gn = traction_gain(u1r, u2r, u3r, m.knee)
+    (u1r * gn, u2r * gn, u3r * gn)
+end
+
+"""Body-frame proper acceleration for an ALREADY-SATURATED command."""
+@inline function body_accel_sat(m::Model, u1, u2, u3, vx, vy, w)
     B = m.B; A = m.A; q = m.q; S = m.S; D = m.D; c = m.c; e = m.eps
-    # The fit was made against the saturated command, so the solver has to
-    # saturate too or its dynamics will not match the tables.
-    g = traction_gain(u1r, u2r, u3r, m.knee)
-    u1 = u1r * g; u2 = u2r * g; u3 = u3r * g
     w2 = w * w
     sx = csign(vx, e[1]); sy = csign(vy, e[2]); sw = csign(w, e[3])
     dx = abs(vx) * vx;    dy = abs(vy) * vy;    dw = abs(w) * w
@@ -153,6 +162,37 @@ end
     (ax, ay, al)
 end
 
+"""Body-frame proper acceleration for a raw (unsaturated) command."""
+@inline function body_accel(m::Model, u1r, u2r, u3r, vx, vy, w)
+    # The fit was made against the saturated command, so the solver has to
+    # saturate too or its dynamics will not match the tables.
+    u1, u2, u3 = saturate(m, u1r, u2r, u3r)
+    body_accel_sat(m, u1, u2, u3, vx, vy, w)
+end
+
+"""
+Has the integration blown up?
+
+A long lookahead can walk the state into a region where the *fitted model*
+is unstable, which is not the same thing as the robot being unstable. The
+quadratic drag block is fitted over the speeds the calibration run actually
+visited, and extrapolated far enough its omega term changes sign and becomes
+positive feedback: past roughly 15 rad/s the fitted `0.312*|w|*w` outruns the
+linear `-4.67*w` and runs away. The step-length ladder deliberately tries
+horizons long enough to reach that, because trying them is how it finds out
+they are not worth taking.
+
+So divergence has to be *detected* rather than prevented -- the caller
+rejects a non-finite successor and that candidate simply loses. What must not
+happen is reaching `sincos` with an infinite argument: CUDA returns NaN and
+carries on, but the CPU throws a DomainError and kills the whole solve. The
+GPU hid this bug completely; only running the CPU backend found it.
+"""
+@inline diverged(x, y, h, vx, vy, w) =
+    !isfinite(x + y + h + vx + vy + w)
+
+const NANSTATE = (NaN32, NaN32, NaN32, NaN32, NaN32, NaN32)
+
 """
 Advance the state by `dt` using `nsub` semi-implicit Euler substeps.
 
@@ -160,11 +200,14 @@ The regression's `a` is the body-frame proper acceleration,
 `a = dv/dt + w x v`, so the velocity derivative is `dv/dt = a - w x v`.
 Position integrates in the field frame through R(h).
 """
-@inline function step_state(m::Model, x, y, h, vx, vy, w, u1, u2, u3,
+@inline function step_state(m::Model, x, y, h, vx, vy, w, u1r, u2r, u3r,
                             dt::Float32, nsub::Int32)
     hs = dt / Float32(nsub)
+    # Saturate once: the command does not change across substeps.
+    u1, u2, u3 = saturate(m, u1r, u2r, u3r)
     @inbounds for _ in 1:nsub
-        ax, ay, al = body_accel(m, u1, u2, u3, vx, vy, w)
+        diverged(x, y, h, vx, vy, w) && return NANSTATE
+        ax, ay, al = body_accel_sat(m, u1, u2, u3, vx, vy, w)
         # dv/dt = a - w x v,  with w x v = w*(-vy, vx)
         dvx = ax + w * vy
         dvy = ay - w * vx
@@ -175,6 +218,62 @@ Position integrates in the field frame through R(h).
         vx += dvx * hs
         vy += dvy * hs
         w  += al * hs
+    end
+    (x, y, h, vx, vy, w)
+end
+
+"""The full state derivative, for a command that is already saturated."""
+@inline function state_deriv(m::Model, x, y, h, vx, vy, w, u1, u2, u3)
+    ax, ay, al = body_accel_sat(m, u1, u2, u3, vx, vy, w)
+    sh, ch = sincos(h)
+    (ch * vx - sh * vy,        # dx
+     sh * vx + ch * vy,        # dy
+     w,                        # dh
+     ax + w * vy,              # dvx   (dv/dt = a - w x v)
+     ay - w * vx,              # dvy
+     al)                       # dw
+end
+
+"""
+Advance the state by `dt` using `nsub` explicit-midpoint (RK2) substeps.
+
+Same dynamics as `step_state`, integrated to second order instead of first.
+The extra cost is one more acceleration evaluation per substep, which is
+arithmetic; the Bellman backup is limited by the 64 scattered reads in
+`interp`, so on this kernel it is very nearly free. What it buys is real:
+first-order error at this step size is not negligible next to the grid
+resolution, and it is systematic rather than random, so it does not average
+out over a trajectory.
+
+It matters most exactly where the model is hardest. The Coulomb term is
+smoothed over a band of only 5 cm/s, and the drivetrain crosses that band in
+about 6 ms under full command -- shorter than a substep. Euler steps straight
+over the transition and books the wrong friction for the whole substep;
+midpoint at least samples inside it.
+"""
+@inline function step_state_rk2(m::Model, x, y, h, vx, vy, w, u1r, u2r, u3r,
+                                dt::Float32, nsub::Int32)
+    hs = dt / Float32(nsub)
+    hh = 0.5f0 * hs
+    u1, u2, u3 = saturate(m, u1r, u2r, u3r)
+    @inbounds for _ in 1:nsub
+        diverged(x, y, h, vx, vy, w) && return NANSTATE
+        d1x, d1y, d1h, d1vx, d1vy, d1w =
+            state_deriv(m, x, y, h, vx, vy, w, u1, u2, u3)
+        mx = x + d1x * hh; my = y + d1y * hh; mh = h + d1h * hh
+        mvx = vx + d1vx * hh; mvy = vy + d1vy * hh; mw = w + d1w * hh
+        # The midpoint is itself fed to sincos, so it needs the same guard as
+        # the state proper -- one unstable substep is enough to make it
+        # infinite while the state it came from was still finite.
+        diverged(mx, my, mh, mvx, mvy, mw) && return NANSTATE
+        d2x, d2y, d2h, d2vx, d2vy, d2w =
+            state_deriv(m, mx, my, mh, mvx, mvy, mw, u1, u2, u3)
+        x  += d2x  * hs
+        y  += d2y  * hs
+        h  += d2h  * hs
+        vx += d2vx * hs
+        vy += d2vy * hs
+        w  += d2w  * hs
     end
     (x, y, h, vx, vy, w)
 end
@@ -257,9 +356,24 @@ This is the hot spot of the whole solver: 64 corner reads per lookup, with
 poor locality. `nearest` trades accuracy for one read, which is a large speed
 win on big grids at the cost of a more diffusive value function.
 
-Velocity outside the grid is clamped rather than rejected -- leaving the
-velocity box means the model has been pushed past where it was fitted, not
-that the state is illegal. Position outside the field returns `cap`.
+Velocity outside the grid is REJECTED, like position outside the field.
+
+That is a correction, not a preference. Clamping instead -- charging a state
+outside the envelope the value of the nearest state inside it -- prices
+exceeding the envelope at exactly zero, and the minimisation finds that
+immediately. The fitted model's terminal speed is around 400 cm/s, well
+beyond the 150 cm/s a typical grid covers, so "accelerate out of the box" is
+both reachable and free: the cells near the velocity boundary come out
+optimistic, and the policy they induce drives the robot into a region where
+the table says nothing and the regression was never fitted. A rollout on a
+clamped table does exactly that -- observed running away to 432 cm/s and then
+to NaN.
+
+Rejecting keeps every trajectory the table endorses inside the envelope it
+was solved over, which is the honest reading of what a value table covers.
+It raises `V` near the velocity boundary, because it removes controls that
+were previously free; that is the optimism being taken away, not accuracy
+being lost. `vclamp = true` restores the old behaviour.
 
 Unreached cells hold `cap`, a large *finite* value, rather than Inf. That
 matters: during value iteration "not computed yet" and "inside an obstacle"
@@ -274,7 +388,8 @@ rejected by the swept check in `cell_update`, and obstacle cells sit at
 `cap`. That argument needs obstacles to be at least one cell thick -- see
 `margin_cm` in `build_occupancy`.
 """
-@inline function interp(V, g::Grid6, x, y, h, vx, vy, w, nearest::Bool, cap::Float32)
+@inline function interp(V, g::Grid6, x, y, h, vx, vy, w, nearest::Bool,
+                        cap::Float32, vclamp::Bool = false)
     st = (x, y, h, vx, vy, w)
     # Fractional grid coordinates.
     f1 = (st[1] - g.lo[1]) / g.step[1]
@@ -287,13 +402,25 @@ rejected by the swept check in `cell_update`, and obstacle cells sit at
     f5 = (st[5] - g.lo[5]) / g.step[5]
     f6 = (st[6] - g.lo[6]) / g.step[6]
 
+    # A non-finite coordinate must be caught before anything is rounded: every
+    # comparison against NaN is false, so an unchecked NaN passes all the
+    # range tests below and then indexes the table with garbage.
+    (isfinite(f1) && isfinite(f2) && isfinite(f3) &&
+     isfinite(f4) && isfinite(f5) && isfinite(f6)) || return cap
+
     # Off the field is unreachable.
     (f1 < 0.0f0 || f1 > Float32(g.n[1] - 1)) && return cap
     (f2 < 0.0f0 || f2 > Float32(g.n[2] - 1)) && return cap
-    # Past the fitted velocity envelope: clamp.
-    f4 = clamp(f4, 0.0f0, Float32(g.n[4] - 1))
-    f5 = clamp(f5, 0.0f0, Float32(g.n[5] - 1))
-    f6 = clamp(f6, 0.0f0, Float32(g.n[6] - 1))
+    # Past the velocity envelope: reject, unless explicitly asked to clamp.
+    if vclamp
+        f4 = clamp(f4, 0.0f0, Float32(g.n[4] - 1))
+        f5 = clamp(f5, 0.0f0, Float32(g.n[5] - 1))
+        f6 = clamp(f6, 0.0f0, Float32(g.n[6] - 1))
+    else
+        (f4 < 0.0f0 || f4 > Float32(g.n[4] - 1)) && return cap
+        (f5 < 0.0f0 || f5 > Float32(g.n[5] - 1)) && return cap
+        (f6 < 0.0f0 || f6 > Float32(g.n[6] - 1)) && return cap
+    end
 
     if nearest
         i1 = Int32(round(f1)); i2 = Int32(round(f2)); i3 = Int32(round(f3)) % g.n[3]
@@ -331,21 +458,526 @@ rejected by the swept check in `cell_update`, and obstacle cells sit at
 end
 
 # --------------------------------------------------------------------------
+# Kuhn / Freudenthal simplex interpolation
+# --------------------------------------------------------------------------
+
+"""Descending compare-exchange on (value, axis) pairs."""
+@inline cmpx(ta, ka, tb, kb) = ta >= tb ? (ta, ka, tb, kb) : (tb, kb, ta, ka)
+
+"""
+Sort six (t, axis) pairs into descending order by `t`.
+
+A 12-comparator sorting network rather than a loop: it is branchless, which
+is what a GPU wants, and 12 is the optimal comparator count for six inputs.
+"""
+@inline function sort6_desc(t1, t2, t3, t4, t5, t6)
+    k1 = Int32(1); k2 = Int32(2); k3 = Int32(3)
+    k4 = Int32(4); k5 = Int32(5); k6 = Int32(6)
+    t1, k1, t6, k6 = cmpx(t1, k1, t6, k6)
+    t2, k2, t4, k4 = cmpx(t2, k2, t4, k4)
+    t3, k3, t5, k5 = cmpx(t3, k3, t5, k5)
+    t2, k2, t3, k3 = cmpx(t2, k2, t3, k3)
+    t4, k4, t5, k5 = cmpx(t4, k4, t5, k5)
+    t1, k1, t4, k4 = cmpx(t1, k1, t4, k4)
+    t3, k3, t6, k6 = cmpx(t3, k3, t6, k6)
+    t1, k1, t2, k2 = cmpx(t1, k1, t2, k2)
+    t3, k3, t4, k4 = cmpx(t3, k3, t4, k4)
+    t5, k5, t6, k6 = cmpx(t5, k5, t6, k6)
+    t2, k2, t3, k3 = cmpx(t2, k2, t3, k3)
+    t4, k4, t5, k5 = cmpx(t4, k4, t5, k5)
+    (t1, t2, t3, t4, t5, t6, k1, k2, k3, k4, k5, k6)
+end
+
+"""
+Step one grid subscript along axis `k`.
+
+Heading wraps; every other axis clamps at the top index. Clamping is safe
+rather than merely convenient: a point sitting exactly on the last grid plane
+has `t = 0` on that axis, so the sort puts it last and the vertex that would
+step past the edge carries zero barycentric weight. The read still happens --
+it just does not contribute.
+"""
+@inline function bump(g::Grid6, i1, i2, i3, i4, i5, i6, k::Int32)
+    k == Int32(1) && return (min(i1 + Int32(1), g.n[1] - Int32(1)), i2, i3, i4, i5, i6)
+    k == Int32(2) && return (i1, min(i2 + Int32(1), g.n[2] - Int32(1)), i3, i4, i5, i6)
+    k == Int32(3) && return (i1, i2, (i3 + Int32(1)) % g.n[3], i4, i5, i6)   # periodic
+    k == Int32(4) && return (i1, i2, i3, min(i4 + Int32(1), g.n[4] - Int32(1)), i5, i6)
+    k == Int32(5) && return (i1, i2, i3, i4, min(i5 + Int32(1), g.n[5] - Int32(1)), i6)
+    (i1, i2, i3, i4, i5, min(i6 + Int32(1), g.n[6] - Int32(1)))
+end
+
+"""Grid step along a runtime axis index, as an explicit chain.
+
+Indexing the `NTuple` with a non-constant would make the compiler either
+build a branch tree anyway or spill the tuple to local memory, which on a GPU
+is the expensive outcome. Writing the chain out keeps it in registers.
+"""
+@inline function stepof(g::Grid6, k::Int32)
+    k == Int32(1) && return g.step[1]
+    k == Int32(2) && return g.step[2]
+    k == Int32(3) && return g.step[3]
+    k == Int32(4) && return g.step[4]
+    k == Int32(5) && return g.step[5]
+    g.step[6]
+end
+
+"""
+6D Kuhn (Freudenthal) simplex interpolation, with the gradient for free.
+
+Returns `(value, dV/dx, dV/dy, dV/dh, dV/dvx, dV/dvy, dV/dw)`.
+
+**Why this and not the 64-corner multilinear.** Two independent reasons, and
+the second is the important one.
+
+*It is far cheaper.* A unit cube in 6D splits into 6! = 720 simplices, each
+with 7 vertices, so a lookup reads 7 values instead of 64. The Bellman backup
+is bound by exactly these scattered reads, so this is close to a 9x cut in
+the hot loop.
+
+*It is what the robot uses.* The online optimizer recovers `grad(V)` by
+locating the simplex containing its state, taking the 7 vertices and
+finite-differencing them. `V` is the fixed point of whichever interpolant the
+Bellman update is written with -- so solving with multilinear and reading with
+simplex produces a table that is self-consistent under an operator nobody
+ever applies. Matching the two is a correctness argument, not a performance
+one; the speed is a bonus.
+
+**Construction.** Sort the six fractional coordinates descending,
+`t_s(1) >= ... >= t_s(6)`. The simplex has vertices `v0 = floor(f)` and
+`v_k = v_(k-1) + e_s(k)`, so the walk from the low corner to the high corner
+takes the axes in order of how far into the cell the point sits. Barycentric
+weights are the consecutive differences, `L0 = 1 - t_s(1)`,
+`L_k = t_s(k) - t_s(k+1)`, `L6 = t_s(6)`; they sum to one and are
+non-negative precisely because the sort is descending.
+
+That makes the value a convex combination of stored cell values, exactly as
+multilinear is, so the Bellman operator stays monotone and value iteration
+still converges downward to a fixed point. The decomposition also agrees on
+shared cell faces, so the interpolant is globally continuous -- neighbouring
+cells triangulate their common face the same way.
+
+The gradient falls out with no extra reads: `V` is affine on the simplex, and
+consecutive vertices differ by one step along one axis, so
+`dV/dx_s(k) = (V(v_k) - V(v_(k-1))) / step_s(k)`.
+"""
+@inline function interp_kuhn(V, g::Grid6, x, y, h, vx, vy, w,
+                             cap::Float32, vclamp::Bool = false)
+    z = 0.0f0
+    f1 = (x - g.lo[1]) / g.step[1]
+    f2 = (y - g.lo[2]) / g.step[2]
+    n3 = Float32(g.n[3])
+    f3 = (h - g.lo[3]) / g.step[3]
+    f3 = f3 - floor(f3 / n3) * n3
+    f4 = (vx - g.lo[4]) / g.step[4]
+    f5 = (vy - g.lo[5]) / g.step[5]
+    f6 = (w - g.lo[6]) / g.step[6]
+
+    # NaN before anything is rounded: every comparison against NaN is false,
+    # so an unchecked NaN passes all the range tests and indexes with garbage.
+    (isfinite(f1) && isfinite(f2) && isfinite(f3) &&
+     isfinite(f4) && isfinite(f5) && isfinite(f6)) ||
+        return (cap, z, z, z, z, z, z)
+
+    (f1 < 0.0f0 || f1 > Float32(g.n[1] - 1)) && return (cap, z, z, z, z, z, z)
+    (f2 < 0.0f0 || f2 > Float32(g.n[2] - 1)) && return (cap, z, z, z, z, z, z)
+    if vclamp
+        f4 = clamp(f4, 0.0f0, Float32(g.n[4] - 1))
+        f5 = clamp(f5, 0.0f0, Float32(g.n[5] - 1))
+        f6 = clamp(f6, 0.0f0, Float32(g.n[6] - 1))
+    else
+        (f4 < 0.0f0 || f4 > Float32(g.n[4] - 1)) && return (cap, z, z, z, z, z, z)
+        (f5 < 0.0f0 || f5 > Float32(g.n[5] - 1)) && return (cap, z, z, z, z, z, z)
+        (f6 < 0.0f0 || f6 > Float32(g.n[6] - 1)) && return (cap, z, z, z, z, z, z)
+    end
+
+    b1 = floor(f1); b2 = floor(f2); b3 = floor(f3)
+    b4 = floor(f4); b5 = floor(f5); b6 = floor(f6)
+    i1 = Int32(b1); i2 = Int32(b2); i3 = Int32(b3) % g.n[3]
+    i4 = Int32(b4); i5 = Int32(b5); i6 = Int32(b6)
+
+    s1, s2, s3, s4, s5, s6, a1, a2, a3, a4, a5, a6 =
+        sort6_desc(f1 - b1, f2 - b2, f3 - b3, f4 - b4, f5 - b5, f6 - b6)
+
+    # Walk the simplex from the low corner to the high one, accumulating the
+    # value and keeping each edge's difference for the gradient.
+    @inbounds v0 = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+    acc = (1.0f0 - s1) * v0
+    prev = v0
+
+    # Unrolled by hand. A `for k in 1:6` over tuples would index them with a
+    # runtime value, and the usual result of that on a GPU is the tuple going
+    # to local memory.
+    @inbounds begin
+        i1, i2, i3, i4, i5, i6 = bump(g, i1, i2, i3, i4, i5, i6, a1)
+        v = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+        acc += (s1 - s2) * v
+        e1 = (v - prev) / stepof(g, a1); prev = v
+
+        i1, i2, i3, i4, i5, i6 = bump(g, i1, i2, i3, i4, i5, i6, a2)
+        v = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+        acc += (s2 - s3) * v
+        e2 = (v - prev) / stepof(g, a2); prev = v
+
+        i1, i2, i3, i4, i5, i6 = bump(g, i1, i2, i3, i4, i5, i6, a3)
+        v = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+        acc += (s3 - s4) * v
+        e3 = (v - prev) / stepof(g, a3); prev = v
+
+        i1, i2, i3, i4, i5, i6 = bump(g, i1, i2, i3, i4, i5, i6, a4)
+        v = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+        acc += (s4 - s5) * v
+        e4 = (v - prev) / stepof(g, a4); prev = v
+
+        i1, i2, i3, i4, i5, i6 = bump(g, i1, i2, i3, i4, i5, i6, a5)
+        v = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+        acc += (s5 - s6) * v
+        e5 = (v - prev) / stepof(g, a5); prev = v
+
+        i1, i2, i3, i4, i5, i6 = bump(g, i1, i2, i3, i4, i5, i6, a6)
+        v = V[flatten(g, i1, i2, i3, i4, i5, i6) + 1]
+        acc += s6 * v
+        e6 = (v - prev) / stepof(g, a6)
+
+        # Scatter each edge difference back to the axis it stepped along.
+        d1 = a1 == Int32(1) ? e1 : a2 == Int32(1) ? e2 : a3 == Int32(1) ? e3 :
+             a4 == Int32(1) ? e4 : a5 == Int32(1) ? e5 : e6
+        d2 = a1 == Int32(2) ? e1 : a2 == Int32(2) ? e2 : a3 == Int32(2) ? e3 :
+             a4 == Int32(2) ? e4 : a5 == Int32(2) ? e5 : e6
+        d3 = a1 == Int32(3) ? e1 : a2 == Int32(3) ? e2 : a3 == Int32(3) ? e3 :
+             a4 == Int32(3) ? e4 : a5 == Int32(3) ? e5 : e6
+        d4 = a1 == Int32(4) ? e1 : a2 == Int32(4) ? e2 : a3 == Int32(4) ? e3 :
+             a4 == Int32(4) ? e4 : a5 == Int32(4) ? e5 : e6
+        d5 = a1 == Int32(5) ? e1 : a2 == Int32(5) ? e2 : a3 == Int32(5) ? e3 :
+             a4 == Int32(5) ? e4 : a5 == Int32(5) ? e5 : e6
+        d6 = a1 == Int32(6) ? e1 : a2 == Int32(6) ? e2 : a3 == Int32(6) ? e3 :
+             a4 == Int32(6) ? e4 : a5 == Int32(6) ? e5 : e6
+    end
+
+    (min(acc, cap), d1, d2, d3, d4, d5, d6)
+end
+
+# --------------------------------------------------------------------------
+# Warm-start policy storage
+# --------------------------------------------------------------------------
+
+"""
+Bytes a resident cell costs, by driver. **The one place that decides this.**
+
+`V` is a `Float32`, and the warm-start policy is three `Int8` -- one per
+command component -- in *both* drivers, so both answer 7.
+
+They did not always. The in-core driver kept the policy as three `Float32`
+planes, which cost 16 bytes a cell, while the tiled driver quantised to
+bytes; `decompose` sized the whole-grid case with the tiled driver's number
+and `run_solve` then allocated with the in-core one. A grid between
+`budget / 16` and `budget / 7` was therefore routed in core and could not be
+allocated -- and on Windows it did not even fail, because WDDM pages VRAM
+into host RAM, so the desktop silently ran at half speed and only Linux
+raised it.
+
+Hence one function. If a driver's layout changes, this number changes with
+it, and self-test 15 asserts that what the drivers *allocate* still matches
+what this claims.
+"""
+value_bytes_per_cell() = 4
+policy_bytes_per_cell() = 3
+cell_bytes(warm::Bool) =
+    value_bytes_per_cell() + (warm ? policy_bytes_per_cell() : 0)
+
+"""
+Read and write the warm-start policy, in either of the two layouts it is
+kept in.
+
+`Float32` in three planes is what the in-core solver uses: `V` and the policy
+are both the size of the grid, the grid fits in VRAM by assumption, and
+planes give perfectly coalesced access.
+
+`Int8` interleaved per cell is what the tiled solver uses, and both halves of
+that matter. **Bytes**, because out-of-core the policy is read and written
+again on every round, and three bytes carry this quantity perfectly well: the
+policy is not the answer, it is the seed the pattern search starts from, and
+the search's own first step is `delta0` -- 0.35 by default, fifty times
+coarser than the 1/127 a byte resolves. Every candidate is still evaluated
+exactly by `lookahead`, so the quantisation cannot move the fixed point, only
+the route to it. **Interleaved**, because a tile's window is then one
+contiguous run per x plane exactly as `V`'s is, and moves between store and
+device in the same handful of copies rather than three times as many.
+
+Both layouts go through these two functions so that `cell_update` does not
+have to know which it was handed.
+"""
+@inline function pol_get(pol::AbstractVector{Float32}, idx::Int64, n::Int64)
+    @inbounds (pol[idx + 1], pol[idx + 1 + n], pol[idx + 1 + 2 * n])
+end
+
+@inline function pol_get(pol::AbstractVector{Int8}, idx::Int64, n::Int64)
+    b = 3 * idx
+    @inbounds (Float32(pol[b + 1]) * (1.0f0 / 127.0f0),
+               Float32(pol[b + 2]) * (1.0f0 / 127.0f0),
+               Float32(pol[b + 3]) * (1.0f0 / 127.0f0))
+end
+
+@inline function pol_set!(pol::AbstractVector{Float32}, idx::Int64, n::Int64,
+                          u1, u2, u3)
+    @inbounds pol[idx + 1] = u1
+    @inbounds pol[idx + 1 + n] = u2
+    @inbounds pol[idx + 1 + 2 * n] = u3
+    nothing
+end
+
+@inline function pol_set!(pol::AbstractVector{Int8}, idx::Int64, n::Int64,
+                          u1, u2, u3)
+    q(v) = unsafe_trunc(Int8, round(clamp(v, -1.0f0, 1.0f0) * 127.0f0))
+    b = 3 * idx
+    @inbounds pol[b + 1] = q(u1)
+    @inbounds pol[b + 2] = q(u2)
+    @inbounds pol[b + 3] = q(u3)
+    nothing
+end
+
+"""Value only, from whichever interpolant `p` selects."""
+@inline function value_at(V, g::Grid6, x, y, h, vx, vy, w, p)
+    p.simplex && return interp_kuhn(V, g, x, y, h, vx, vy, w, p.cap, p.vclamp)[1]
+    interp(V, g, x, y, h, vx, vy, w, p.nearest, p.cap, p.vclamp)
+end
+
+# --------------------------------------------------------------------------
 # Bellman update for one cell
 # --------------------------------------------------------------------------
 
 """
+Everything the Bellman backup needs that is not the grid, the model or the
+arrays. `isbits`, so it passes straight into a GPU kernel as one argument
+instead of a dozen.
+
+The defaults reproduce the original fixed scheme exactly: `ncoarse = 0` means
+"scan the whole control table", `rounds = 0` disables the refinement, and
+`ntau = 1` pins the lookahead to a single `dt`.
+"""
+struct Params
+    dt::Float32            # fallback horizon when cfl <= 0
+    nsub::Int32
+    checks::Int32          # floor on the number of swept collision probes
+    adaptive_checks::Bool  # scale the probe count with how far the step moves
+    nearest::Bool
+    cap::Float32
+    ntau::Int32            # how many step lengths each cell tries
+    tau_ratio::Float32     # ratio between consecutive step lengths
+    cfl::Float32           # grid cells a step should advance (0 = use dt)
+    tau_min::Float32
+    tau_max::Float32
+    hmax::Float32          # longest integration substep allowed
+    ncoarse::Int32         # lattice controls scanned per sweep (0 = all)
+    rounds::Int32          # pattern-search refinement rounds
+    delta0::Float32        # first pattern-search radius
+    rk2::Bool              # midpoint integration instead of Euler
+    vclamp::Bool           # clamp (rather than reject) out-of-envelope speeds
+    simplex::Bool          # Kuhn simplex interpolation instead of multilinear
+end
+
+Params(; dt = 0.05f0, nsub = Int32(4), checks = Int32(3),
+         adaptive_checks = true, nearest = false, cap = 60.0f0,
+         ntau = Int32(1), tau_ratio = 2.0f0, cfl = 0.0f0,
+         tau_min = 0.004f0, tau_max = 0.5f0, hmax = 0.0125f0,
+         ncoarse = Int32(0), rounds = Int32(0), delta0 = 0.35f0,
+         rk2 = true, vclamp = false, simplex = true) =
+    Params(Float32(dt), Int32(nsub), Int32(checks), adaptive_checks, nearest,
+           Float32(cap), Int32(ntau), Float32(tau_ratio), Float32(cfl),
+           Float32(tau_min), Float32(tau_max), Float32(hmax), Int32(ncoarse),
+           Int32(rounds), Float32(delta0), rk2, vclamp, simplex)
+
+"""
+The lookahead horizon this cell should use, from the grid rather than a
+global constant.
+
+**Why a single `dt` cannot be right everywhere.** The Bellman backup learns
+nothing from a step that does not leave the cell it started in: the
+interpolated successor is then mostly the cell's own value, the update is
+dominated by its own numerical diffusion, and the iteration crawls toward an
+answer that is too pessimistic. Push the step the other way and the
+constant-command assumption starts costing more than the diffusion it saves.
+The step that balances the two is the one that advances about one grid cell
+-- a CFL condition -- and *that time is different in every cell*, because it
+depends on how fast the robot is already going.
+
+At rest, position hardly moves however long the step, so the binding axis is
+velocity: `cell / a_max`. At speed, position crosses a cell first. Taking the
+minimum over all six axes covers both, and covers rotation, which has its
+own occupancy slice to cross.
+
+`a_max` per body axis is the largest acceleration any admissible command can
+produce. Over the octahedron `|u|_1 <= 1` that is simply the largest entry of
+that row of `B`, since the maximum of a linear form over the unit 1-ball is
+its largest coefficient. Traction saturation only lowers it, so using the
+unsaturated figure errs toward a shorter step, which is the safe direction.
+"""
+@inline function cfl_tau(g::Grid6, m::Model, vfx, vfy, w, p::Params)
+    p.cfl <= 0.0f0 && return p.dt
+    B = m.B
+    ax = max(abs(B[1]), abs(B[2]), abs(B[3]))
+    ay = max(abs(B[4]), abs(B[5]), abs(B[6]))
+    aw = max(abs(B[7]), abs(B[8]), abs(B[9]))
+
+    t = p.tau_max
+    # Velocity axes: time to cross `cfl` velocity cells at full command.
+    ax > 1.0f-6 && (t = min(t, p.cfl * g.step[4] / ax))
+    ay > 1.0f-6 && (t = min(t, p.cfl * g.step[5] / ay))
+    aw > 1.0f-6 && (t = min(t, p.cfl * g.step[6] / aw))
+    # Position: time to cross `cfl` position cells at the current speed.
+    sp = sqrt(vfx * vfx + vfy * vfy)
+    sp > 1.0f-3 && (t = min(t, p.cfl * min(g.step[1], g.step[2]) / sp))
+    # Heading: time to cross `cfl` heading bins at the current spin rate.
+    aw2 = abs(w)
+    aw2 > 1.0f-4 && (t = min(t, p.cfl * g.step[3] / aw2))
+    clamp(t, p.tau_min, p.tau_max)
+end
+
+"""
+Substeps for a horizon of `tau`: enough that no substep exceeds `hmax`.
+
+Tying the substep count to the horizon rather than fixing it is what makes
+the step-length ladder safe. Integration error grows with the substep, and
+unlike discretisation error it can push the value BELOW the truth -- the one
+direction a minimum-time table must not be wrong in, because the robot would
+then be steering by a promise the drivetrain cannot keep. Holding the substep
+constant means a longer horizon is not silently a less accurate one.
+"""
+@inline function substeps_for(tau::Float32, p::Params)
+    p.hmax <= 0.0f0 && return p.nsub
+    k = unsafe_trunc(Int32, min(tau / p.hmax, 1.0f4)) + Int32(1)
+    max(Int32(1), min(k, Int32(64)))
+end
+
+"""
+Cost of holding one control for `tau`: `tau + V(successor)`, or `cap` if the
+step is blocked.
+
+**Why the probe count is derived rather than fixed.** The swept check exists
+because a fast step can cross several cells, and sampling only the endpoint
+tunnels through walls. A constant three probes is right for one particular
+speed and wrong either side of it: wasteful when the robot has barely moved,
+and unsafe once a step spans more than about one and a half cells -- which is
+exactly what a longer `tau` does on purpose. Deriving the count from the
+actual displacement, in cells, makes the guarantee independent of `dt`,
+`tau` and the grid resolution.
+
+The rotation is counted too, not just the translation: a chassis pivoting in
+place covers no ground at all while sweeping through headings whose occupancy
+slices are completely different.
+"""
+@inline function lookahead(V, occ, g::Grid6, m::Model, x, y, h, vx, vy, w,
+                           u1, u2, u3, tau::Float32, nsub::Int32, p::Params)
+    nx, ny, nh, nvx, nvy, nw = p.rk2 ?
+        step_state_rk2(m, x, y, h, vx, vy, w, u1, u2, u3, tau, nsub) :
+        step_state(m, x, y, h, vx, vy, w, u1, u2, u3, tau, nsub)
+
+    dx = nx - x; dy = ny - y; dh = nh - h
+    # A non-finite successor means the integration has diverged. It must be
+    # rejected explicitly: every comparison against NaN is false, so an
+    # unchecked NaN sails through the range tests in `interp` and indexes the
+    # table with garbage -- the same failure mode a NaN traction knee once
+    # caused, from a different direction.
+    (isfinite(dx) && isfinite(dy) && isfinite(dh) &&
+     isfinite(nvx) && isfinite(nvy) && isfinite(nw)) || return p.cap
+
+    nchk = p.checks
+    if p.adaptive_checks
+        cells_pos = sqrt(dx * dx + dy * dy) / (0.5f0 * min(g.step[1], g.step[2]))
+        cells_rot = abs(dh) / (0.5f0 * g.step[3])
+        # Bounded before truncating: `unsafe_trunc` past Int32 range is
+        # undefined, and a diverging step can reach a large finite number
+        # before it reaches Inf.
+        cells = min(max(cells_pos, cells_rot), 1.0f4)
+        need = unsafe_trunc(Int32, cells) + Int32(1)
+        nchk = max(p.checks, min(need, Int32(24)))
+    end
+
+    @inbounds for sc in 1:nchk
+        a = Float32(sc) / Float32(nchk)
+        px = x + dx * a
+        py = y + dy * a
+        ph = h + dh * a                    # the robot turns as it moves
+        gx = (px - g.lo[1]) / g.step[1]
+        gy = (py - g.lo[2]) / g.step[2]
+        if gx < 0.0f0 || gy < 0.0f0 ||
+           gx > Float32(g.n[1] - 1) || gy > Float32(g.n[2] - 1)
+            return p.cap
+        end
+        n3f = Float32(g.n[3])
+        gh = (ph - g.lo[3]) / g.step[3]
+        gh = gh - floor(gh / n3f) * n3f
+        ci = Int32(round(gx)); cj = Int32(round(gy))
+        ck = Int32(round(gh)) % g.n[3]
+        occ[(Int64(ci) * g.n[2] + cj) * g.n[3] + ck + 1] && return p.cap
+    end
+
+    # Rotate the successor's velocity back to the field frame, using the NEW
+    # heading, before looking it up in the grid.
+    snh, cnh = sincos(nh)
+    nvfx = cnh * nvx - snh * nvy
+    nvfy = snh * nvx + cnh * nvy
+    nv = value_at(V, g, nx, ny, nh, nvfx, nvfy, nw, p)
+    min(tau + nv, p.cap)
+end
+
+"""
+Push a command back onto the octahedron surface along its own direction.
+
+Used by the pattern search: a perturbed command generally leaves the
+admissible set, and rescaling by the 1-norm is the cheapest way back that
+keeps the direction. Rescaling rather than clipping is also what lets a
+perturbation walk off one face and onto a neighbouring one -- a component
+that crosses zero simply changes sign, so the search is free to move between
+orthants instead of being trapped on the face it started from.
+"""
+@inline function proj_oct(u1, u2, u3)
+    s = abs(u1) + abs(u2) + abs(u3)
+    s < 1.0f-6 && return (0.0f0, 0.0f0, 0.0f0)
+    r = 1.0f0 / s
+    (u1 * r, u2 * r, u3 * r)
+end
+
+"""
 One Bellman backup. Written to be valid in both a CPU loop and a GPU kernel:
 scalar math, no allocation, no dynamic dispatch.
+
+Returns `(value, u1, u2, u3)` -- the backed-up value and the command that
+achieved it, so the caller can keep it as a warm start.
+
+**How the minimisation over `u` is done.** Scanning the whole lattice every
+sweep spends the entire budget rediscovering the same answer: the optimal
+command at a cell barely moves from one sweep to the next, because `V` around
+it barely moves. So each sweep evaluates
+
+  * coasting, which is always admissible and is the tie-break;
+  * the command this cell chose last sweep (`pol`), the warm start;
+  * a rotating slice of the lattice, `ncoarse` entries starting at an offset
+    that advances every sweep, so the whole lattice is still swept -- just
+    spread over several sweeps rather than all at once;
+  * `rounds` of pattern search around whichever of those is currently best,
+    with the radius halving each round.
+
+The pattern search is what makes the command **continuous**: the lattice only
+ever seeds it, and the refinement then moves off-lattice by arbitrary
+amounts. That is worth having because the optimum genuinely is not at a
+lattice point -- the traction term `tanh(|u|/knee)/(|u|/knee)` varies over
+the octahedron surface, so the best command sits wherever alignment with the
+value gradient balances against saturation, which no fixed lattice hits.
+
+Every candidate is a real Bellman evaluation, never an approximation, so the
+result is still an upper bound on the true value and the iteration is still
+monotone. A restricted candidate set can only slow convergence down, never
+move the fixed point -- which is why the stopping rule in `solve_value!` has
+to see a quiet sweep for a whole rotation of the coarse offset, not just one.
 """
-@inline function cell_update(idx::Int64, V, occ, g::Grid6, m::Model,
-                             ctl, nctl::Int32, dt::Float32, nsub::Int32,
-                             sweep_checks::Int32, nearest::Bool, cap::Float32)
+@inline function cell_update(idx::Int64, V, occ, pol, g::Grid6, m::Model,
+                             ctl, nctl::Int32, p::Params, phase::Int32)
     i1, i2, i3, i4, i5, i6 = unflatten(g, idx)
 
     # Occupancy is (x, y, heading): a chassis with real extent blocks
     # different cells depending on which way it is pointing.
-    @inbounds occ[(Int64(i1) * g.n[2] + i2) * g.n[3] + i3 + 1] && return cap
+    @inbounds occ[(Int64(i1) * g.n[2] + i2) * g.n[3] + i3 + 1] &&
+        return (p.cap, 0.0f0, 0.0f0, 0.0f0)
 
     x  = axisvalue(g, 1, i1); y   = axisvalue(g, 2, i2)
     h  = axisvalue(g, 3, i3); vfx = axisvalue(g, 4, i4)
@@ -358,49 +990,120 @@ scalar math, no allocation, no dynamic dispatch.
     vx =  ch0 * vfx + sh0 * vfy
     vy = -sh0 * vfx + ch0 * vfy
 
-    best = cap
-    @inbounds for k in 1:nctl
-        u1 = ctl[k]; u2 = ctl[k+nctl]; u3 = ctl[k+2*nctl]
-        nx, ny, nh, nvx, nvy, nw = step_state(m, x, y, h, vx, vy, w, u1, u2, u3,
-                                              dt, nsub)
-        # Swept collision check: at speed the step can jump several cells, so
-        # sampling only the endpoint would tunnel straight through a wall.
-        blocked = false
-        for sc in 1:sweep_checks
-            a = Float32(sc) / Float32(sweep_checks)
-            px = x + (nx - x) * a
-            py = y + (ny - y) * a
-            ph = h + (nh - h) * a          # the robot turns as it moves
-            gx = (px - g.lo[1]) / g.step[1]
-            gy = (py - g.lo[2]) / g.step[2]
-            if gx < 0.0f0 || gy < 0.0f0 ||
-               gx > Float32(g.n[1] - 1) || gy > Float32(g.n[2] - 1)
-                blocked = true; break
-            end
-            n3f = Float32(g.n[3])
-            gh = (ph - g.lo[3]) / g.step[3]
-            gh = gh - floor(gh / n3f) * n3f
-            ci = Int32(round(gx)); cj = Int32(round(gy))
-            ck = Int32(round(gh)) % g.n[3]
-            if occ[(Int64(ci) * g.n[2] + cj) * g.n[3] + ck + 1]
-                blocked = true; break
+    ncell = ncells(g)
+
+    # The horizon this cell searches at, and the substeps that keep the
+    # integration error of that horizon bounded.
+    tau0 = cfl_tau(g, m, vfx, vfy, w, p)
+    ns0 = substeps_for(tau0, p)
+
+    # Coasting: always admissible, and the tie-break, so it goes first.
+    best = lookahead(V, occ, g, m, x, y, h, vx, vy, w,
+                     0.0f0, 0.0f0, 0.0f0, tau0, ns0, p)
+    b1 = 0.0f0; b2 = 0.0f0; b3 = 0.0f0
+
+    # The warm start: what this cell chose last sweep.
+    if pol !== nothing
+        q1, q2, q3 = pol_get(pol, idx, ncell)
+        if abs(q1) + abs(q2) + abs(q3) > 1.0f-6
+            c = lookahead(V, occ, g, m, x, y, h, vx, vy, w, q1, q2, q3,
+                          tau0, ns0, p)
+            if c < best
+                best = c; b1 = q1; b2 = q2; b3 = q3
             end
         end
-        blocked && continue
-
-        # Rotate the successor's velocity back to the field frame, using the
-        # NEW heading, before looking it up in the grid.
-        snh, cnh = sincos(nh)
-        nvfx = cnh * nvx - snh * nvy
-        nvfy = snh * nvx + cnh * nvy
-        nv = interp(V, g, nx, ny, nh, nvfx, nvfy, nw, nearest, cap)
-        best = min(best, min(dt + nv, cap))
     end
-    best
+
+    # Lattice scan: the whole table, or a rotating slice of it.
+    nnc = max(nctl - Int32(1), Int32(1))       # entries after coast
+    span = p.ncoarse <= Int32(0) ? nnc : min(p.ncoarse, nnc)
+    off  = p.ncoarse <= Int32(0) ? Int32(0) :
+           Int32(mod(Int64(phase) * Int64(span), Int64(nnc)))
+    @inbounds for j in Int32(0):(span - Int32(1))
+        k = Int32(mod(Int64(off) + Int64(j), Int64(nnc))) + Int32(2)   # skip coast
+        u1 = ctl[k]; u2 = ctl[k+nctl]; u3 = ctl[k+2*nctl]
+        c = lookahead(V, occ, g, m, x, y, h, vx, vy, w, u1, u2, u3,
+                      tau0, ns0, p)
+        if c < best
+            best = c; b1 = u1; b2 = u2; b3 = u3
+        end
+    end
+
+    # Pattern search: walk the incumbent across the octahedron surface.
+    delta = p.delta0
+    for _ in Int32(1):p.rounds
+        for d in Int32(1):Int32(6)
+            s = iseven(d) ? -delta : delta
+            e1 = d <= Int32(2) ? s : 0.0f0
+            e2 = (d == Int32(3) || d == Int32(4)) ? s : 0.0f0
+            e3 = d >= Int32(5) ? s : 0.0f0
+            c1, c2, c3 = proj_oct(b1 + e1, b2 + e2, b3 + e3)
+            (abs(c1) + abs(c2) + abs(c3)) < 1.0f-6 && continue
+            c = lookahead(V, occ, g, m, x, y, h, vx, vy, w, c1, c2, c3,
+                          tau0, ns0, p)
+            if c < best
+                best = c; b1 = c1; b2 = c2; b3 = c3
+            end
+        end
+        delta *= 0.5f0     # each round looks half as far as the last
+    end
+
+    # Step-length ladder on the incumbent.
+    #
+    # The dynamic programming principle holds for ANY lookahead horizon, so
+    # taking the minimum over several is a valid backup -- and a strictly
+    # tighter one, since it can only lower the result. `cfl_tau` already
+    # picked the horizon that should be about right for this cell; the ladder
+    # brackets it, half as long through several times as long, because "about
+    # right" is an estimate from the linearised geometry and the true best
+    # horizon depends on how `V` is shaped nearby.
+    #
+    # The ladder is geometric and centred on `tau0` rather than climbing away
+    # from it, so a cell that wants a shorter step can have one. Near the
+    # target that matters: the last approach needs finer resolution than the
+    # open-field cruise that got there.
+    if p.ntau > Int32(1)
+        tau = tau0 * 0.5f0
+        for k in Int32(1):p.ntau
+            if k != Int32(2)                 # k = 2 is tau0, already done
+                t = min(max(tau, p.tau_min), p.tau_max)
+                c = lookahead(V, occ, g, m, x, y, h, vx, vy, w, b1, b2, b3,
+                              t, substeps_for(t, p), p)
+                c < best && (best = c)
+            end
+            tau *= p.tau_ratio
+        end
+
+        # And always try the configured `dt` as well.
+        #
+        # "More horizons can only lower V" is true of a SUPERSET of horizons
+        # and false of a different set of them. With `cfl > 0` the ladder is
+        # built around a grid-derived `tau0`, which need not contain the fixed
+        # `dt` a run would otherwise have used -- so the ladder can, on some
+        # problems, be strictly worse than the single horizon it replaced.
+        # Measured: +4.8% on a double integrator whose grid happened to suit
+        # dt = 0.05 better than any rung around `tau0`.
+        #
+        # One extra evaluation restores the guarantee, and it is a guarantee
+        # worth having: it makes the scheme provably no worse than the fixed
+        # step it supersedes, on every problem rather than on average.
+        if p.cfl > 0.0f0
+            t = min(max(p.dt, p.tau_min), p.tau_max)
+            c = lookahead(V, occ, g, m, x, y, h, vx, vy, w, b1, b2, b3,
+                          t, substeps_for(t, p), p)
+            c < best && (best = c)
+        end
+    end
+
+    (best, b1, b2, b3)
 end
 
 include("Pipeline.jl")
+include("Tiles.jl")
+include("Advise.jl")
 include("Gpu.jl")
+include("OutOfCore.jl")
 include("Run.jl")
+include("SelfTest.jl")
 
 end # module

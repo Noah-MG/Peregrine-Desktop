@@ -54,13 +54,14 @@ N_FIELDS = len(HEADER_FIELDS)
 # solver detail. Units: cm/s, cm/s, rad/s.
 COULOMB_EPS = (5.0, 5.0, 0.15)
 
-# Traction knee search. `None` means "no saturation"; the auto search always
-# includes it, so a run that shows no slip disables the term by itself.
-KNEE_GRID = (None, 1.20, 0.90, 0.70, 0.55, 0.45, 0.35, 0.28)
-# A knee has to earn its parameter. Below this improvement in held-out rollout
-# it is not switched on -- an always-sliding run, for instance, can be fitted
-# marginally better with a huge knee that means nothing.
-KNEE_MIN_GAIN = 0.01
+# Traction knee search. Every candidate is a real knee: the model REQUIRES a
+# traction term, so the search picks the best one rather than deciding whether
+# to have one. `None` is still scored, but only as the reference row the
+# printout compares against -- it is never chosen.
+KNEE_GRID = (1.20, 0.90, 0.70, 0.55, 0.45, 0.35, 0.28)
+# Scored alongside the grid so the report can say what the knee bought. Not a
+# candidate.
+KNEE_REFERENCE = None
 
 MOTORS = ["FR", "FL", "BR", "BL"]
 MECANUM = ["fwd", "strafe", "turn"]
@@ -714,47 +715,38 @@ def print_report(results: list[FitResult], prep: Prepared, args, dist_unit: str,
 
 
 def print_traction(args, rows):
-    """Show what the knee search found, including when it found nothing."""
+    """Show which knee the search picked, and what it was worth."""
     print()
     print("=" * 78)
     print("  WHEEL SLIP (traction saturation)")
     print("=" * 78)
-    if args.knee_mode == "off":
-        print("  disabled by --traction-knee off")
-        print()
-        return
     if rows:
         print("  Searching for the demand at which the tyres stop delivering.")
         print("  Scored by integrating the model on held-out data, because a")
         print("  saturating term will always reduce the fit residual somewhere.")
         print()
         print("    %-14s %8s %8s %8s %8s" % ("knee", "v_x", "v_y", "omega", "mean"))
-        best = max(rows, key=lambda r: r[2])
+        cands = [r for r in rows if r[0] is not None]
+        best = max(cands, key=lambda r: r[2])
         for knee, r2, mu in rows:
-            lbl = "no saturation" if knee is None else "%.2f" % knee
+            lbl = ("no saturation*" if knee is None else "%.2f" % knee)
             print("    %-14s %8.3f %8.3f %8.3f %8.3f%s"
                   % (lbl, *r2, mu, "   <-- chosen" if knee == best[0] else ""))
         flat = [r for r in rows if r[0] is None]
         gain = best[2] - (flat[0][2] if flat else best[2])
+        print("    * reference only -- the model requires a knee, so this row")
+        print("      is never chosen. It is here to price the one that was.")
         print()
-        if args.knee is None and best[0] is not None:
-            print("  Best knee %.2f gained only %+.3f, below the %.2f needed to"
-                  % (best[0], best[2] - (flat[0][2] if flat else best[2]),
-                     KNEE_MIN_GAIN))
-            print("  justify the parameter, so the term is switched off. A run")
-            print("  that is ALWAYS sliding looks like this: it can be fitted")
-            print("  slightly better with a huge knee, but the knee is not")
-            print("  identifiable because the data never comes back below it.")
-        elif args.knee is None:
-            print("  No slip found: the run scores best with no saturation, so")
-            print("  the term switches itself off. That is the right answer both")
-            print("  for a run that never reaches the traction limit and for one")
-            print("  that never comes back below it -- a permanently sliding")
-            print("  robot just looks like a lower gain.")
-        else:
-            print("  Knee at %.2f, worth %+.3f mean rollout R2 over no saturation."
-                  % (args.knee, gain))
-            print("  Past that demand, extra command buys no extra force.")
+        print("  Knee at %.2f, worth %+.3f mean rollout R2 over no saturation."
+              % (best[0], gain))
+        print("  Past that demand, extra command buys no extra force.")
+        if gain < 0.01:
+            print()
+            print("  That gain is small, so this run does not pin the knee down.")
+            print("  Two runs look like this: one that never reaches the traction")
+            print("  limit, and one that never comes back below it. The knee is")
+            print("  still shipped -- treat it as an upper bound on what the")
+            print("  floor delivers and re-measure on a run that crosses it.")
     elif args.knee:
         print("  knee fixed at %.2f by --traction-knee" % args.knee)
     if args.knee:
@@ -934,6 +926,12 @@ def print_vel_source_comparison(seg: Segment, args):
 # --------------------------------------------------------------------------
 
 def _pack_basis(results, inputs, knee=None) -> dict:
+    # A knee is part of the model, not an option. Every consumer -- the solver,
+    # the robot -- saturates the command before applying the gains, and the
+    # gains were fitted that way, so a file without one describes dynamics
+    # nobody evaluates.
+    if knee is None or not (knee > 0) or not math.isfinite(knee):
+        raise ValueError("a positive traction_knee is required; got %r" % (knee,))
     names = results[0].names
     B = np.array([[r.coef[names.index(m)] for m in inputs] for r in results])
     A = np.array([[r.coef[names.index(s)] for s in STATES] for r in results])
@@ -999,7 +997,7 @@ def _pack_basis(results, inputs, knee=None) -> dict:
         "traction_knee": knee,
         "traction_note": ("u is the SATURATED command: m = norm(u_raw), "
                           "u = u_raw * tanh(m/knee)/(m/knee). "
-                          "A null knee means no saturation."),
+                          "The knee is always present and positive."),
         "B_columns": list(inputs),
         "A_columns": STATES,
         "rows": RESPONSES,
@@ -1138,7 +1136,14 @@ def eval_terms(u, v, names, eps=COULOMB_EPS):
             j = STATES.index(nm[5:])
             cols.append(np.abs(v[:, j]) * v[:, j])
         elif nm.endswith("^2") and nm[:-2] in idx:
-            cols.append(u[:, idx[nm[:-2]]] ** 2)
+            # Control-squared regressors are not supported anywhere in the
+            # pipeline: they are even in u, so they claim the same force for
+            # full forward and full reverse, and the shipped model has no
+            # block to put them in. Fail loudly rather than evaluate a term
+            # that could never reach the robot.
+            raise ValueError(
+                "control-squared regressor " + nm + " is not supported; "
+                "command curvature belongs in the traction knee")
         elif "*" in nm:
             a_, b_ = nm.split("*", 1)
             cols.append(u[:, idx[a_]] * v[:, STATES.index(b_)])
@@ -1201,22 +1206,28 @@ def rollout_r2(t, u_mec, v_meas, coef, names, horizon=0.5, dt=0.01,
 
 def choose_knee(prep, args, grid=KNEE_GRID):
     """
-    Pick the traction knee by held-out rollout, "no saturation" included.
+    Pick the traction knee by held-out rollout.
 
     Judged by integrating the model rather than by fit residual, because a
-    saturating term will always reduce residual somewhere. Including `None` in
-    the grid is what makes this safe to leave on: a run with no visible slip
-    simply scores best without it and the term switches itself off.
+    saturating term will always reduce residual somewhere.
+
+    A knee is mandatory, so this always returns one. "No saturation" is scored
+    too, but only as the reference the report quotes a gain against; it is not
+    a candidate. When a run shows no slip the winning knee simply sits above
+    anything the run demanded, which is the honest reading: the limit was not
+    reached, not that there is no limit.
 
     Slip is only identifiable from a run that CROSSES the traction limit. A
     run that lives entirely above it just looks like a lower gain, and one
-    that never reaches it has nothing to see -- both come back as None.
+    that never reaches it has nothing to see -- in both cases the chosen knee
+    describes the data weakly, and the printed gain over the reference is what
+    says so.
     """
     k = prep.keep
     best = (None, -np.inf, None)
     rows = []
     flat_score = None
-    for knee in grid:
+    for knee in (KNEE_REFERENCE,) + tuple(grid):
         us = saturate_u(prep.u[k], knee)
         X, names = build_design(us, prep.v[k], args.coulomb, args.intercept,
                                 args.omega_sq, args.drag)
@@ -1230,12 +1241,12 @@ def choose_knee(prep, args, grid=KNEE_GRID):
         rows.append((knee, r2, mu))
         if knee is None:
             flat_score = mu
+            continue          # reference row only, never a candidate
         if mu > best[1]:
             best = (knee, mu, r2)
-    # Only keep a knee that is clearly better than no saturation at all.
-    if (best[0] is not None and flat_score is not None
-            and best[1] - flat_score < KNEE_MIN_GAIN):
-        return None, rows
+    if best[0] is None:
+        raise RuntimeError("the traction knee grid is empty; a knee is "
+                           "required, so there is nothing to choose from")
     return best[0], rows
 
 
@@ -1444,9 +1455,9 @@ def parse_args(argv: Sequence[str] | None = None):
     p.add_argument("--no-drag", dest="drag", action="store_false",
                    help="drop the quadratic |v|v drag terms (on by default)")
     p.add_argument("--traction-knee", default="auto",
-                   help="wheel-slip saturation: 'auto' searches for the knee "
-                        "and switches the term off if the run shows no slip, "
-                        "'off' disables it, or give a number to fix it")
+                   help="wheel-slip saturation: 'auto' searches for the knee, "
+                        "or give a positive number to fix it. A knee is "
+                        "required -- there is no way to switch it off")
     p.add_argument("--robust", action="store_true",
                    help="Huber IRLS instead of ordinary least squares")
     p.add_argument("--min-excitation", type=float, default=0.01,
@@ -1480,14 +1491,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.v_min = 2.0 if args.units == "cm" else 0.02
     tk = str(args.traction_knee).strip().lower()
     if tk in ("off", "none", "0"):
-        args.knee_mode, args.knee = "off", None
+        print("error: the traction knee cannot be switched off -- the model "
+              "requires one. Use 'auto' or a positive number.",
+              file=sys.stderr)
+        return 2
     elif tk == "auto":
         args.knee_mode, args.knee = "auto", None
     else:
         try:
             args.knee_mode, args.knee = "fixed", float(tk)
         except ValueError:
-            print("error: --traction-knee wants 'auto', 'off' or a number",
+            print("error: --traction-knee wants 'auto' or a positive number",
+                  file=sys.stderr)
+            return 2
+        if not (args.knee > 0) or not math.isfinite(args.knee):
+            print("error: --traction-knee must be a positive number",
                   file=sys.stderr)
             return 2
     if args.self_test:

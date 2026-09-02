@@ -16,8 +16,10 @@ using JSON3
 function main()
     if isempty(ARGS)
         println(stderr, "usage: solve.jl <config.json> [plan|solve]")
+        println(stderr, "       solve.jl --self-test")
         return 2
     end
+    ARGS[1] == "--self-test" && return PeregrineSolver.self_test()
     cfgpath = ARGS[1]
     mode = length(ARGS) >= 2 ? ARGS[2] : "solve"
     isfile(cfgpath) || (println(stderr, "no such config: $cfgpath"); return 2)
