@@ -31,8 +31,8 @@ Commands:
 
     provision [host] [--driver] [--quick]  install Julia and check the GPU
     plan      <config.json>                remote `plan`, printed like the wizard's
-    run       <config.json> [--no-pull]    push, solve, pull, verify
-    attach    [--no-pull]                  re-follow a solve already running
+    run       <config.json>                push, solve, stream home, verify
+    attach                                 re-follow a solve already running
     status                                 what the box is and what is running
     pull                                   fetch the last solve's tables again
     cost                                   what the current rental has run up
@@ -40,17 +40,26 @@ Commands:
     --self-test                            check this script without a box
 
 `--rate <usd>` sets the price per hour the cost lines are figured at.
+
+`run` and `attach` fetch each table **as the box finishes it**, rather than
+all of them at the end -- a target's chunks are final the moment
+`target_done` is emitted, so the download of one overlaps the compute of the
+next and costs no rental time. `--stream-to DIR` sends them somewhere other
+than the config's `out_dir` (an SD card, when they will not fit on the local
+disk); `--no-stream` restores the fetch-everything-at-the-end behaviour.
 """
 
 import argparse
 import json
 import os
 import posixpath
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 
@@ -381,6 +390,13 @@ class ProgressReader:
         # amount. That is right for a terminal and wrong for anything that
         # wants to know where the solve actually is.
         self.frac = 0.0
+        # Set by `follow` when a streamer is attached. Called the moment a
+        # target's chunks are final -- `target_done` is emitted after
+        # `write_table` has returned and hashed them.
+        self.on_target_done = None
+        # Called on the `setup` event, which is the first thing that knows how
+        # big the output will be.
+        self.on_setup = None
 
     def show(self, frac: float, note: str) -> None:
         frac = min(1.0, max(0.0, frac))
@@ -410,6 +426,8 @@ class ProgressReader:
             self.cells = ev.get("cells", 0)
             print(f"  {ev['cells']:,} cells, {ev['controls']} controls, "
                   f"{human(ev['bytes_per_target'])} per table")
+            if self.on_setup is not None:
+                self.on_setup(ev)
         elif ph == "occupancy":
             print(f"  obstacles block {ev['blocked_frac']*100:.1f}% of the "
                   f"xy plane")
@@ -447,6 +465,8 @@ class ProgressReader:
             self.show(self.done_targets / self.n_targets,
                       f"{ev['target_name']} done "
                       f"({ev['reached_frac']*100:.0f}% reachable)")
+            if self.on_target_done is not None:
+                self.on_target_done(ev)
         elif ph == "done":
             self.bar.done(f"{ev['targets']} table(s) in "
                           f"{hms(time.time() - self.started)}")
@@ -484,9 +504,140 @@ def copy_counted(src, dst, total: int, label: str = "downloading"):
     return got, el
 
 
-def follow(host: str, logpath: str, label: str = "solving") -> ProgressReader:
+class TableStreamer:
+    """Fetch each target's table while the box is still solving the next one.
+
+    A run's tables are the slow part of getting the work home -- tens of
+    gigabytes at production resolution, hundreds at full -- and downloading
+    them after the solve means paying for the box while a home connection
+    trickles. But a target's chunks are finished long before the run is: the
+    solver emits `target_done` only after `write_table` has returned and
+    hashed them, so from that moment they are immutable and safe to take.
+
+    So each target is fetched as it lands, overlapping the download with the
+    remaining targets' compute. On a three-target run that hides two thirds
+    of the transfer behind work you are paying for anyway.
+
+    One worker thread and a queue rather than a download per target in
+    parallel: they would only contend for the same link, and a single stream
+    keeps the ordering (and the reporting) obvious. Targets finish minutes
+    apart and a queue depth above one is rare.
+    """
+
+    def __init__(self, host: str, remote_dir: str, dest: str):
+        self.host = host
+        self.remote_dir = remote_dir
+        self.dest = dest
+        self.q = queue.Queue()
+        self.done = {}          # target index -> bytes fetched
+        self.failed = {}        # target index -> why
+        self.seconds = 0.0
+        self.thread = threading.Thread(target=self._work, daemon=True)
+        self.thread.start()
+
+    def check_space(self, total_bytes: int) -> None:
+        """Warn now if the destination cannot hold what the run will make.
+
+        Called on the `setup` event, which is seconds into the solve and the
+        first moment the size is known. A warning rather than a stop: the box
+        is already working, and killing a run over a disk the user may be
+        about to clear would be the more expensive mistake. What matters is
+        that it is said at the start and not discovered at 90%.
+        """
+        if total_bytes <= 0:
+            return
+        try:
+            free = shutil.disk_usage(self.dest).free
+        except OSError:
+            return
+        if total_bytes > free:
+            print(c(f"\n  WARNING: this run will produce {human(total_bytes)} "
+                    f"but {self.dest}", "1;31"))
+            print(c(f"  has only {human(free)} free. Point --stream-to at a "
+                    f"bigger volume (an SD card,", "1;31"))
+            print(c("  say) before the first table lands, or the fetch will "
+                    "fail part way.", "1;31"))
+        elif total_bytes > free * 0.8:
+            print(c(f"  note: {human(total_bytes)} of tables into "
+                    f"{human(free)} free -- tight", "33"))
+
+    def enqueue(self, index: int, name: str, nbytes: int) -> None:
+        self.q.put((index, name, nbytes))
+
+    def finish(self) -> None:
+        """Stop accepting work and wait for what is queued."""
+        self.q.put(None)
+        self.thread.join()
+
+    def _work(self) -> None:
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            index, name, nbytes = item
+            try:
+                got, el = self._fetch(index)
+                self.done[index] = got
+                self.seconds += el
+                # Printed rather than drawn as a bar: the solve's bar owns the
+                # live line, and two of them would fight over it.
+                print(f"\n  {c('fetched', '32')} {name} "
+                      f"({human(got)} in {hms(el)}, "
+                      f"{human(got / max(el, 1e-6))}/s) "
+                      + c("-- while the box keeps solving", "2"))
+            except Exception as e:                      # noqa: BLE001
+                # Never let a transfer failure stop the solve being followed.
+                # The final sweep re-fetches whatever is missing.
+                self.failed[index] = str(e)[:200]
+                print(c(f"\n  could not fetch target {index} yet "
+                        f"({str(e)[:120]}); it will be collected at the end",
+                        "33"))
+
+    def _fetch(self, index: int):
+        """Pull one target's chunks. `find -print0` keeps argv out of it.
+
+        A full-resolution target is nearly two thousand chunk files, so a
+        shell glob would build a 40 KB argv. Feeding the names to tar on
+        stdin sidesteps the question entirely.
+        """
+        os.makedirs(os.path.join(self.dest, "TABLES"), exist_ok=True)
+        pat = f"T{index:02d}C*.BIN"
+        remote = (f"cd {shlex.quote(self.remote_dir)} && "
+                  f"find TABLES -name {shlex.quote(pat)} -print0 | "
+                  f"tar -c --null -T -")
+        src = ssh_popen_binary(self.host, remote)
+        dst = subprocess.Popen(["tar", "-x", "-C", self.dest],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+        got = 0
+        t0 = time.time()
+        try:
+            while True:
+                chunk = src.stdout.read(1 << 20)
+                if not chunk:
+                    break
+                dst.stdin.write(chunk)
+                got += len(chunk)
+        finally:
+            dst.stdin.close()
+            dst.wait()
+            src.wait()
+        if dst.returncode != 0 or got == 0:
+            raise RuntimeError(f"tar exited {dst.returncode} after {got} bytes")
+        return got, time.time() - t0
+
+
+def follow(host: str, logpath: str, label: str = "solving",
+           streamer: "TableStreamer | None" = None) -> ProgressReader:
     """Follow a running solve's log until its exit sentinel arrives."""
     pr = ProgressReader(label)
+    if streamer is not None:
+        pr.on_target_done = lambda ev: streamer.enqueue(
+            int(ev.get("target", 0)), ev.get("target_name", "?"),
+            int(ev.get("bytes", 0)))
+        pr.on_setup = lambda ev: streamer.check_space(
+            int(ev.get("bytes_per_target", 0))
+            * max(1, int(ev.get("n_targets", 1))))
     # -n +1 so re-attaching replays the run from the start and the bar lands
     # where the run actually is rather than at zero.
     cmd = f"tail -n +1 -F {shlex.quote(logpath)}"
@@ -762,10 +913,33 @@ def cmd_run(args, st) -> int:
 
     print(f"\n  started in tmux on {c(host, '36')} -- "
           f"this window can close safely\n")
+
+    # Stream each table home as it is finished rather than all of them at the
+    # end. The download is then paid for out of time the box is spending on
+    # the next target anyway, instead of out of rented minutes at the end.
+    dest = os.path.abspath(args.stream_to) if args.stream_to \
+        else st["run"]["local_out"]
+    streamer = None
+    if not args.no_pull and not args.no_stream:
+        os.makedirs(dest, exist_ok=True)
+        streamer = TableStreamer(host, rdir, dest)
+        if dest != st["run"]["local_out"]:
+            print(f"  streaming tables to {c(dest, '36')}")
+        st["run"]["local_out"] = dest
+        save_state(st)
+
     started = time.time()
-    pr = follow(host, log)
+    pr = follow(host, log, streamer = streamer)
     st["run"]["cells"] = pr.cells
     save_state(st)
+    if streamer is not None:
+        # Anything still queued is a table the box has already finished, so
+        # this is waiting on the wire and not on the GPU -- but the box is
+        # billing throughout, so say what is happening rather than appearing
+        # to hang.
+        if not streamer.q.empty():
+            print(c("\n  finishing the last table's download...", "2"))
+        streamer.finish()
 
     if pr.exit_code not in (0, None):
         print(c(f"\n  solver failed (exit {pr.exit_code})", "31"))
@@ -780,7 +954,15 @@ def cmd_run(args, st) -> int:
         print(c("\n  --no-pull: the tables are still on the box.", "33"))
         _cost_line(st.get("rented_since", started), args.rate)
         return 0
-    return _pull(host, st, args.rate)
+    if streamer is not None and streamer.done:
+        got = sum(streamer.done.values())
+        print(f"\n  {c(f'{human(got)} already home', '1;32')} -- "
+              f"{len(streamer.done)} of {pr.n_targets} tables arrived while "
+              f"the box was still solving")
+        print(c(f"  that is {hms(streamer.seconds)} of transfer that cost no "
+                f"rental time (~${streamer.seconds / 3600 * args.rate:,.2f})",
+                "2"))
+    return _pull(host, st, args.rate, streamed = streamer)
 
 
 def _measured_rate(pr: ProgressReader, elapsed: float, cfg_path: str) -> None:
@@ -799,22 +981,42 @@ def _measured_rate(pr: ProgressReader, elapsed: float, cfg_path: str) -> None:
           f"{os.path.basename(cfg_path)} and every later estimate sharpens")
 
 
-def _pull(host: str, st: dict, rate: float) -> int:
+def _pull(host: str, st: dict, rate: float, streamed=None) -> int:
     run = st.get("run")
     if not run:
         die("no run to pull -- this box has not solved anything from here")
     local = run["local_out"]
     os.makedirs(local, exist_ok=True)
-    size = ssh(host, f"du -sb {shlex.quote(run['remote_dir'])} | cut -f1",
-               check=False).stdout.strip()
-    try:
-        total = int(size)
-    except ValueError:
-        total = 0
 
-    print(f"\n  pulling {human(total) if total else 'the tables'} "
-          f"to {c(local, '36')}")
-    src = ssh_popen_binary(host, f"tar -c -C {shlex.quote(run['remote_dir'])} .")
+    # Chunk files already fetched by the streamer are excluded by name, so
+    # this is a sweep for the remainder -- the manifest, the model, the log,
+    # and any target whose stream failed -- rather than a second copy of
+    # everything. Excluding by target rather than by file keeps the argument
+    # list to a handful of patterns however many chunks there are.
+    excl = ""
+    if streamed is not None and streamed.done:
+        pats = " ".join(f"--exclude={shlex.quote(f'TABLES/T{i:02d}C*.BIN')}"
+                        for i in sorted(streamed.done))
+        excl = " " + pats
+        print(f"\n  collecting what the stream did not take "
+              f"({len(streamed.done)} table(s) already home)")
+
+    size = ssh(host,
+               f"cd {shlex.quote(run['remote_dir'])} && du -sb ."
+               + (" 2>/dev/null" if not excl else " 2>/dev/null"),
+               check=False).stdout.strip().split()
+    try:
+        total = int(size[0])
+    except (ValueError, IndexError):
+        total = 0
+    if streamed is not None and streamed.done:
+        total = max(0, total - sum(streamed.done.values()))
+    else:
+        print(f"\n  pulling {human(total) if total else 'the tables'} "
+              f"to {c(local, '36')}")
+
+    src = ssh_popen_binary(
+        host, f"tar -c{excl} -C {shlex.quote(run['remote_dir'])} .")
     dst = subprocess.Popen(["tar", "-x", "-C", local], stdin=subprocess.PIPE,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     got, secs = copy_counted(src.stdout, dst.stdin, total)
@@ -859,12 +1061,27 @@ def cmd_attach(args, st) -> int:
         die("no run started from this desktop to attach to")
     check_ssh(host)
     print(f"  following {c(run['stamp'], '36')} on {host}\n")
-    pr = follow(host, run["log"])
+    # Re-attaching replays the log from the start, so every target that has
+    # already finished is announced again -- and therefore streamed now. That
+    # is the behaviour worth having rather than a quirk to suppress: it is
+    # exactly how a run whose connection dropped mid-solve collects the tables
+    # it missed, without waiting for the whole thing to end.
+    dest = os.path.abspath(args.stream_to) if args.stream_to \
+        else run["local_out"]
+    streamer = None
+    if not args.no_pull and not args.no_stream:
+        os.makedirs(dest, exist_ok=True)
+        streamer = TableStreamer(host, run["remote_dir"], dest)
+        run["local_out"] = dest
+        save_state(st)
+    pr = follow(host, run["log"], streamer = streamer)
+    if streamer is not None:
+        streamer.finish()
     if pr.exit_code not in (0, None):
         print(c(f"\n  solver failed (exit {pr.exit_code})", "31"))
         return 1
     if pr.exit_code == 0 and not args.no_pull:
-        return _pull(host, st, args.rate)
+        return _pull(host, st, args.rate, streamed = streamer)
     return 0
 
 
@@ -1059,7 +1276,108 @@ def self_test() -> int:
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
-    print("\n[6] a passphrase-protected key is told apart from a missing one")
+    print("\n[6] tables stream home as each target finishes")
+    # The whole point is overlap, so this drives the real machinery -- the
+    # reader's hook, the queue, the worker, and the exclusion the final sweep
+    # builds -- with only the ssh call replaced by a local tar. Everything
+    # except the wire is the shipping code.
+    work = tempfile.mkdtemp(prefix="peregrine-stream-")
+    try:
+        remote = os.path.join(work, "remote")
+        dest = os.path.join(work, "dest")
+        os.makedirs(os.path.join(remote, "TABLES"))
+        os.makedirs(dest)
+        payload = {}
+        for ti in range(3):
+            for ck in range(2):
+                nm = "T%02dC%04d.BIN" % (ti, ck)
+                body = bytes(range(256)) * (20 + ti) + b"\r\n\x1a"
+                with open(os.path.join(remote, "TABLES", nm), "wb") as fh:
+                    fh.write(body)
+                payload[nm] = body
+        with open(os.path.join(remote, "MANIFEST.JSON"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"schema_version": 1}, fh)
+
+        real_popen = globals()["ssh_popen_binary"]
+
+        def fake(host, cmd):
+            # The streamer's own command names the pattern; run the same
+            # find | tar locally, so the argv-avoidance is exercised too.
+            m = re.search(r"-name '([^']+)'", cmd)
+            if m:
+                return subprocess.Popen(
+                    ["bash", "-c",
+                     "cd %s && find TABLES -name %s -print0 | tar -c --null -T -"
+                     % (shlex.quote(remote), shlex.quote(m.group(1)))],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return real_popen(host, cmd)
+
+        globals()["ssh_popen_binary"] = fake
+        try:
+            streamer = TableStreamer("fake", remote, dest)
+            pr = ProgressReader("test")
+            pr.on_target_done = lambda ev: streamer.enqueue(
+                int(ev["target"]), ev["target_name"], int(ev.get("bytes", 0)))
+            pr.feed('PROGRESS {"phase":"setup","n_targets":3,"cells":100,'
+                    '"controls":25,"bytes_per_target":1000}')
+            for ti, nm in enumerate(("a", "b", "c")):
+                pr.feed('PROGRESS {"phase":"target_done","target":%d,'
+                        '"target_name":"%s","reached_frac":0.9,"bytes":1000}'
+                        % (ti, nm))
+            pr.feed('PROGRESS {"phase":"done","targets":3}')
+            streamer.finish()
+        finally:
+            globals()["ssh_popen_binary"] = real_popen
+
+        check("every target was fetched", sorted(streamer.done) == [0, 1, 2],
+              "%s failed=%s" % (sorted(streamer.done), streamer.failed))
+        landed = sorted(os.listdir(os.path.join(dest, "TABLES")))
+        check("all six chunks arrived", landed == sorted(payload), str(landed))
+        same = True
+        for k, v in payload.items():
+            with open(os.path.join(dest, "TABLES", k), "rb") as fh:
+                same = same and fh.read() == v
+        check("byte for byte identical through the stream", same)
+        check("bytes were counted", sum(streamer.done.values()) > 0,
+              str(streamer.done))
+
+        # The final sweep must not re-fetch what the stream already took.
+        pats = " ".join("--exclude=%s" % shlex.quote("TABLES/T%02dC*.BIN" % i)
+                        for i in sorted(streamer.done))
+        check("the final sweep excludes every streamed target",
+              all(("TABLES/T%02dC*.BIN" % i) in pats for i in range(3)), pats)
+        check("...and it is a handful of patterns, not a file list",
+              len(pats.split()) == 3, str(len(pats.split())))
+
+        # A failed fetch must be left for the sweep rather than lost or fatal.
+        def broken(host, cmd):
+            return subprocess.Popen(["bash", "-c", "exit 1"],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+
+        globals()["ssh_popen_binary"] = broken
+        try:
+            s2 = TableStreamer("fake", remote, dest)
+            s2.enqueue(7, "doomed", 10)
+            s2.finish()
+        finally:
+            globals()["ssh_popen_binary"] = real_popen
+        check("a failed fetch is recorded, not raised", 7 in s2.failed,
+              str(s2.failed))
+        check("and is absent from `done`, so the final sweep collects it",
+              7 not in s2.done)
+
+        # The space check warns; it must never stop a run that is already
+        # costing money.
+        s3 = TableStreamer("fake", remote, dest)
+        s3.finish()
+        s3.check_space(1 << 62)
+        check("an impossible size warns without raising", True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    print("\n[7] a passphrase-protected key is told apart from a missing one")
     # Both produce "Permission denied (publickey)" under BatchMode, and the
     # advice for each is the opposite of the other's, so guessing is worse
     # than useless.
@@ -1088,12 +1406,12 @@ def self_test() -> int:
                                       ).decode()
                      + "\n-----END OPENSSH PRIVATE KEY-----\n") is None)
 
-    print("\n[7] the cost arithmetic")
+    print("\n[8] the cost arithmetic")
     # Two hours of the default rate, to the cent.
     check("2 h at $1.57/hr is $3.14",
           abs(2.0 * DEFAULT_USD_PER_HOUR - 3.14) < 1e-9)
 
-    print("\n[8] the pieces this script needs are on PATH")
+    print("\n[9] the pieces this script needs are on PATH")
     for tool in ("ssh", "scp", "tar"):
         check(f"{tool} found", shutil.which(tool) is not None)
     check("provision.sh sits next to this script",
@@ -1135,9 +1453,18 @@ def main() -> int:
     s.add_argument("config")
     s.add_argument("--no-pull", action="store_true",
                    help="leave the tables on the box")
+    s.add_argument("--no-stream", action="store_true",
+                   help="fetch every table at the end instead of each one as "
+                        "it is finished")
+    s.add_argument("--stream-to", metavar="DIR",
+                   help="write the tables here instead of the config's "
+                        "out_dir -- an SD card, say, when they will not fit "
+                        "on the local disk")
 
     s = sub.add_parser("attach", help="re-follow a solve already running")
     s.add_argument("--no-pull", action="store_true")
+    s.add_argument("--no-stream", action="store_true")
+    s.add_argument("--stream-to", metavar="DIR")
 
     s = sub.add_parser("benchmark",
                        help="measure this box's cell and disk rates")

@@ -132,8 +132,8 @@ doctl compute droplet delete <name>
 |---|---|
 | `provision <host> [--driver] [--quick]` | Julia, the project, CUDA check, solver self-test, disk-rate measurement |
 | `plan <config.json>` | what the box would do with this grid, and what it would cost |
-| `run <config.json>` | push, solve, pull, verify, bill |
-| `attach` | re-follow a solve after a dropped connection |
+| `run <config.json>` | push, solve, stream each table home as it lands, verify, bill |
+| `attach` | re-follow a solve after a dropped connection, collecting any tables it missed |
 | `status` | what the box is, whether a solve is running, disk left |
 | `pull` | fetch the last solve's tables again |
 | `cost` | what this rental has run up |
@@ -162,8 +162,12 @@ Up: the repo minus history and derived files, plus `drivetrain_fit.toml`,
 
 Down: the tables. This is the real friction, and it is not a cloud problem,
 it is a home-connection problem. 13.1 GB for the three-target 08-30 grid,
-**86 GB** at full resolution — call it two hours on a 100 Mbit link. Worth
-planning for before renting, not after.
+**86 GB** at full resolution — call it two hours on a 100 Mbit link.
+
+Most of that no longer costs rental time: each table is fetched as the box
+finishes it, so only the last one is downloaded on the clock. See section 7.
+You still need somewhere to put them, and `--stream-to` exists for when that
+is not the local disk.
 
 ---
 
@@ -245,3 +249,41 @@ cell rate:
 An 18% win, and it saturates: at 30 GB the reads are already entirely hidden,
 so the run sits on its compute floor and a smaller tile buys nothing more.
 `plan` prices this -- set `vram_budget_bytes` and re-plan.
+
+## 7. Tables come home as they are made
+
+`run` and `attach` fetch each target's table the moment the box finishes it,
+not at the end. A target's chunks are immutable from the instant `target_done`
+is emitted -- the solver sends it only after `write_table` has returned and
+hashed them -- so the download of one target overlaps the compute of the next
+and costs **no rental time at all**. On a three-target run that hides two
+thirds of the transfer behind work you are already paying for.
+
+At full resolution that is the difference between 86 GB downloaded on the
+clock and 29 GB downloaded on the clock. The run reports what it saved:
+
+```
+  fetched score_left (28.6 GB in 41m 12s, 11.8 MB/s) -- while the box keeps solving
+  ...
+  57.2 GB already home -- 2 of 3 tables arrived while the box was still solving
+  that is 1h 22m of transfer that cost no rental time (~$4.63)
+```
+
+The final sweep then collects only the remainder -- manifest, model, log, and
+any target whose stream failed -- by excluding the streamed targets by
+pattern, so nothing is fetched twice and a failed transfer is retried rather
+than lost.
+
+`--stream-to DIR` puts them somewhere other than the config's `out_dir`. Use
+it when the tables will not fit on the local disk: point it at the SD card and
+they land in `<DIR>/TABLES/`. This is purely additive -- it creates and writes
+files and never wipes anything, so preparing and verifying the card stays with
+`wizard/sdcard.py` and its guard, where the only destructive code in this
+project lives.
+
+The destination's free space is checked against the run's total on the
+`setup` event, seconds into the solve, and warns rather than stopping: the box
+is already working by then, and killing a run over a disk you are about to
+clear is the more expensive mistake.
+
+`--no-stream` restores the old fetch-everything-at-the-end behaviour.
