@@ -561,10 +561,17 @@ def step_field(ws: Workspace) -> None:
 #
 # `headroom` matches the solver's own default -- the driver and the CUDA
 # context need room that a solve may not have.
+#
+# The H200 is here for one reason worth knowing before you pick from this
+# list: full resolution needs 100 GB to be held whole, so it is the first
+# card that does not tile it. Six cents an hour over the H100 removes a
+# +12.3% accuracy cost and, because the halo goes with it, comes out cheaper
+# in absolute dollars. `solver/cloud/README.md` section 1 has the arithmetic.
 TARGET_GPUS = {
     "local":  dict(label="this machine's card", vram_gb=None, usd_hr=0.0),
     "l40s":   dict(label="NVIDIA L40S 48 GB", vram_gb=48.0, usd_hr=1.57),
     "h100":   dict(label="NVIDIA H100 80 GB", vram_gb=80.0, usd_hr=3.39),
+    "h200":   dict(label="NVIDIA H200 141 GB", vram_gb=141.0, usd_hr=3.45),
 }
 GPU_HEADROOM = 0.85
 # Held back for the driver and the CUDA context, as the solver does.

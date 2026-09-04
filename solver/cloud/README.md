@@ -53,6 +53,53 @@ The second table is the real argument, and it is not about speed: at full
 resolution the desktop card **cannot run the accurate scheme at any price in
 time**. The 48 GB card can.
 
+### And the 141 GB H200, which is the one to rent
+
+Added 2026-09-04, on Noah's quote of **six cents an hour** over the H100 --
+so $3.45 against $3.39, which is what `TARGET_GPUS` in `wizard/peregrine.py`
+now carries. Re-check the price before renting; at full resolution those six
+cents change the driver.
+
+100 GB is what full resolution needs to be held whole (15.4e9 cells at
+`cell_bytes` 7). The budgets are `(VRAM - 1 GB) * 0.85`, so:
+
+| card | budget | in-core ceiling | full resolution |
+|---|---|---|---|
+| L40S 48 GB | 39.9 GiB | 6.1e9 cells | tiled |
+| H100 80 GB | 67.1 GiB | 1.0e10 cells | tiled |
+| **H200 141 GB** | **119.0 GiB** | **1.8e10 cells** | **whole grid on the card** |
+
+`plan` on the full-resolution grid `[161,161,64,21,21,21]`, three targets,
+every card costed at the **H100's measured 153M cell-updates/s** so the
+comparison isolates the VRAM and nothing else:
+
+| | L40S 48 GB | H100 80 GB | H200 141 GB |
+|---|---|---|---|
+| driver | tiled, 2.14x | tiled, 2.17x | **in core** |
+| longest lookahead that fits | 0.1 s | 0.15 s | **0.5 s** |
+| accuracy cost of that | +21.1% mean value | +12.3% mean value | **none** |
+| scratch store on disk | 100.2 GB | 100.2 GB | **none** |
+| estimate | 54.5 h | 54.6 h | **38.5 h** |
+| at that card's rate | $86 | $185 | **$133** |
+
+So against the H100 the H200 is **more accurate and cheaper in absolute
+dollars** -- it removes a +12.3% error and saves about $52, because dropping
+the halo removes 2.17x of redundant loading and the run gets 30% shorter.
+It also removes the 100 GB scratch store, so the box needs a disk for the
+tables and nothing else.
+
+Two honesties about that table:
+
+- **The H200's cell rate is not measured.** It is quoted at the H100's,
+  which is the conservative choice: the two have the same SM count and
+  clocks, and the H200's advantage is memory bandwidth (4.8 vs 3.35 TB/s),
+  which this sweep is more likely to be helped by than hurt. Run
+  `peregrine_remote.py benchmark` on the box before believing 38.5 h.
+- **At the grid Noah is actually running** -- 2.54 cm, `[130,130,36,19,19,17]`,
+  3.73e9 cells, 24.3 GB -- an H100 already holds it whole at `tau_max` 0.5,
+  and `plan` returns the *identical* 9.3 h estimate for all three cards. The
+  H200 buys nothing there. Its case is full resolution, and only that.
+
 ### Read those estimates as ceilings, twice over
 
 1. They assume the full `iterations` budget. `tolerance` normally stops a
@@ -96,8 +143,10 @@ artifacts (~2-3 GB, the slow part of a first provision).
 
 - **VRAM** is what decides in-core vs tiled, at **7 bytes a cell** with warm
   start — `cell_bytes`, which is now the single place that decides it. So the
-  in-core ceiling is about **6.1e9 cells on an L40S** and **1.0e10 on an
-  H100**, an 11 GB and a 19 GB `u16` table respectively.
+  in-core ceiling is about **6.1e9 cells on an L40S**, **1.0e10 on an H100**
+  and **1.8e10 on an H200**, an 11 GB, a 19 GB and a 34 GB `u16` table
+  respectively. Full resolution needs 100 GB to hold whole, so the H200 is
+  the first card in this list that does not tile it.
 
   It used to be two numbers. `decompose` sized the whole-grid case at 7 B/cell
   while `run_solve` allocated 16 (the in-core policy was three `Float32`), so
