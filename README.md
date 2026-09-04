@@ -61,7 +61,10 @@ Everything the wizard drives can also be run directly — see *Layout*.
 - Optional: an SSH key and a rented GPU box, if the grid you want is bigger
   than the card here. See `solver/cloud/README.md` — the 8 GB card is what
   forces tiling, and tiling is what makes a long lookahead expensive, so a
-  bigger card buys accuracy as well as speed.
+  bigger card buys accuracy as well as speed. You do not need the box to
+  exist while you are planning: step 3 saves a plan as a **job**, and
+  `peregrine_remote.py run <job> --host root@<ip>` solves it whenever the
+  box is up.
 
 ## The steps
 
@@ -293,6 +296,21 @@ the field, the model or the machine, and a stale short step is invisible —
 0.12 s left over from a tiled experiment costs about 17% on mean value on
 every run afterwards, including ones with nothing to gain from it. Pin it to a
 number if you want to, and `plan` will tell you what the pin is costing.
+
+**A settled plan can be saved and rented for later.** Planning takes an
+evening of re-planning at different resolutions; a rented box bills until it
+is destroyed, so it should exist for the solve and not a minute more. Step 3
+therefore offers to freeze a plan into a **job** — a directory under
+`<workspace>/jobs/` holding the config and frozen copies of the three inputs
+— and nothing needs to be rented at that point. When the box is up:
+
+```bash
+py -3.12 solver/cloud/peregrine_remote.py provision root@<ip>
+py -3.12 solver/cloud/peregrine_remote.py run <job> --host root@<ip>
+```
+
+The inputs are copies rather than references, so editing a target afterwards
+cannot quietly change what the job solves. `solver/cloud/README.md` §8.
 
 **4. Write the SD card.** Wipes the card and writes the tables, plus
 `MANIFEST.JSON` describing them and `MODEL.JSON` carrying the drivetrain

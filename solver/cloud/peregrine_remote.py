@@ -3,13 +3,32 @@
 Run a Peregrine solve on a rented GPU box over SSH.
 
     py -3.12 solver/cloud/peregrine_remote.py provision root@1.2.3.4
-    py -3.12 solver/cloud/peregrine_remote.py run <config.json>
+    py -3.12 solver/cloud/peregrine_remote.py run <job> --host root@1.2.3.4
 
 `run` is the whole job: push the working tree and the inputs, start the solve
 in a detached tmux session, follow its progress with the same bar the wizard
 draws, pull the tables back, verify them, and tell you what the rental cost.
-The host is remembered after the first command, which is what makes the
-second line above short.
+
+**Planning and renting are on different clocks.** A plan is settled over an
+evening of re-planning at different resolutions; the box is created minutes
+before it is needed and destroyed as soon as the tables land, because it
+bills until it is destroyed. So the wizard's step 3 can freeze a plan into a
+**job** -- a directory holding `job.json`, `config.json`, and copies of the
+three inputs -- and `run <name> --host <box>` solves it later with no wizard
+session and nothing rented in between. `jobs` lists them.
+
+The inputs are copies, and the config names them relatively. That makes a job
+a fact rather than a pointer: editing a target in the workspace after saving
+cannot quietly change what a later run solves, and a job directory can be
+moved or copied to another machine intact.
+
+**`--host` is per invocation, and naming a different box drops what was
+remembered about the last one.** `rented_since` is the clock every cost line
+is figured from, and a destroyed box's clock carried onto a new one reports a
+machine ninety seconds old as three days of billing. The `run` record goes
+the same way -- it names a directory on a box that no longer exists. Use
+`forget` when the next box comes up on the same address, which is the one
+case this cannot detect.
 
 Everything here is deliberately provider-agnostic -- it needs an Ubuntu box
 with an NVIDIA GPU and an SSH key, and nothing else. It works on a
@@ -27,19 +46,26 @@ Two properties matter more than the convenience:
     normally ahead of origin, so cloning on the box would silently solve with
     different code than the one being tested.
 
-Commands:
+Commands. Every one that talks to a box takes `--host USER@IP`:
 
     provision [host] [--driver] [--quick]  install Julia and check the GPU
-    plan      <config.json>                remote `plan`, printed like the wizard's
-    run       <config.json>                push, solve, stream home, verify
+    plan      <job|config.json>            remote `plan`, printed like the wizard's
+    run       <job|config.json>            push, solve, stream home, verify
     attach                                 re-follow a solve already running
     status                                 what the box is and what is running
     pull                                   fetch the last solve's tables again
     cost                                   what the current rental has run up
-    host      <host>                       remember a different box
+    jobs                                   list the plans saved for later
+    host      <host>                       remember a box between commands
+    forget                                 drop the remembered box and its clock
+    benchmark [--seconds N]                measure this box's cell and disk rates
     --self-test                            check this script without a box
 
-`--rate <usd>` sets the price per hour the cost lines are figured at.
+`<job>` is a saved job's name, its directory, or any `config.json`.
+
+`--rate <usd>` sets the price per hour the cost lines are figured at. Left
+off, a job is priced at the card it was planned for and everything else at
+the module default, which is an L40S.
 
 `run` and `attach` fetch each table **as the box finishes it**, rather than
 all of them at the end -- a target's chunks are final the moment
@@ -109,11 +135,38 @@ def save_state(st: dict) -> None:
         json.dump(st, fh, indent=2)
 
 
-def need_host(st: dict) -> str:
-    h = st.get("host")
+def resolve_host(args, st: dict) -> str:
+    """The box this invocation talks to, and the state that belongs to it.
+
+    `--host` wins over anything remembered, because the normal life of a
+    rented box is hours: created, provisioned, solved on, destroyed. The next
+    one has a different address and shares nothing with it.
+
+    **A different host clears the remembered state.** That is not tidiness.
+    `rented_since` is the clock every cost line is figured from, and carrying
+    a destroyed box's clock onto a new one is how a machine created a minute
+    ago gets billed as three days -- which is what a stale `remote.json` did
+    here. The `run` record (what `attach` and `pull` resume from) is just as
+    host-specific: a remote directory on a box that no longer exists. Neither
+    has any meaning once the address changes, so neither survives it.
+    """
+    want = getattr(args, "host", None)
+    h = want or st.get("host")
     if not h:
-        die("no host remembered yet. Give one once:\n"
+        die("no box to talk to. Give one:\n"
+            "    py -3.12 solver/cloud/peregrine_remote.py <cmd> "
+            "--host root@1.2.3.4\n"
+            "or remember it for this box's lifetime:\n"
             "    py -3.12 solver/cloud/peregrine_remote.py host root@1.2.3.4")
+    if st.get("host") != h:
+        known = st.get("host")
+        st.clear()
+        st["host"] = h
+        st["rented_since"] = time.time()
+        save_state(st)
+        if known:
+            print(c(f"  new box {h} -- the clock and run state for {known} "
+                    f"are dropped", "2"))
     return h
 
 
@@ -684,7 +737,7 @@ def cmd_benchmark(args, st) -> int:
     The answer is written into the wizard's settings under the card's name,
     so the next plan for that card uses it without being asked.
     """
-    host = need_host(st)
+    host = resolve_host(args, st)
     check_ssh(host)
     env = remote_env(host)
     if not env:
@@ -715,7 +768,7 @@ def cmd_benchmark(args, st) -> int:
     _remember_rates(key, res)
     print(c(f"\n  saved as '{key}' -- the wizard will plan with these now",
             "32"))
-    _cost_line(st.get("rented_since"), args.rate)
+    _cost_line(st.get("rented_since"), job_rate(args, None))
     return 0
 
 
@@ -751,16 +804,40 @@ def _remember_rates(key: str, res: dict) -> None:
 
 
 def cmd_host(args, st) -> int:
-    st["host"] = args.host
+    # Through resolve_host, so remembering a *different* box drops the old
+    # one's rental clock and run record here too, not only when --host is
+    # used. The two ways of naming a box must not disagree about that.
+    host = resolve_host(args, st)
+    check_ssh(host)
+    print(f"  remembered {c(host, '36')}")
+    return 0
+
+
+def cmd_forget(args, st) -> int:
+    """Drop everything remembered about the last box.
+
+    Wanted after destroying a droplet, and needed when the next one comes up
+    on the *same* address -- `resolve_host` cannot tell that apart from the
+    box still being there, so it would carry the dead one's clock forward.
+    """
+    host = st.get("host")
+    if not host:
+        print("  nothing remembered")
+        return 0
+    st.clear()
     save_state(st)
-    check_ssh(args.host)
-    print(f"  remembered {c(args.host, '36')}")
+    print(f"  forgot {c(host, '36')} -- its clock and run record are gone")
+    print(c("  Give the next box with --host, or `host root@<ip>`.", "2"))
     return 0
 
 
 def cmd_provision(args, st) -> int:
-    host = args.host or need_host(st)
+    args.host = args.host or args.host_pos
+    host = resolve_host(args, st)
     st["host"] = host
+    # Provisioning a box already remembered leaves its clock alone; a new one
+    # got a fresh clock from resolve_host. This covers the third case: a box
+    # remembered by `host` and never provisioned, so no clock was ever set.
     st.setdefault("rented_since", time.time())
     save_state(st)
 
@@ -792,10 +869,179 @@ def cmd_provision(args, st) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Saved jobs
+#
+# A job is a directory the wizard froze a plan into: `job.json` (what was
+# planned, and for which card), `config.json`, and copies of the three
+# inputs. It exists because planning and renting run on different clocks --
+# the plan is settled over an evening of re-planning, the box is created
+# minutes before it is needed and destroyed as soon as the tables land.
+#
+# The inputs are *copies*, and the config names them relatively, so a job is
+# a fact rather than a pointer: editing a target in the workspace after
+# saving cannot quietly change what a later run solves. Resolving those
+# relative names against the job directory is this side's half of that
+# bargain.
+# --------------------------------------------------------------------------
+
+JOB_FILE = "job.json"
+
+
+def jobs_dir() -> str | None:
+    """Where the wizard keeps saved jobs, if a workspace has been chosen."""
+    try:
+        ws = load_wizard_settings().get("workspace")
+    except Exception:
+        return None
+    return os.path.join(ws, "jobs") if ws else None
+
+
+def load_wizard_settings() -> dict:
+    path = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Peregrine",
+                        "wizard.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def resolve_config(spec: str) -> tuple:
+    """A config path from what the user typed, plus the job it came from.
+
+    Three forms, most explicit first: a config file, a job directory, or a
+    bare job name looked up in the workspace. The bare name is the one worth
+    having -- `run overnight-full --host root@1.2.3.4` is short enough to
+    type from memory next to a droplet that has been up for ninety seconds.
+    """
+    if os.path.isfile(spec):
+        d = os.path.dirname(os.path.abspath(spec))
+        jpath = os.path.join(d, JOB_FILE)
+        if os.path.basename(spec) == JOB_FILE:
+            return _job_at(d)
+        return spec, _read_job(jpath)
+    if os.path.isdir(spec) and os.path.isfile(os.path.join(spec, JOB_FILE)):
+        return _job_at(spec)
+    root = jobs_dir()
+    if root and os.path.isfile(os.path.join(root, spec, JOB_FILE)):
+        return _job_at(os.path.join(root, spec))
+    known = list_jobs()
+    hint = ""
+    if known:
+        hint = "\nsaved jobs: " + ", ".join(j["name"] for j in known)
+    elif root:
+        hint = (f"\nno saved jobs in {root} -- the wizard's step 3 writes "
+                f"them,\nchoose 'Save this plan as a job to run later'")
+    die(f"no config or saved job called '{spec}'{hint}")
+
+
+def _job_at(d: str) -> tuple:
+    cfg = os.path.join(d, "config.json")
+    if not os.path.isfile(cfg):
+        die(f"job at {d} has no config.json")
+    return cfg, _read_job(os.path.join(d, JOB_FILE))
+
+
+def _read_job(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def list_jobs() -> list:
+    root = jobs_dir()
+    if not root or not os.path.isdir(root):
+        return []
+    out = []
+    for name in sorted(os.listdir(root)):
+        j = _read_job(os.path.join(root, name, JOB_FILE))
+        if j is not None:
+            j.setdefault("name", name)
+            j["dir"] = os.path.join(root, name)
+            out.append(j)
+    return out
+
+
+def job_rate(args, job: dict | None) -> float:
+    """What to price this run at.
+
+    An explicit `--rate` wins. Otherwise the job's own card is a far better
+    default than the module constant, which is an L40S price and would
+    under-bill an H200 run by half.
+    """
+    if getattr(args, "rate", None) is not None:
+        return args.rate
+    if job and job.get("usd_hr"):
+        return float(job["usd_hr"])
+    return DEFAULT_USD_PER_HOUR
+
+
+def resolve_inputs(cfg: dict, cfg_path: str) -> dict:
+    """Make the config's input paths absolute, against its own directory.
+
+    A saved job names its inputs relatively so it can be moved or copied to
+    another machine. Everything downstream -- `push_inputs` above all -- wants
+    real paths, and this is the one place that knows what they are relative
+    to.
+    """
+    base = os.path.dirname(os.path.abspath(cfg_path))
+    out = dict(cfg)
+    for key in INPUT_KEYS:
+        v = cfg.get(key)
+        if isinstance(v, str) and v and not os.path.isabs(v):
+            out[key] = os.path.normpath(os.path.join(base, v))
+    return out
+
+
+def _print_job(j: dict, rate: float) -> None:
+    p = j.get("plan") or {}
+    est = p.get("estimate_s") or 0.0
+    bits = []
+    if p.get("cells"):
+        bits.append(f"{p['cells']:,} cells")
+    if p.get("driver"):
+        bits.append("in core" if p["driver"] == "incore" else "tiled")
+    if p.get("tau_applied") is not None:
+        cost = p.get("tau_applied_cost") or 0.0
+        bits.append(f"lookahead {p['tau_applied']:.3f} s"
+                    + (f" (+{cost:.1f}%)" if cost > 0.5 else ""))
+    print(f"  {c(j.get('name', '?'), '1;36')}   "
+          + c(j.get("gpu_label", j.get("target_gpu", "?")), "2"))
+    if bits:
+        print("    " + ", ".join(bits))
+    if est:
+        print(f"    planned {hms(est)}"
+              + (f", about ${est / 3600 * rate:,.2f} at ${rate:.2f}/hr"
+                 if rate else ""))
+    print(c(f"    saved {j.get('saved_utc', '?')}   {j.get('dir', '')}", "2"))
+
+
+def cmd_jobs(args, st) -> int:
+    js = list_jobs()
+    if not js:
+        root = jobs_dir()
+        print("  no saved jobs" + (f" in {root}" if root else
+                                   " -- no workspace chosen yet"))
+        print(c("  The wizard's step 3 saves one: choose 'Save this plan as "
+                "a job to run later'.", "2"))
+        return 0
+    print()
+    for j in js:
+        _print_job(j, job_rate(args, j))
+        print()
+    print(c("  run one with:  py -3.12 solver/cloud/peregrine_remote.py run "
+            "<name> --host root@<ip>", "2"))
+    return 0
+
+
 def _prepare(host, cfg_path, st):
     """Everything both `plan` and `run` need: env, upload, remote config."""
     with open(cfg_path, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
+    cfg = resolve_inputs(cfg, cfg_path)
     env = remote_env(host)
     if not env:
         die("this box has not been provisioned. Run:\n"
@@ -809,9 +1055,10 @@ def _prepare(host, cfg_path, st):
 
 
 def cmd_plan(args, st) -> int:
-    host = need_host(st)
+    cfg_path, job = resolve_config(args.config)
+    host = resolve_host(args, st)
     check_ssh(host)
-    env, rcfg, rpath, _ = _prepare(host, args.config, st)
+    env, rcfg, rpath, _ = _prepare(host, cfg_path, st)
     julia = env.get("julia", "julia")
     print("\n  planning on the box ...\n")
     r = ssh(host, f"cd ~/peregrine && {shlex.quote(julia)} --project=solver "
@@ -823,8 +1070,42 @@ def cmd_plan(args, st) -> int:
     if not line:
         die(f"no PLAN line in the output:\n{r.stdout[:1000]}")
     p = json.loads(line[5:])
-    _print_plan(p, args.rate, env)
+    _print_plan(p, job_rate(args, job), env)
+    if job:
+        _compare_to_job(job, p)
     return 0
+
+
+def _compare_to_job(job: dict, p: dict) -> None:
+    """Say when the box disagrees with the plan the job was saved from.
+
+    It often will, and legitimately: the desktop planned for a *model* of the
+    card, the box plans for the card. A bigger VRAM than the catalogue
+    assumed can move the run from tiled to in core, which changes the driver,
+    the lookahead and the estimate all at once. That is good news, but it is
+    news, and a job that quietly solves something other than what was
+    approved is the failure worth avoiding.
+    """
+    was = job.get("plan") or {}
+    now_mode = (p.get("out_of_core") or {}).get("mode")
+    now_tau = (p.get("recommend") or {}).get("tau_applied")
+    rows = []
+    if was.get("driver") and now_mode and was["driver"] != now_mode:
+        rows.append(("driver", was["driver"], now_mode))
+    if was.get("tau_applied") is not None and now_tau is not None \
+            and abs(was["tau_applied"] - now_tau) > 1e-6:
+        rows.append(("lookahead", f"{was['tau_applied']:.3f} s",
+                     f"{now_tau:.3f} s"))
+    if was.get("cells") and p.get("cells") and was["cells"] != p["cells"]:
+        rows.append(("cells", f"{was['cells']:,}", f"{p['cells']:,}"))
+    if not rows:
+        return
+    print()
+    print(c(f"  this box does not agree with the saved plan "
+            f"('{job.get('name', '?')}')", "33"))
+    for what, a, b in rows:
+        print(f"    {what:<12} saved {a}  ->  here {b}")
+    print(c("    The box's own plan is the one that runs.", "2"))
 
 
 def _print_plan(p: dict, rate: float, env: dict) -> None:
@@ -884,9 +1165,14 @@ def _print_plan(p: dict, rate: float, env: dict) -> None:
 
 
 def cmd_run(args, st) -> int:
-    host = need_host(st)
+    cfg_path, job = resolve_config(args.config)
+    rate = job_rate(args, job)
+    host = resolve_host(args, st)
     check_ssh(host)
-    env, rcfg, rpath, stamp = _prepare(host, args.config, st)
+    if job:
+        print()
+        _print_job(job, rate)
+    env, rcfg, rpath, stamp = _prepare(host, cfg_path, st)
     julia = env.get("julia", "julia")
     rdir = rcfg["out_dir"]
     log = posixpath.join(rdir, "solve.log")
@@ -912,9 +1198,14 @@ def cmd_run(args, st) -> int:
 
     st["host"] = host
     st["run"] = {"remote_dir": rdir, "log": log, "stamp": stamp,
-                 "config": os.path.abspath(args.config),
+                 "config": os.path.abspath(cfg_path),
+                 "job": (job or {}).get("name"),
+                 "rate": rate,
+                 # The config's own out_dir, not the remapped one: a job
+                 # points it at the job's tables/ directory, which is where
+                 # the whole point is for the tables to end up.
                  "local_out": os.path.abspath(
-                     json.load(open(args.config, encoding="utf-8"))["out_dir"]),
+                     json.load(open(cfg_path, encoding="utf-8"))["out_dir"]),
                  "started": time.time(), "cells": 0}
     save_state(st)
 
@@ -952,14 +1243,14 @@ def cmd_run(args, st) -> int:
         print(c(f"\n  solver failed (exit {pr.exit_code})", "31"))
         tailr = ssh(host, f"tail -40 {shlex.quote(log)}", check=False)
         print(tailr.stdout[-2000:])
-        _cost_line(started, args.rate)
+        _cost_line(started, rate)
         return 1
 
     elapsed = time.time() - started
-    _measured_rate(pr, elapsed, args.config)
+    _measured_rate(pr, elapsed, cfg_path)
     if args.no_pull:
         print(c("\n  --no-pull: the tables are still on the box.", "33"))
-        _cost_line(st.get("rented_since", started), args.rate)
+        _cost_line(st.get("rented_since", started), rate)
         return 0
     if streamer is not None and streamer.done:
         got = sum(streamer.done.values())
@@ -967,9 +1258,9 @@ def cmd_run(args, st) -> int:
               f"{len(streamer.done)} of {pr.n_targets} tables arrived while "
               f"the box was still solving")
         print(c(f"  that is {hms(streamer.seconds)} of transfer that cost no "
-                f"rental time (~${streamer.seconds / 3600 * args.rate:,.2f})",
+                f"rental time (~${streamer.seconds / 3600 * rate:,.2f})",
                 "2"))
-    return _pull(host, st, args.rate, streamed = streamer)
+    return _pull(host, st, rate, streamed = streamer)
 
 
 def _measured_rate(pr: ProgressReader, elapsed: float, cfg_path: str) -> None:
@@ -1056,13 +1347,13 @@ def _pull(host: str, st: dict, rate: float, streamed=None) -> int:
 
 
 def cmd_pull(args, st) -> int:
-    host = need_host(st)
+    host = resolve_host(args, st)
     check_ssh(host)
-    return _pull(host, st, args.rate)
+    return _pull(host, st, job_rate(args, None))
 
 
 def cmd_attach(args, st) -> int:
-    host = need_host(st)
+    host = resolve_host(args, st)
     run = st.get("run")
     if not run:
         die("no run started from this desktop to attach to")
@@ -1088,12 +1379,16 @@ def cmd_attach(args, st) -> int:
         print(c(f"\n  solver failed (exit {pr.exit_code})", "31"))
         return 1
     if pr.exit_code == 0 and not args.no_pull:
-        return _pull(host, st, args.rate, streamed = streamer)
+        # The run remembered what it was being priced at, which for a job is
+        # its own card rather than the module's L40S default.
+        rate = args.rate if args.rate is not None \
+            else run.get("rate") or DEFAULT_USD_PER_HOUR
+        return _pull(host, st, rate, streamed = streamer)
     return 0
 
 
 def cmd_status(args, st) -> int:
-    host = need_host(st)
+    host = resolve_host(args, st)
     check_ssh(host)
     env = remote_env(host)
     if not env:
@@ -1110,7 +1405,7 @@ def cmd_status(args, st) -> int:
     df = ssh(host, "df -h --output=target,used,avail,pcent ~/work | tail -1",
              check=False).stdout.strip()
     print(f"  disk    {df}")
-    _cost_line(st.get("rented_since"), args.rate)
+    _cost_line(st.get("rented_since"), job_rate(args, None))
     return 0
 
 
@@ -1123,11 +1418,19 @@ def _cost_line(since, rate: float) -> None:
 
 
 def cmd_cost(args, st) -> int:
+    # Goes through resolve_host so `cost --host <new box>` reports on that
+    # box rather than silently on the last one. No SSH: this reads a clock.
+    if getattr(args, "host", None):
+        resolve_host(args, st)
     since = st.get("rented_since")
     if not since:
         print("  nothing rented from here yet")
         return 0
-    _cost_line(since, args.rate)
+    print(f"  {c(st.get('host', '?'), '36')}")
+    _cost_line(since, job_rate(args, None))
+    print(c("  Counted from when this desktop first named the box, which is "
+            "later than\n  the box was created if it sat idle before you got "
+            "to it.", "2"))
     print(c("  Billing stops when the box is DESTROYED, not when it is "
             "powered off\n  and not when this script exits.", "2"))
     return 0
@@ -1426,6 +1729,111 @@ def self_test() -> int:
     check("verify_tables.py is where the pull expects it",
           os.path.isfile(os.path.join(REPO, "wizard", "verify_tables.py")))
 
+    print("\n[10] a saved job resolves, and carries its own inputs")
+    with tempfile.TemporaryDirectory() as tmp:
+        jdir = os.path.join(tmp, "jobs", "overnight")
+        os.makedirs(jdir)
+        for fname in ("drivetrain_fit.toml", "field.json", "targets.json"):
+            with open(os.path.join(jdir, fname), "w", encoding="utf-8") as fh:
+                fh.write("{}")
+        jcfg = {"regression": "drivetrain_fit.toml", "field": "field.json",
+                "targets": "targets.json",
+                "out_dir": os.path.join(jdir, "tables"),
+                "scratch_dir": tmp, "grid": {"n": [8, 8, 4, 3, 3, 3]}}
+        with open(os.path.join(jdir, "config.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(jcfg, fh)
+        with open(os.path.join(jdir, JOB_FILE), "w", encoding="utf-8") as fh:
+            json.dump({"name": "overnight", "target_gpu": "h200",
+                       "usd_hr": 3.45, "gpu_label": "NVIDIA H200 141 GB",
+                       "plan": {"driver": "incore", "tau_applied": 0.5,
+                                "cells": 15363480384, "estimate_s": 138460.0}},
+                      fh)
+
+        cfgp, job = resolve_config(jdir)
+        check("a job directory resolves to its config",
+              cfgp == os.path.join(jdir, "config.json"), cfgp)
+        check("and brings the job with it",
+              (job or {}).get("target_gpu") == "h200", str(job))
+        cfgp2, job2 = resolve_config(os.path.join(jdir, JOB_FILE))
+        check("naming job.json itself works too",
+              cfgp2 == cfgp and job2 == job)
+        cfgp3, job3 = resolve_config(os.path.join(jdir, "config.json"))
+        check("naming the config directly still finds the job beside it",
+              cfgp3 == cfgp and (job3 or {}).get("usd_hr") == 3.45)
+
+        # The point of the relative names: a job that has been moved still
+        # finds its own inputs, because they travelled with it.
+        moved = os.path.join(tmp, "elsewhere")
+        shutil.copytree(jdir, moved)
+        cfgp4, _ = resolve_config(moved)
+        with open(cfgp4, encoding="utf-8") as fh:
+            r = resolve_inputs(json.load(fh), cfgp4)
+        check("a moved job's inputs resolve against the job, not the "
+              "workspace",
+              all(os.path.isfile(r[k]) and os.path.dirname(r[k]) == moved
+                  for k in INPUT_KEYS),
+              str([r[k] for k in INPUT_KEYS]))
+
+        # An absolute path in a hand-written config must survive untouched --
+        # the relative handling is an addition, not a replacement.
+        abs_cfg = dict(jcfg, field=os.path.join(jdir, "field.json"))
+        r2 = resolve_inputs(abs_cfg, os.path.join(jdir, "config.json"))
+        check("an absolute input path is left alone",
+              r2["field"] == abs_cfg["field"], r2["field"])
+
+    print("\n[11] the rate falls back through the job, then the constant")
+
+    class _A:
+        rate = None
+    check("no --rate and no job: the module default",
+          job_rate(_A(), None) == DEFAULT_USD_PER_HOUR)
+    check("no --rate but a job: the job's own card",
+          job_rate(_A(), {"usd_hr": 3.45}) == 3.45)
+    _B = type("_B", (), {"rate": 9.99})
+    check("an explicit --rate wins over the job",
+          job_rate(_B(), {"usd_hr": 3.45}) == 9.99)
+
+    print("\n[12] a new box does not inherit the last one's clock")
+    # The failure this prevents: a droplet destroyed on Monday leaves
+    # `rented_since` behind, and Thursday's box -- alive for ninety seconds
+    # -- reports three days of billing. Every cost line in this script reads
+    # that one field.
+    saved, restore = STATE, None
+    with tempfile.TemporaryDirectory() as tmp:
+        globals()["STATE"] = os.path.join(tmp, "remote.json")
+        old = {"host": "root@1.1.1.1", "rented_since": time.time() - 3 * 86400,
+               "run": {"remote_dir": "/root/work/runs/x", "stamp": "x"}}
+        save_state(old)
+        st = load_state()
+        args = type("_", (), {"host": "root@2.2.2.2"})()
+        h = resolve_host(args, st)
+        check("--host wins over the remembered box", h == "root@2.2.2.2", h)
+        check("the dead box's rental clock is dropped",
+              time.time() - st["rented_since"] < 60,
+              f"{(time.time() - st['rented_since']) / 86400:.1f} days old")
+        check("and so is its run record, which names a directory on it",
+              "run" not in st, str(st.get("run")))
+        check("the reset is persisted, not just in memory",
+              load_state().get("host") == "root@2.2.2.2")
+
+        # Same box named again: nothing is disturbed. Re-running `status`
+        # must not keep restarting the clock it is reporting.
+        was = st["rented_since"]
+        st["run"] = {"stamp": "y"}
+        save_state(st)
+        st2 = load_state()
+        resolve_host(type("_", (), {"host": "root@2.2.2.2"})(), st2)
+        check("naming the same box again leaves the clock and run alone",
+              st2["rented_since"] == was and st2.get("run", {}).get("stamp") == "y")
+
+        # No --host at all falls back to what is remembered, unchanged.
+        st3 = load_state()
+        h3 = resolve_host(type("_", (), {"host": None})(), st3)
+        check("no --host falls back to the remembered box",
+              h3 == "root@2.2.2.2" and st3["rented_since"] == was)
+    globals()["STATE"] = saved
+
     print(f"\n{npass} passed, {nfail} failed\n")
     return 1 if nfail else 0
 
@@ -1438,26 +1846,48 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--self-test", action="store_true",
                    help="check this script without needing a box")
-    p.add_argument("--rate", type=float, default=DEFAULT_USD_PER_HOUR,
-                   help=f"rental price per hour (default {DEFAULT_USD_PER_HOUR}, "
-                        "DigitalOcean's on-demand single L40S)")
+    # No module-level default. `--rate` unset means "work it out": a saved
+    # job knows which card it was planned for, and that is a far better
+    # answer than a constant that happens to be an L40S price.
+    p.add_argument("--rate", type=float, default=None,
+                   help="rental price per hour (default: the job's card, "
+                        f"else {DEFAULT_USD_PER_HOUR}, DigitalOcean's "
+                        "on-demand single L40S)")
     sub = p.add_subparsers(dest="cmd")
+
+    # --host on every command that talks to a box, because a box lives for
+    # hours and the next one has a different address. Declared per subparser
+    # rather than on the top-level parser: a subparser's default would
+    # otherwise overwrite a value given before the subcommand with None.
+    def box(name, help_):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("--host", metavar="USER@IP",
+                       help="the box to use, for this command only "
+                            "(overrides, and replaces, the remembered one)")
+        return s
 
     s = sub.add_parser("host", help="remember which box to use")
     s.add_argument("host")
 
-    s = sub.add_parser("provision", help="install Julia and check the GPU")
-    s.add_argument("host", nargs="?")
+    s = box("provision", "install Julia and check the GPU")
+    # `provision root@1.2.3.4` is the documented shape and predates --host.
+    # It needs its own dest: sharing "host" with the option above would let
+    # argparse's positional default of None overwrite a --host given before
+    # the subcommand. cmd_provision folds the two back together.
+    s.add_argument("host_pos", nargs="?", metavar="host",
+                   help="the box, positionally -- same thing as --host")
     s.add_argument("--driver", action="store_true",
                    help="install the NVIDIA driver (plain OS images only)")
     s.add_argument("--quick", action="store_true",
                    help="skip the solver self-test")
 
-    s = sub.add_parser("plan", help="what the box would do with this config")
-    s.add_argument("config")
+    s = box("plan", "what the box would do with this config or saved job")
+    s.add_argument("config", help="a config.json, a job directory, or the "
+                                  "name of a saved job")
 
-    s = sub.add_parser("run", help="push, solve, pull, verify")
-    s.add_argument("config")
+    s = box("run", "push, solve, pull, verify")
+    s.add_argument("config", help="a config.json, a job directory, or the "
+                                  "name of a saved job")
     s.add_argument("--no-pull", action="store_true",
                    help="leave the tables on the box")
     s.add_argument("--no-stream", action="store_true",
@@ -1468,19 +1898,21 @@ def main() -> int:
                         "out_dir -- an SD card, say, when they will not fit "
                         "on the local disk")
 
-    s = sub.add_parser("attach", help="re-follow a solve already running")
+    s = box("attach", "re-follow a solve already running")
     s.add_argument("--no-pull", action="store_true")
     s.add_argument("--no-stream", action="store_true")
     s.add_argument("--stream-to", metavar="DIR")
 
-    s = sub.add_parser("benchmark",
-                       help="measure this box's cell and disk rates")
+    s = box("benchmark", "measure this box's cell and disk rates")
     s.add_argument("--seconds", type=float, default=25.0,
                    help="roughly how long to spend on the cell-rate timing")
 
-    sub.add_parser("status", help="what the box is and what it is doing")
-    s = sub.add_parser("pull", help="fetch the last solve's tables")
-    sub.add_parser("cost", help="what this rental has run up")
+    box("status", "what the box is and what it is doing")
+    box("pull", "fetch the last solve's tables")
+    box("cost", "what this rental has run up")
+
+    sub.add_parser("jobs", help="list the plans saved for later")
+    sub.add_parser("forget", help="drop the remembered box and its clock")
 
     args = p.parse_args()
     if args.self_test:
@@ -1492,8 +1924,8 @@ def main() -> int:
     st = load_state()
     fn = {"host": cmd_host, "provision": cmd_provision, "plan": cmd_plan,
           "run": cmd_run, "attach": cmd_attach, "status": cmd_status,
-          "pull": cmd_pull, "cost": cmd_cost,
-          "benchmark": cmd_benchmark}[args.cmd]
+          "pull": cmd_pull, "cost": cmd_cost, "jobs": cmd_jobs,
+          "forget": cmd_forget, "benchmark": cmd_benchmark}[args.cmd]
     return fn(args, st)
 
 

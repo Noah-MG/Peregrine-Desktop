@@ -8,16 +8,21 @@ through the halo. Renting a bigger card for a few hours relaxes both.
 This directory is the whole apparatus: `provision.sh` runs on the rented box,
 `peregrine_remote.py` runs here.
 
+Plan whenever you like, in the wizard, with nothing rented. Save the plan as
+a **job**. Then, on the day you actually want the compute:
+
 ```bash
+py -3.12 solver/cloud/peregrine_remote.py jobs                          # what is saved
 py -3.12 solver/cloud/peregrine_remote.py provision root@<ip>
-py -3.12 solver/cloud/peregrine_remote.py plan D:\PeregrineWorkspace\3\runs\<stamp>\config.json
-py -3.12 solver/cloud/peregrine_remote.py run  D:\PeregrineWorkspace\3\runs\<stamp>\config.json
+py -3.12 solver/cloud/peregrine_remote.py run overnight --host root@<ip>
 ```
 
 `run` pushes the working tree and the inputs, starts the solve under `tmux`,
 draws the same progress bar the wizard does, pulls the tables back, verifies
-them against `docs/TABLE_FORMAT.md`, and prints the bill. The host is
-remembered, so only the first command needs it.
+them against `docs/TABLE_FORMAT.md`, and prints the bill.
+
+`--host` goes on every command that talks to a box. Section 8 is why it is
+per invocation rather than remembered.
 
 ---
 
@@ -177,19 +182,28 @@ doctl compute droplet delete <name>
 
 ## 3. The commands
 
+Every command that talks to a box takes `--host USER@IP`.
+
 | | |
 |---|---|
 | `provision <host> [--driver] [--quick]` | Julia, the project, CUDA check, solver self-test, disk-rate measurement |
-| `plan <config.json>` | what the box would do with this grid, and what it would cost |
-| `run <config.json>` | push, solve, stream each table home as it lands, verify, bill |
+| `plan <job\|config.json>` | what the box would do with this grid, and what it would cost |
+| `run <job\|config.json>` | push, solve, stream each table home as it lands, verify, bill |
 | `attach` | re-follow a solve after a dropped connection, collecting any tables it missed |
 | `status` | what the box is, whether a solve is running, disk left |
 | `pull` | fetch the last solve's tables again |
 | `cost` | what this rental has run up |
+| `jobs` | list the plans saved for later |
+| `host <host>` | remember a box between commands, instead of repeating `--host` |
+| `forget` | drop the remembered box and its rental clock |
+| `benchmark [--seconds N]` | measure this box's cell and disk rates |
 | `--self-test` | check this script with no box at all |
 
-`--rate` sets the price per hour for the cost lines; the default is
-DigitalOcean's on-demand single L40S.
+`<job>` is a saved job's name, its directory, or any `config.json`.
+
+`--rate` sets the price per hour for the cost lines. Left off, a job is
+priced at the card it was planned for, and everything else at DigitalOcean's
+on-demand single L40S.
 
 ### Two properties worth knowing
 
@@ -336,3 +350,82 @@ is already working by then, and killing a run over a disk you are about to
 clear is the more expensive mistake.
 
 `--no-stream` restores the old fetch-everything-at-the-end behaviour.
+
+## 8. Saved jobs, and why the host is typed every time
+
+Added 2026-09-04. Planning and renting run on different clocks, and the
+tooling used to pretend they were the same one.
+
+A plan is settled slowly: re-plan at 4 cm, look at the estimate, try 5, look
+at what the lookahead costs, coarsen, re-plan again. That is an evening. A
+box is the opposite -- created when the compute is wanted, destroyed the
+moment the tables land, because **it bills until it is destroyed and not a
+second less**. Wiring "solve on the rented card" into the end of the wizard's
+step 3 meant either renting the box through the whole deliberation, or
+re-doing the deliberation when the box was up.
+
+So step 3 offers a fourth thing to do with a plan: save it.
+
+```
+   1. Solve on the rented NVIDIA H200 141 GB (uploads and runs there -- needs the box up now)
+   2. Save this plan as a job to run later (no droplet needed now)
+   3. Solve on this machine instead
+   4. Change settings
+```
+
+A job is a directory under `<workspace>/jobs/<name>/`:
+
+```
+job.json             what was planned, and for which card
+config.json          the solver config, inputs named relatively
+drivetrain_fit.toml  \
+field.json            > copies, frozen at save time
+targets.json         /
+tables/              where the tables come home to
+```
+
+**The inputs are copies, not references.** A job that pointed back at
+`<workspace>/field/field.json` would read the field as it is on the day it is
+*run*, so moving a target between planning and renting would quietly solve a
+different problem than the one that was approved -- and `job.json`'s record of
+the plan would be a record of nothing. The three files are kilobytes. Copying
+them makes the job a fact, and makes the directory portable: it can be moved,
+copied to another machine, or kept after the workspace moves on.
+
+Then, later, with a droplet up for as long as it takes:
+
+```bash
+py -3.12 solver/cloud/peregrine_remote.py jobs
+py -3.12 solver/cloud/peregrine_remote.py provision root@<ip>
+py -3.12 solver/cloud/peregrine_remote.py run overnight --host root@<ip>
+doctl compute droplet delete <name>
+```
+
+`run` re-plans on the box, and says so when the box disagrees with what was
+saved -- a bigger VRAM than the catalogue assumed can move the run from tiled
+to in core, which changes the driver, the lookahead and the estimate at once.
+That is good news, but it is news. The box's own plan is the one that runs.
+
+### `--host` is not remembered, on purpose
+
+`host <ip>` still exists for a box you are going to use all afternoon. But
+`--host` on the command is the normal way, because **naming a different box
+drops everything remembered about the last one**, and that is a correctness
+rule rather than tidiness:
+
+- `rented_since` is the clock every cost line in this script is figured from.
+  A droplet destroyed on Monday leaves it behind, and Thursday's box, alive
+  for ninety seconds, then reports three days of billing. That is not
+  hypothetical -- it is what `remote.json` here did, and the reason this
+  section exists.
+- The `run` record that `attach` and `pull` resume from names a remote
+  directory *on that box*. On a new one it points at nothing.
+
+Neither has any meaning once the address changes, so neither survives it.
+`forget` covers the one case this cannot detect: the next box coming up on
+the same IP, where nothing in the state can tell that apart from the old box
+still being there.
+
+The rental clock counts from **when this desktop first named the box**, which
+is later than the box was created if it sat idle before you got to it. It is
+a floor on the bill, not the bill; the provider's console is the bill.

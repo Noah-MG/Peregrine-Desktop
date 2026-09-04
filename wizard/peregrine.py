@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import sdcard
 
@@ -194,7 +195,11 @@ class Workspace:
         self.calib = os.path.join(self.root, "calibration")
         self.field = os.path.join(self.root, "field")
         self.runs = os.path.join(self.root, "runs")
-        for d in (self.calib, self.field, self.runs):
+        # Saved plans, each a self-contained directory that a later
+        # `peregrine_remote.py run` can solve with no wizard session and no
+        # droplet in existence at save time. See `save_job`.
+        self.jobs = os.path.join(self.root, "jobs")
+        for d in (self.calib, self.field, self.runs, self.jobs):
             os.makedirs(d, exist_ok=True)
 
     @property
@@ -1097,17 +1102,138 @@ def _pick_target(default: str) -> str:
 
 
 def _pick_where(target: str) -> str:
-    """Solve here, solve on the droplet, or go back and change something."""
+    """Solve here, solve on the droplet, save for later, or change settings.
+
+    "Save for later" exists because planning and renting are on different
+    clocks. A plan is worked out over an evening of re-planning at different
+    resolutions; the droplet is created minutes before it is needed and
+    destroyed the moment the tables land, because it bills until it is
+    destroyed. Requiring the box to exist at the moment the plan is settled
+    would mean renting it through the whole deliberation.
+    """
     spec = TARGET_GPUS.get(target, {})
     print()
     if spec.get("vram_gb"):
         print(f"   1. Solve on the rented {spec['label']} "
-              + c("(uploads and runs there)", "2"))
-        print("   2. Solve on this machine instead")
-        print("   3. Change settings")
-        raw = ask("  choice", "1")
-        return {"1": "remote", "2": "local"}.get(raw.strip(), "back")
-    return "local" if confirm("Start solving with these settings?") else "back"
+              + c("(uploads and runs there -- needs the box up now)", "2"))
+        print("   2. Save this plan as a job to run later "
+              + c("(no droplet needed now)", "2"))
+        print("   3. Solve on this machine instead")
+        print("   4. Change settings")
+        raw = ask("  choice", "2")
+        return {"1": "remote", "2": "save",
+                "3": "local"}.get(raw.strip(), "back")
+    if confirm("Start solving with these settings?"):
+        return "local"
+    return "save" if confirm("Save this plan as a job to run later instead?",
+                             default_yes=False) else "back"
+
+
+# The keys of a saved job that name an input file. Frozen copies live beside
+# job.json under these names, so the job does not depend on the workspace
+# still holding what it held at save time.
+JOB_INPUTS = {"regression": "drivetrain_fit.toml",
+              "field": "field.json",
+              "targets": "targets.json"}
+
+
+def save_job(ws: Workspace, cfg: dict, target: str, p: dict) -> str | None:
+    """Freeze a planned config into a directory that runs itself later.
+
+    Self-contained on purpose. The alternative -- a job that points back at
+    `<workspace>/field/field.json` -- reads the field as it is on the day it
+    is *run*, so editing a target between planning and renting would quietly
+    solve a different problem than the one that was planned, and the plan
+    printed here would be a record of nothing. The three inputs are
+    kilobytes; copying them costs nothing and makes the job a fact.
+
+    The planning overrides stay in the config. `vram_budget_bytes` is the
+    dangerous one and `remote_config` on the far side drops it before the box
+    ever sees it, so what survives here is a faithful record of what was
+    planned rather than an instruction to the solver.
+    """
+    print()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = ask("  job name", stamp).strip()
+    # One path segment, no surprises: this becomes a directory name and is
+    # typed back on a command line.
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or stamp
+    if safe != name:
+        print(c(f"  saving as '{safe}'", "2"))
+    jdir = os.path.join(ws.jobs, safe)
+    if os.path.isdir(jdir) and not confirm(
+            f"'{safe}' already exists -- overwrite it?", default_yes=False):
+        return None
+    os.makedirs(jdir, exist_ok=True)
+
+    cfg = dict(cfg)
+    for key, fname in JOB_INPUTS.items():
+        src = cfg.get(key)
+        if not src or not os.path.isfile(src):
+            print(c(f"  cannot save: config's '{key}' is not a file "
+                    f"({src})", "31"))
+            return None
+        shutil.copy2(src, os.path.join(jdir, fname))
+        # Relative, so the job survives being moved or copied to another
+        # machine. `peregrine_remote.py` resolves them against the job dir.
+        cfg[key] = fname
+    # Where the tables come home to. Absolute, because it is the one path
+    # that names a place outside the job.
+    cfg["out_dir"] = os.path.join(jdir, "tables")
+    cfg["scratch_dir"] = ws.runs
+
+    with open(os.path.join(jdir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+
+    ooc = p.get("out_of_core") or {}
+    rec = p.get("recommend") or {}
+    rt = p.get("runtime") or {}
+    spec = TARGET_GPUS.get(target, {})
+    job = {
+        "name": safe,
+        "saved_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "target_gpu": target,
+        "gpu_label": spec.get("label", target),
+        "usd_hr": spec.get("usd_hr", 0.0),
+        # What was planned, kept so `jobs` can list it and a later run can be
+        # checked against it without re-planning. Advisory: the box re-plans
+        # for itself, and its answer is the one that runs.
+        "plan": {
+            "n": p.get("n"),
+            "cells": p.get("cells"),
+            "n_targets": p.get("n_targets"),
+            "bytes_per_target": p.get("bytes_per_target"),
+            "bytes_total": p.get("bytes_total"),
+            "driver": ooc.get("mode"),
+            "amplification": ooc.get("amplification"),
+            "store_bytes": ooc.get("store_bytes"),
+            "tau_applied": rec.get("tau_applied"),
+            "tau_applied_cost": rec.get("tau_applied_cost"),
+            "estimate_s": rt.get("total_s"),
+            "cell_rate": rt.get("cell_rate"),
+        },
+    }
+    with open(os.path.join(jdir, "job.json"), "w", encoding="utf-8") as fh:
+        json.dump(job, fh, indent=2)
+
+    est = rt.get("total_s") or 0.0
+    hourly = spec.get("usd_hr", 0.0)
+    print()
+    print(c(f"  saved job '{safe}'", "1;32"))
+    print(f"    {jdir}")
+    if est:
+        line = f"    planned {hms(est)} on {spec.get('label', target)}"
+        if hourly:
+            line += f", about ${est / 3600 * hourly:,.2f}"
+        print(c(line, "2"))
+    print()
+    print("  When the droplet is up, from this repo:")
+    print(c(f"    py -3.12 solver/cloud/peregrine_remote.py provision "
+            f"root@<ip>", "36"))
+    print(c(f"    py -3.12 solver/cloud/peregrine_remote.py run {safe} "
+            f"--host root@<ip>", "1;36"))
+    print(c("  The tables come home to the job's tables/ directory.", "2"))
+    return jdir
 
 
 def _solve_remote(cfgpath: str, run_dir: str, target: str) -> None:
@@ -1353,13 +1479,25 @@ def step_solve(ws: Workspace) -> None:
                 continue
         if not blocked:
             where = _pick_where(target)
-            if where == "remote":
+            if where in ("remote", "save"):
                 st = load_settings()
                 st["solver"] = {k: v for k, v in answers.items()
                                 if k != "tau_max"}
                 save_settings(st)
+            if where == "remote":
                 _solve_remote(cfgpath, run_dir, target)
                 return
+            if where == "save":
+                # Saved from `cfg`, the dict the plan above was made from,
+                # rather than by re-reading cfgpath -- they are the same
+                # bytes, and going through the object keeps the job tied to
+                # the plan being displayed rather than to a file that a
+                # later loop iteration would overwrite.
+                if save_job(ws, cfg, target, p):
+                    return
+                # Cancelled at the overwrite prompt. Falls through to the
+                # "adjust and try again" question at the bottom rather than
+                # looping, so declining does not re-ask every setting.
             if where == "local":
                 break
         # If the settings cannot run, going back is the only useful move, so
