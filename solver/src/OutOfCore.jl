@@ -582,3 +582,105 @@ function solve_value_ooc!(s::ValueStore, occ::Vector{Bool}, g::Grid6, m::Model,
     CUDA.unsafe_free!(dtotal)
     (done_rounds, last_delta)
 end
+
+"""
+The escape pass, tiled, against a store that already holds a solved table.
+
+`solve_escape!` for a grid too big for the card. Same tiling, same shift, same
+round accounting as `solve_value_ooc!`; the differences are all consequences
+of running *after* a solve rather than instead of one:
+
+  * **The store is not filled and nothing is seeded.** The converged table is
+    the initial condition -- see `solve_escape!`.
+  * **No policy.** The warm start is worth its second store over hundreds of
+    rounds of a full solve; this is tens of rounds over a fraction of the
+    cells, and skipping it leaves `pstore` holding the real policy untouched.
+  * **The improvement is measured in escape time**, since that is the
+    quantity `sweep_tile_escape_gpu!` minimises.
+
+**The stale-halo argument survives, read the other way up.** The prefetch is
+sound in `solve_value_ooc!` because V only ever decreases, so an older halo
+value is a larger one and `cell_update` mins against it. Here the stored value
+is the *negated* escape time, so it only ever increases -- but the quantity
+being minimised is still the escape time, an older halo still carries a larger
+one, and the backup still mins. The direction that would be dangerous, a stale
+read making a cell converge to something too small, is closed either way.
+"""
+function solve_escape_ooc!(s::ValueStore, occ::Vector{Bool}, g::Grid6,
+                           m::Model, ctl_h::Vector{Float32}, nctl, p::Params,
+                           tp::TilePlan;
+                           rounds::Int, tol::Float64, tile_sweeps::Int = 4,
+                           shift::Bool = true, prefetch::Bool = false,
+                           on_progress = nothing, on_tile = nothing)
+    col = tp.col
+    maxcells = Int64(tp.nxl) * Int64(tp.nyl) * col
+    dV = CUDA.zeros(Float32, maxcells)
+    docc = CUDA.zeros(Bool, Int64(tp.nxl) * Int64(tp.nyl) * Int64(g.n[3]))
+    hocc = Vector{Bool}(undef, Int64(tp.nxl) * Int64(tp.nyl) * Int64(g.n[3]))
+    dctl = CuArray(ctl_h)
+    dtotal = CUDA.zeros(Float32, 1)
+    plane = Int64(tp.nyl) * col
+    hV = Vector{Float32}(undef, plane)
+
+    pre_s = prefetch ? read_handle(s) : s
+    winV = prefetch ? Vector{Float32}(undef, maxcells) : Float32[]
+    pretask = nothing
+    pren = Int64(0)
+
+    quiet_needed = p.ncoarse <= Int32(0) ? 1 :
+        max(1, cld(Int(nctl) - 1, Int(p.ncoarse) * max(tile_sweeps, 1)))
+
+    phase = 0
+    quiet = 0
+    last_delta = Inf
+    done_rounds = 0
+
+    for rd in 1:rounds
+        tiles = tiles_of(g, tp; shift = shift ? rd - 1 : 0)
+        delta = 0.0
+        for (k, t) in enumerate(tiles)
+            gt = subgrid(g, t.lx0, t.ly0, t.nxl, t.nyl)
+            if pretask !== nothing
+                wait(pretask)
+                pretask = nothing
+                copyto!(dV, 1, winV, 1, pren)
+            else
+                load_tile!(dV, s, g, t, col, hV)
+            end
+            nocc = tile_occupancy!(hocc, occ, g, t)
+            copyto!(docc, 1, hocc, 1, nocc)
+
+            if prefetch && k < length(tiles)
+                tn = tiles[k + 1]
+                pretask = Threads.@spawn read_window!(winV, pre_s, g, tn, col)
+                pren = Int64(tn.nxl) * Int64(tn.nyl) * col
+            end
+            ox = Int64(t.ix0 - t.lx0); oy = Int64(t.iy0 - t.ly0)
+
+            for _ in 1:tile_sweeps
+                phase += 1
+                delta += sweep_tile_escape_gpu!(dV, docc, gt, m, dctl, nctl, p,
+                                                phase, dtotal, ox, oy,
+                                                t.wx, t.wy; rev = isodd(phase))
+            end
+
+            store_tile!(s, dV, g, t, col, hV)
+            on_tile === nothing || on_tile(rd, k, length(tiles))
+        end
+
+        done_rounds = rd
+        last_delta = delta / max(tile_sweeps, 1)
+        quiet = last_delta <= tol ? quiet + 1 : 0
+        on_progress === nothing || on_progress(rd, last_delta)
+        quiet >= quiet_needed && break
+    end
+
+    pretask === nothing || wait(pretask)
+    close_handle!(pre_s, s)
+    s.io === nothing || flush(s.io)
+    CUDA.unsafe_free!(dV)
+    CUDA.unsafe_free!(docc)
+    CUDA.unsafe_free!(dctl)
+    CUDA.unsafe_free!(dtotal)
+    (done_rounds, last_delta)
+end

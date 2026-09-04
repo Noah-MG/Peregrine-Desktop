@@ -37,6 +37,49 @@ function sweep_gpu!(V, occ, pol, g::Grid6, m::Model, ctl, nctl, p::Params,
 end
 
 """
+One in-place escape sweep on the GPU.
+
+The same backup as `gpu_sweep_kernel!`, over the complement of the cells that
+one solved, and with the comparison run in escape time rather than in stored
+value -- `V` holds escape times negated, so `c < e_old` and `V = -c` is the
+improvement test written the right way up. See `EscapeView`.
+
+A cell with a real route is the boundary condition and is returned from
+immediately, which is also what keeps the pass cheap: on a converged table
+most cells are terminal, and those threads do one load and retire.
+"""
+function gpu_escape_kernel!(V, occ, g::Grid6, m::Model, ctl, nctl::Int32,
+                            p::Params, phase::Int32, rev::Bool, n::Int64,
+                            total)
+    i = (Int64(blockIdx().x) - Int64(1)) * Int64(blockDim().x) + Int64(threadIdx().x)
+    i > n && return nothing
+    idx = rev ? n - i : i - Int64(1)
+    @inbounds v0 = V[idx + 1]
+    is_terminal(v0, p.cap) && return nothing
+    e_old = escape_of(v0, p.cap)
+    c, _, _, _ = cell_update(idx, V, occ, nothing, g, m, ctl, nctl, p, phase,
+                             Val(true))
+    if c < e_old
+        @inbounds V[idx + 1] = -c
+        CUDA.@atomic total[1] += (e_old - c)
+    end
+    return nothing
+end
+
+"""One in-place escape sweep on the GPU. Returns the total improvement."""
+function sweep_escape_gpu!(V, occ, g::Grid6, m::Model, ctl, nctl, p::Params,
+                           phase::Integer, total; rev::Bool = false)
+    n = ncells(g)
+    fill!(total, 0.0f0)
+    threads = 256
+    blocks = cld(n, threads)
+    @cuda threads=threads blocks=blocks gpu_escape_kernel!(
+        V, occ, g, m, ctl, Int32(nctl), p, Int32(phase), rev, n, total)
+    CUDA.synchronize()
+    Float64(CUDA.@allowscalar total[1])
+end
+
+"""
 One in-place sweep over the *interior* of a resident tile.
 
 `gt` is the tile's own grid (see `subgrid`), so every read and write in
@@ -81,6 +124,54 @@ function sweep_tile_gpu!(V, occ, pol, gt::Grid6, m::Model, ctl, nctl, p::Params,
     blocks = cld(nint, threads)
     @cuda threads=threads blocks=blocks gpu_tile_sweep_kernel!(
         V, occ, pol, gt, m, ctl, Int32(nctl), p, Int32(phase), rev,
+        Int64(ox), Int64(oy), Int64(wx), Int64(wy), nrest, nint, total)
+    CUDA.synchronize()
+    Float64(CUDA.@allowscalar total[1])
+end
+
+"""
+One in-place escape sweep over a tile's interior.
+
+`gpu_tile_sweep_kernel!`'s index mapping and `gpu_escape_kernel!`'s update
+rule. The halo is the frozen boundary for this residency exactly as it is in
+the ordinary sweep, and it is sound for the same reason read the other way
+up: a stale halo carries an *older* escape time, which is a larger one, and
+the backup mins against it. See `solve_escape_ooc!`.
+"""
+function gpu_tile_escape_kernel!(V, occ, gt::Grid6, m::Model, ctl,
+                                 nctl::Int32, p::Params, phase::Int32,
+                                 rev::Bool, ox::Int64, oy::Int64, wx::Int64,
+                                 wy::Int64, nrest::Int64, nint::Int64, total)
+    i = (Int64(blockIdx().x) - Int64(1)) * Int64(blockDim().x) + Int64(threadIdx().x)
+    i > nint && return nothing
+    j = rev ? nint - i : i - Int64(1)
+    r  = j % nrest;  q  = j ÷ nrest
+    jy = q % wy;     jx = q ÷ wy
+    idx = ((jx + ox) * Int64(gt.n[2]) + (jy + oy)) * nrest + r
+    @inbounds v0 = V[idx + 1]
+    is_terminal(v0, p.cap) && return nothing
+    e_old = escape_of(v0, p.cap)
+    c, _, _, _ = cell_update(idx, V, occ, nothing, gt, m, ctl, nctl, p, phase,
+                             Val(true))
+    if c < e_old
+        @inbounds V[idx + 1] = -c
+        CUDA.@atomic total[1] += (e_old - c)
+    end
+    return nothing
+end
+
+"""One in-place escape sweep over a tile's interior. Total improvement."""
+function sweep_tile_escape_gpu!(V, occ, gt::Grid6, m::Model, ctl, nctl,
+                                p::Params, phase::Integer, total, ox::Integer,
+                                oy::Integer, wx::Integer, wy::Integer;
+                                rev::Bool = false)
+    nrest = ncells(gt) ÷ (Int64(gt.n[1]) * Int64(gt.n[2]))
+    nint = Int64(wx) * Int64(wy) * nrest
+    fill!(total, 0.0f0)
+    threads = 256
+    blocks = cld(nint, threads)
+    @cuda threads=threads blocks=blocks gpu_tile_escape_kernel!(
+        V, occ, gt, m, ctl, Int32(nctl), p, Int32(phase), rev,
         Int64(ox), Int64(oy), Int64(wx), Int64(wy), nrest, nint, total)
     CUDA.synchronize()
     Float64(CUDA.@allowscalar total[1])

@@ -1336,6 +1336,366 @@ function test_cell_bytes()
     ok
 end
 
+"""
+Self-test 16: the escape pass, and the band that carries it on the card.
+
+This is for a robot that is *already stuck* -- shoved into an obstacle, or
+against a wall at a heading that does not fit -- reading `unreachable` in
+every direction with nothing to descend. So the tests are the four things
+that failure mode actually needs, and not the easy one.
+
+The easy one, and the reason it is not enough: "every blocked cell got some
+number". A pass that filled them with the distance to the nearest edge of the
+obstacle would satisfy that and still strand the robot, by walking it out of
+the near side of a wall into a pocket with no route onward.
+
+So the geometry here is deliberately **asymmetric**. A slab across the field
+at x in 20..40 cuts the low end off from the target at x = 100 entirely, so
+the cells below it are unreachable and stay that way. A cell at x = 25 is
+therefore 5 cm from the near edge and 15 cm from the far one, and only the far
+edge is any use. The closed form separates the two answers by 73%:
+
+    escape from rest over d, free terminal speed:  t = sqrt(2d/a)
+    near edge  (5 cm, useless):   0.316 s
+    far edge  (15 cm, the answer): 0.548 s
+
+Which one comes back says whether the pass is aiming at *states that have a
+route* or merely at "not an obstacle".
+"""
+function test_escape(; use_gpu = CUDA.functional())
+    println("\n[16] the escape pass")
+    amax = 100.0f0
+    m = _double_integrator(amax)
+    n = (81, 5, 4, 33, 5, 5)
+    g = Grid6(n, (0.0, 0.0, -π, -100.0, -100.0, -2.0),
+                 (200.0, 200.0, π, 100.0, 100.0, 2.0))
+    cap = 30.0f0
+    ncell = ncells(g)
+    nxy = Int(n[1]) * Int(n[2]) * Int(n[3])
+
+    # A slab of obstacle at x in 20..40, every y and every heading. Set
+    # directly rather than rasterised from a polygon: this is a test of the
+    # pass, not of `build_occupancy`, and a hand-built mask cannot drift.
+    occ = falses(nxy)
+    xs = [Float64(axisvalue(g, 1, i)) for i in 0:(Int(n[1]) - 1)]
+    slab = [i for i in 0:(Int(n[1]) - 1) if 20.0 <= xs[i + 1] <= 40.0]
+    for i in slab, j in 0:(Int(n[2]) - 1), k in 0:(Int(n[3]) - 1)
+        occ[(Int64(i) * g.n[2] + j) * g.n[3] + k + 1] = true
+    end
+    _check(length(slab) >= 3, "the slab is thicker than one cell",
+           "$(length(slab)) cells, $(round(xs[slab[1] + 1], digits = 1))..$(round(xs[slab[end] + 1], digits = 1)) cm")
+
+    targ = (100.0f0, 100.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0)
+    ttol = NTuple{6,Float32}(Float32[g.step[k] * 0.5f0 for k in 1:6])
+    tcells = target_cells(g, targ, ttol)
+    ctl_t = control_set(4)
+    nctl = length(ctl_t)
+    ctl_h = Float32[getindex.(ctl_t, 1); getindex.(ctl_t, 2); getindex.(ctl_t, 3)]
+    p = Params(; dt = 0.05f0, nsub = Int32(4), cap = cap, checks = Int32(2),
+               adaptive_checks = true, ntau = Int32(4), cfl = 1.0f0,
+               hmax = 0.0125f0, ncoarse = Int32(0), rounds = Int32(2),
+               rk2 = true)
+
+    function solved(gpu::Bool)
+        if gpu
+            V = CUDA.fill(cap, ncell)
+            solve_value!(V, CuArray(occ), g, m, CuArray(Int64.(tcells) .+ 1),
+                         CuArray(ctl_h), nctl, p; iters = 600, tol = 1e-4,
+                         use_gpu = true, total = CUDA.zeros(Float32, 1))
+            Array(V)
+        else
+            V = fill(cap, ncell)
+            solve_value!(V, occ, g, m, Int64.(tcells) .+ 1, ctl_h, nctl, p;
+                         iters = 600, tol = 1e-4, use_gpu = false)
+            V
+        end
+    end
+
+    function escaped(V0, gpu::Bool)
+        if gpu
+            V = CuArray(V0)
+            solve_escape!(V, CuArray(occ), g, m, CuArray(ctl_h), nctl, p;
+                          iters = 200, tol = 1e-4, use_gpu = true,
+                          total = CUDA.zeros(Float32, 1))
+            Array(V)
+        else
+            V = copy(V0)
+            solve_escape!(V, occ, g, m, ctl_h, nctl, p; iters = 200,
+                          tol = 1e-4, use_gpu = false)
+            V
+        end
+    end
+
+    before = solved(use_gpu)
+    after = escaped(before, use_gpu)
+
+    # --- it cannot damage the table it was given -------------------------
+    #
+    # The whole reason this is on by default. Every cell that had a real route
+    # must come back bit-identical, or the pass is not additive and every
+    # table on every card is in question.
+    term = [i for i in eachindex(before) if is_terminal(before[i], cap)]
+    _check(!isempty(term), "the solve reached something", "$(length(term)) cells")
+    _check(all(after[i] === before[i] for i in term),
+           "every cell with a real route is untouched, bit for bit",
+           "$(count(i -> after[i] !== before[i], term)) changed of $(length(term))")
+
+    nesc = count(v -> v < 0.0f0, after)
+    dead = count(v -> !is_terminal(v, cap), before)
+    _check(nesc > 0, "cells with no route got an escape",
+           "$nesc of $dead, $(round(100 * nesc / dead, digits = 1))%")
+    _check(all(isfinite(v) && -v > 0.0f0 && -v <= cap + 1.0f-3
+               for v in after if v < 0.0f0),
+           "every escape time is finite, positive and within cap")
+
+    # --- it aims at states that have a route, not at open space ----------
+    esc_at(V, x) = begin
+        i = argmin(abs.(xs .- x)) - 1
+        j = Int(round((100.0 - g.lo[2]) / g.step[2]))
+        # At rest, mid heading bin, mid velocity: the state a stuck robot is in.
+        i4 = (Int(n[4]) - 1) ÷ 2; i5 = (Int(n[5]) - 1) ÷ 2; i6 = (Int(n[6]) - 1) ÷ 2
+        v = V[flatten(g, Int32(i), Int32(j), Int32(0), Int32(i4), Int32(i5),
+                      Int32(i6)) + 1]
+        v < 0.0f0 ? Float64(-v) : NaN
+    end
+
+    d_far = 40.0 - 25.0
+    want_far = sqrt(2 * d_far / Float64(amax))
+    want_near = sqrt(2 * (25.0 - 20.0) / Float64(amax))
+    got = esc_at(after, 25.0)
+    @printf("        x = 25 cm:  far edge %.3f s   near edge %.3f s   solver %.3f s\n",
+            want_far, want_near, got)
+    # Generous on the upper side -- a discrete grid and a cell-sized terminal
+    # set both cost a little -- but nowhere near the near-edge answer, which
+    # is the alternative this is separating it from.
+    _check(!isnan(got) && got > (want_far + want_near) / 2,
+           "the escape aims at the reachable side, not the nearest edge",
+           @sprintf("%.3f s, midpoint between the two answers is %.3f s",
+                    got, (want_far + want_near) / 2))
+    _check(!isnan(got) && got <= want_far * 1.6,
+           "and it is close to the closed form for that side",
+           @sprintf("%.3f s vs %.3f s (%+.1f%%)", got, want_far,
+                    100 * (got - want_far) / want_far))
+
+    # --- it does not route through walls ---------------------------------
+    #
+    # The cells below the slab are cut off from the target by it. They are in
+    # free space, so the rule is that they may not enter an obstacle to get
+    # out -- and there is nowhere else for them to go. They must stay
+    # unreachable. A pass that "helped" them would be walking the robot into
+    # the wall it is standing next to.
+    low = [(Int64(i) * g.n[2] + j) * g.n[3] + k
+           for i in 0:(slab[1] - 1) for j in 0:(Int(n[2]) - 1)
+           for k in 0:(Int(n[3]) - 1)]
+    lowcells = Int64[]
+    for b in low, r in 0:(Int(n[4]) * Int(n[5]) * Int(n[6]) - 1)
+        push!(lowcells, b * Int64(n[4]) * Int64(n[5]) * Int64(n[6]) + r)
+    end
+    nbad = count(i -> after[i + 1] < 0.0f0, lowcells)
+    _check(nbad == 0,
+           "free cells walled off from the target get no escape through the wall",
+           "$nbad of $(length(lowcells)) cells below the slab")
+
+    # --- the two backends run the same scheme ----------------------------
+    #
+    # On its own small grid with a small control set. The pass costs the same
+    # per cell as a solve sweep, so running the real one on the CPU as well
+    # would be the slowest thing in this file by an order of magnitude, and it
+    # would be measuring the CPU rather than the agreement.
+    if use_gpu
+        gs = Grid6((25, 3, 4, 13, 3, 3), (0.0, 0.0, -π, -100.0, -100.0, -2.0),
+                   (200.0, 200.0, π, 100.0, 100.0, 2.0))
+        nc = ncells(gs)
+        so = falses(Int(gs.n[1]) * Int(gs.n[2]) * Int(gs.n[3]))
+        sxs = [Float64(axisvalue(gs, 1, i)) for i in 0:(Int(gs.n[1]) - 1)]
+        for i in 0:(Int(gs.n[1]) - 1), j in 0:(Int(gs.n[2]) - 1),
+            k in 0:(Int(gs.n[3]) - 1)
+            20.0 <= sxs[i + 1] <= 50.0 &&
+                (so[(Int64(i) * gs.n[2] + j) * gs.n[3] + k + 1] = true)
+        end
+        sct = control_set(2)
+        sch = Float32[getindex.(sct, 1); getindex.(sct, 2); getindex.(sct, 3)]
+        stc = target_cells(gs, targ,
+                           NTuple{6,Float32}(Float32[gs.step[k] * 0.5f0 for k in 1:6]))
+        sp = Params(; dt = 0.05f0, nsub = Int32(4), cap = cap,
+                    checks = Int32(2), adaptive_checks = true,
+                    ntau = Int32(2), cfl = 1.0f0, hmax = 0.0125f0, rk2 = true)
+
+        Vc = fill(cap, nc)
+        solve_value!(Vc, so, gs, m, Int64.(stc) .+ 1, sch, length(sct), sp;
+                     iters = 200, tol = 1e-4, use_gpu = false)
+        # The solved table, kept before either pass runs over it in place, so
+        # every backend below starts from identical input.
+        Vgh0 = copy(Vc)
+        Vg = CuArray(Vc)
+        solve_escape!(Vc, so, gs, m, sch, length(sct), sp; iters = 60,
+                      tol = 1e-4, use_gpu = false)
+        solve_escape!(Vg, CuArray(so), gs, m, CuArray(sch), length(sct), sp;
+                      iters = 60, tol = 1e-4, use_gpu = true,
+                      total = CUDA.zeros(Float32, 1))
+        Vgh = Array(Vg)
+        de = maximum(abs(Float64(Vc[i]) - Float64(Vgh[i]))
+                     for i in eachindex(Vc) if Vc[i] < 0 || Vgh[i] < 0;
+                     init = 0.0)
+        nsign = count(i -> (Vc[i] < 0) != (Vgh[i] < 0), eachindex(Vc))
+        _check(nsign == 0, "the CPU and GPU passes escape the same cells",
+               "$nsign of $nc disagree")
+
+        # In the aggregate, not cell by cell, and that is not a fudge.
+        #
+        # Measured: the two backends settle on escape times that differ by up
+        # to 0.19 s at the worst cell, against a self-spread of 0.0003 s (CPU
+        # against CPU) and 0.013 s (GPU against GPU). So it is systematic, not
+        # scheduling noise -- but **each answer is a fixed point of the other
+        # backend**: running the GPU pass from the CPU's converged table does
+        # not move it, and vice versa. Neither dominates either, the GPU being
+        # strictly lower on 932 cells and strictly higher on 871.
+        #
+        # The discretised operator simply has more than one fixed point here,
+        # and CPU and GPU float contraction tip near-tied controls to
+        # different ones. Every disagreement sits at the corner of the
+        # velocity envelope on the obstacle's edge, where the value surface is
+        # flat and bifurcating. The mean is what is stable -- it differed by
+        # 0.012% -- so that is what is worth asserting; a worst-cell bound
+        # would only be pinning down which arbitrary tie a given card breaks.
+        me(V) = (e = [-Float64(V[i]) for i in eachindex(V) if V[i] < 0.0f0];
+                 isempty(e) ? 0.0 : sum(e) / length(e))
+        mc = me(Vc); mg = me(Vgh)
+        rel = mc > 0 ? abs(mc - mg) / mc : 0.0
+        _check(rel <= 0.01, "and agree on the mean escape time",
+               @sprintf("cpu %.4f s, gpu %.4f s (%+.3f%%); worst cell %.3f s",
+                        mc, mg, 100 * (mg - mc) / mc, de))
+
+        # --- and the tiled pass agrees with the whole-grid one ------------
+        #
+        # The tiled driver is what runs at full scale, so the escape pass has
+        # to hold there too. Fed the *same* solved table as the in-core pass
+        # rather than re-solving, so this isolates the escape pass from any
+        # difference in the solve that preceded it.
+        #
+        # A tile's halo is frozen for the residency exactly as it is in a
+        # solve, and it is sound here for the mirrored reason: the stored
+        # value is the negated escape time, so it only ever increases, but the
+        # quantity being minimised is still the escape time and a stale halo
+        # still carries a larger one. See `solve_escape_ooc!`.
+        # The halo has to cover how far one backup can reach, or steps that
+        # leave a tile are priced as unreachable and the comparison below
+        # measures a starved halo rather than the tiling. 50 cm is `tau_max`
+        # at the envelope's top speed; six x cells is 50 cm, and one y cell is
+        # 100 cm on this deliberately coarse y axis.
+        tp = tile_plan(gs, 6, 1, 6, 1; warm = false, dxy_cm = 50.0,
+                       dh_rad = 2.0 * Float64(gs.step[3]))
+        st = open_store(nc)
+        try
+            # 0-based store offset, 1-based buffer position.
+            write_range!(st, Int64(0), Vgh0, Int64(1), Int64(nc))
+            rd, _ = solve_escape_ooc!(st, Vector{Bool}(so), gs, m, sch,
+                                      length(sct), sp, tp; rounds = 40,
+                                      tol = 1e-6, tile_sweeps = 3)
+            Vt = read_all(st)
+            nsign_t = count(i -> (Vt[i] < 0) != (Vgh[i] < 0), eachindex(Vt))
+            mt = me(Vt)
+            _check(tp.ntiles >= 4, "the grid really was cut into tiles",
+                   "$(tp.ntiles) tiles, $(rd) rounds")
+            _check(nsign_t == 0, "the tiled pass escapes the same cells",
+                   "$nsign_t of $nc disagree")
+            _check(mt > 0 && abs(mt - mg) / mg <= 0.05,
+                   "and agrees with the whole-grid pass on the mean",
+                   @sprintf("tiled %.4f s vs whole %.4f s (%+.2f%%)",
+                            mt, mg, 100 * (mt - mg) / mg))
+        finally
+            close_store!(st)
+        end
+    end
+
+    # --- the card round-trip ---------------------------------------------
+    #
+    # Decoded by the rules in section 6 of TABLE_FORMAT.md rather than by
+    # anything the encoder knows, because what is being tested is the
+    # contract the robot firmware will implement.
+    for dt in ("u16", "u8", "f32")
+        sc = DTYPES[dt].scale
+        es = escape_scale_for(dt, cap)
+        buf = encode(after, dt, sc, cap, es)
+        base = Int(DTYPES[dt].escape_base)
+        # NaN for the float types, so it cannot go through `Int`.
+        sentinel = dt == "f32" ? 0 : Int(DTYPES[dt].sentinel)
+        raws = dt == "u8" ? Int.(buf) :
+               dt == "u16" ? Int.(reinterpret(UInt16, buf)) : Int[]
+        fl = dt == "f32" ? reinterpret(Float32, buf) : Float32[]
+
+        # Decode both halves, exactly as section 6 and 6.1 say to.
+        function dec(i)
+            if dt == "f32"
+                v = fl[i]
+                isnan(v) && return (Inf, nothing)
+                v < 0 && return (Inf, -Float64(v))
+                return (Float64(v), nothing)
+            end
+            r = raws[i]
+            r == sentinel && return (Inf, nothing)
+            r >= base && return (Inf, es * (r - base)^2)
+            (r * sc, nothing)
+        end
+
+        nboth = 0; nesc_rt = 0; worst = 0.0; nreach = 0
+        for i in eachindex(after)
+            v, e = dec(i)
+            isfinite(v) && (nreach += 1)
+            if after[i] < 0.0f0
+                nesc_rt += 1
+                # An escape cell MUST still read as unreachable. This is the
+                # property the whole design rests on: it must lose every
+                # comparison against a real route.
+                isfinite(v) && (nboth += 1)
+                e === nothing || (worst = max(worst, abs(e - Float64(-after[i]))))
+            elseif is_terminal(after[i], cap)
+                e === nothing || (nboth += 1)
+            end
+        end
+        _check(nboth == 0,
+               "$dt: no cell decodes as both reachable and escapable",
+               "$nboth of $(length(after))")
+        _check(nesc_rt == nesc, "$dt: every escape cell survived encoding",
+               "$nesc_rt of $nesc")
+        # The band's own resolution is the bar: `escape_scale * (2r+1)` at the
+        # top code, which is what a square-law band costs at the far end.
+        tol = dt == "f32" ? 1.0e-3 :
+              es * (2 * (escape_codes(dt) - 1) + 1) + 1.0e-6
+        _check(worst <= tol, "$dt: escape times round-trip inside the band's step",
+               @sprintf("worst %.4f s, band step at the top %.4f s", worst, tol))
+        # Only where the dtype can represent `cap` at all. `u8` at 25 ms a
+        # code tops out at 5.575 s against a 30 s cap, so most real values
+        # saturate to the sentinel -- which is the long-standing behaviour of
+        # a one-byte table and not something the escape band changed. What
+        # matters for `u8` is that they saturate to the *sentinel* and not
+        # into the band, and "no cell decodes as both" above is that test.
+        nterm = count(v -> is_terminal(v, cap), after)
+        if base == 0 || Float64(cap) / sc < base
+            _check(nreach == nterm,
+                   "$dt: reachable count is unchanged by the escape band",
+                   "$nreach vs $nterm")
+        else
+            _check(nreach <= nterm,
+                   "$dt: cannot represent a $(cap) s cap, so it saturates",
+                   "$nreach of $nterm representable below " *
+                   @sprintf("%.3f s", base * sc))
+        end
+    end
+
+    # A real value that would land in the escape band must saturate to the
+    # sentinel rather than be read back as an escape. `run_solve` refuses a
+    # config that could do this, so it is a guard, but it is the guard on the
+    # one confusion the format cannot tolerate.
+    probe = Float32[Float32(0.9 * 0xfc00 * 0.001), Float32(1.1 * 0xfc00 * 0.001)]
+    pbuf = reinterpret(UInt16, encode(probe, "u16", 0.001, 100.0f0,
+                                      escape_scale_for("u16", 100.0f0)))
+    _check(pbuf[1] < 0xfc00 && pbuf[2] == 0xffff,
+           "a real value above the band saturates to unreachable, not into it",
+           "$(pbuf[1]), $(pbuf[2])")
+    nothing
+end
+
 """Run every self-test. Returns a process exit code."""
 function self_test()
     _PASS[] = 0; _FAIL[] = 0
@@ -1356,6 +1716,7 @@ function self_test()
     test_reach_curve()
     test_prefetch()
     test_cell_bytes()
+    test_escape()
     @printf("\n%d passed, %d failed\n", _PASS[], _FAIL[])
     _FAIL[] == 0 ? 0 : 1
 end

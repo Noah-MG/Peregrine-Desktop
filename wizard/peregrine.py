@@ -623,6 +623,14 @@ DEFAULTS = {
     "tau_max": "auto",
     "level": 4,
     "budget_gb": 8.0,
+    # After each target converges, fill in the cells it could not reach with
+    # the time to get out of them, so a robot shoved into an obstacle has a
+    # gradient to follow instead of `unreachable` in every direction. Written
+    # into the config rather than left to the solver's default so it is
+    # visible and tunable; it only ever writes cells that were going to be
+    # unreachable anyway, so there is no reason to turn it off.
+    "escape": True,
+    "escape_iterations": 60,
 }
 
 
@@ -811,6 +819,8 @@ def config_from(ws: Workspace, run_dir: str, d: dict) -> dict:
         "tau_levels": d["tau_levels"],
         "tau_max": d["tau_max"],
         "control_level": d["level"],
+        "escape": d.get("escape", True),
+        "escape_iterations": d.get("escape_iterations", 60),
         "zero_c": True,
         "backend": "auto",
         # The scratch file for a tiled solve is the whole value function --
@@ -1268,6 +1278,17 @@ def step_solve(ws: Workspace) -> None:
             _cost_preview(rt, target, measured)
             print(f"  per {rt['unit']:<15} {hms(rt['unit_s'])} x "
                   f"{rt['units']} {rt['unit']}s per target")
+            # The escape pass is in that count, priced at a full backup per
+            # cell. It is not one: a cell with a route retires immediately, so
+            # on a table that reaches most of its states this is a large
+            # over-estimate of a small number. Broken out rather than folded
+            # in silently, because it moved the total.
+            esc = (rt.get("escape_rounds") if rt["unit"] == "round"
+                   else rt.get("escape_sweeps"))
+            if esc:
+                print(f"  of which escape     {esc} {rt['unit']}s"
+                      + c("   (over-priced; reachable cells retire at once)",
+                          "2"))
             if rt["unit"] == "round":
                 # A round pays for both halves in sequence -- load, sweep,
                 # store -- so this says which half is the larger, not which
@@ -1507,14 +1528,25 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
                 show((done_targets + within) / n_targets,
                      f"{ev['target_name']}  round {ev['round']}/{rounds}  "
                      f"tile {ev['tile']}/{ev['tiles']}")
+            elif ph == "escape":
+                # Filling in the cells the solve could not reach with the time
+                # to get out of them. Its own phase because it runs after the
+                # bar has already reached the end of this target's slot, and
+                # a bar that sits still is a bar that looks hung.
+                show((done_targets + 1) / n_targets,
+                     f"{ev['target_name']}  escape "
+                     f"{ev['iter']}/{ev['iters']}")
             elif ph == "encode":
                 show((done_targets + 1) / n_targets,
                      f"{ev['target_name']}  writing")
             elif ph == "target_done":
                 done_targets += 1
+                esc = ev.get("escape_of_unreached_frac")
+                extra = ("" if not esc else
+                         f", {esc*100:.0f}% of the rest can escape")
                 show(done_targets / n_targets,
                            f"{ev['target_name']} done "
-                           f"({ev['reached_frac']*100:.0f}% reachable)")
+                           f"({ev['reached_frac']*100:.0f}% reachable{extra})")
             elif ph == "done":
                 bar.done(f"{ev['targets']} table(s) in {hms(time.time()-started)}")
         err = proc.stderr.read()

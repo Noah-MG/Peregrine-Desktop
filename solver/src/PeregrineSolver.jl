@@ -387,6 +387,14 @@ Values cannot leak through a wall because transitions into obstacles are
 rejected by the swept check in `cell_update`, and obstacle cells sit at
 `cap`. That argument needs obstacles to be at least one cell thick -- see
 `margin_cm` in `build_occupancy`.
+
+**Both halves are load-bearing, and the second one is easy to lose.** The
+swept check rounds to a cell; this blends the corners of the successor's cell,
+which is not the same set. A successor just short of a wall reads a corner
+inside it, and if that corner ever holds something small the value leaks
+across regardless of the collision check. The escape pass puts small numbers
+in obstacle cells on purpose, and pays for it by hiding them again -- see
+`EscapeView`. Anything else that writes an obstacle cell owes the same debt.
 """
 @inline function interp(V, g::Grid6, x, y, h, vx, vy, w, nearest::Bool,
                         cap::Float32, vclamp::Bool = false)
@@ -742,6 +750,138 @@ end
 end
 
 # --------------------------------------------------------------------------
+# The escape pass: a second value function, in the same array
+# --------------------------------------------------------------------------
+
+"""
+`V` under the escape pass's reading of it.
+
+**The problem this solves.** After a target converges, every cell the solve
+could not reach sits at `cap`, and a robot that finds itself in one -- shoved
+into an obstacle, or a footprint-width from a wall at the wrong heading --
+reads `unreachable` in every direction and has no gradient to follow out.
+The escape pass gives those cells the time to reach the nearest state that
+*does* have a route, so there is always something to descend.
+
+That is a second value function over the same grid, and at 28.6 GB a table it
+cannot have a second array. So it lives in the sign bit of the first one:
+
+| stored `V` | means |
+| --- | --- |
+| `0 <= v < cap` | a real route to the target, `v` seconds. The escape pass's terminal set, and it never writes these. |
+| `v < 0` | no route, but a way out: escape takes `-v` seconds |
+| `v >= cap` | no route and no way out yet |
+
+Negation is what keeps the two separable. Without it an escape value of 0.3 s
+and a real value of 0.3 s are the same bits, and the *next* sweep cannot tell
+whether the cell it is reading is a boundary condition or a work in progress.
+
+`getindex` is the whole transform: a terminal cell reads as **zero**, because
+reaching one ends the escape and costs nothing more; an unsolved cell reads as
+`cap`; an escape cell reads as its escape time. Wrapping `V` rather than
+branching inside the interpolants is deliberate -- `interp` and `interp_kuhn`
+are the hot loop and are not touched by any of this, they just index something
+whose `getindex` does one compare. Constructed inside the kernel from the
+device array, so it stays `isbits` and needs no `Adapt` rule.
+
+**And it has to hide obstacle cells from everyone standing outside one.** The
+argument in `interp` that values cannot leak through a wall has two halves:
+the swept check rejects transitions into an obstacle, *and obstacle cells sit
+at `cap`*. This pass breaks the second half on purpose -- it is what puts small
+numbers in them -- and the swept check alone does not close the gap, because
+interpolation reads the corners of the successor's cell rather than the cell
+the collision probe rounded to. A successor half a cell short of a wall
+therefore blends a corner that is inside it.
+
+Measured, before this was here: 95,940 free cells on the far side of a slab
+were handed an escape that led straight into the slab. They were cells with
+genuinely no way out, and the pass invented one through the obstacle.
+
+So a corner that is an obstacle reads as `cap` -- unless `ignore`, meaning the
+cell being updated is itself inside an obstacle and is allowed to see its way
+out through obstacle space. Exactly the rule `OccView` applies to transitions,
+applied to the value read. The occupancy index is `idx / (Nvx*Nvy*Nw)`, one
+division: occupancy is indexed by (x, y, h) and those are the slowest three
+axes of the flat index, so the velocity block divides straight out.
+"""
+struct EscapeView{A,O} <: AbstractVector{Float32}
+    V::A
+    occ::O
+    blk::Int64          # cells per (x, y, h) slice: Nvx * Nvy * Nw
+    cap::Float32
+    ignore::Bool        # the cell being updated is itself blocked
+end
+
+Base.size(e::EscapeView) = size(e.V)
+Base.IndexStyle(::Type{<:EscapeView}) = IndexLinear()
+
+Base.@propagate_inbounds function Base.getindex(e::EscapeView, i::Integer)
+    if !e.ignore
+        @inbounds e.occ[(Int64(i) - Int64(1)) ÷ e.blk + Int64(1)] && return e.cap
+    end
+    v = e.V[i]
+    v < 0.0f0 ? -v : (v < e.cap ? 0.0f0 : e.cap)
+end
+
+"""
+Occupancy as the escape pass reads it, which is not always as it is.
+
+A cell inside an obstacle has to be allowed to move *through* obstacle space,
+or there is no way out of one and the pass computes nothing for exactly the
+states it exists to serve. A cell that is merely unreached must not: it is
+standing in free space, and telling it to escape through a wall would be
+worse advice than the `unreachable` it gets today.
+
+So the rule is **you may stay in an obstacle, but you may not enter one** --
+the swept check is waived only when the cell being updated is itself blocked.
+One flag rather than two types, because a GPU kernel that picks between two
+different occupancy representations per cell is type-unstable and will not
+compile.
+"""
+struct OccView{A} <: AbstractVector{Bool}
+    occ::A
+    ignore::Bool
+end
+
+Base.size(o::OccView) = size(o.occ)
+Base.IndexStyle(::Type{<:OccView}) = IndexLinear()
+
+Base.@propagate_inbounds Base.getindex(o::OccView, i::Integer) =
+    o.ignore ? false : o.occ[i]
+
+"""
+Is this cell part of the escape pass's terminal set -- a state with a real
+route, which is frozen and read as zero?
+
+`v >= 0 && v < cap`. The `v >= 0` half is what excludes an escape cell whose
+value has already been written, and it is the reason the sign convention
+exists at all.
+"""
+@inline is_terminal(v::Float32, cap::Float32) = v >= 0.0f0 && v < cap
+
+"""
+The escape time a cell currently claims, from its stored value: `-v` if one
+has been found, and `cap` -- no way out yet -- otherwise.
+"""
+@inline escape_of(v::Float32, cap::Float32) = v < 0.0f0 ? -v : cap
+
+"""
+Swap in the escape pass's views, or don't.
+
+By dispatch rather than by a ternary, so that the substitution is settled at
+compile time and the ordinary sweep is provably unchanged: for `Val{false}`
+these are the identity, they inline away, and `cell_update` indexes the bare
+arrays exactly as it did before the escape pass existed. A runtime branch
+would leave a `Union` in the hot loop, which on the GPU is the difference
+between a register and a spill.
+"""
+@inline esc_v(V, occ, blk::Int64, cap::Float32, blocked::Bool, ::Val{false}) = V
+@inline esc_v(V, occ, blk::Int64, cap::Float32, blocked::Bool, ::Val{true}) =
+    EscapeView(V, occ, blk, cap, blocked)
+@inline esc_occ(occ, blocked::Bool, ::Val{false}) = occ
+@inline esc_occ(occ, blocked::Bool, ::Val{true}) = OccView(occ, blocked)
+
+# --------------------------------------------------------------------------
 # Bellman update for one cell
 # --------------------------------------------------------------------------
 
@@ -970,14 +1110,27 @@ monotone. A restricted candidate set can only slow convergence down, never
 move the fixed point -- which is why the stopping rule in `solve_value!` has
 to see a quiet sweep for a whole rotation of the coarse offset, not just one.
 """
-@inline function cell_update(idx::Int64, V, occ, pol, g::Grid6, m::Model,
-                             ctl, nctl::Int32, p::Params, phase::Int32)
+@inline function cell_update(idx::Int64, V0, occ0, pol, g::Grid6, m::Model,
+                             ctl, nctl::Int32, p::Params, phase::Int32,
+                             ::Val{ESC} = Val(false)) where {ESC}
     i1, i2, i3, i4, i5, i6 = unflatten(g, idx)
 
     # Occupancy is (x, y, heading): a chassis with real extent blocks
     # different cells depending on which way it is pointing.
-    @inbounds occ[(Int64(i1) * g.n[2] + i2) * g.n[3] + i3 + 1] &&
-        return (p.cap, 0.0f0, 0.0f0, 0.0f0)
+    @inbounds blocked = occ0[(Int64(i1) * g.n[2] + i2) * g.n[3] + i3 + 1]
+
+    # The escape pass runs this same backup over the cells the main solve
+    # could not reach, against a different reading of `V` and of `occ`. Both
+    # substitutions are by dispatch on a `Val`, so the ordinary sweep compiles
+    # to exactly what it did before: `ESC` is false, `esc_v` and `esc_occ`
+    # return their argument unchanged, and the blocked test below is the same
+    # early return it always was.
+    V = esc_v(V0, occ0, Int64(g.n[4]) * Int64(g.n[5]) * Int64(g.n[6]), p.cap,
+              blocked, Val(ESC))
+    occ = esc_occ(occ0, blocked, Val(ESC))
+    if !ESC
+        blocked && return (p.cap, 0.0f0, 0.0f0, 0.0f0)
+    end
 
     x  = axisvalue(g, 1, i1); y   = axisvalue(g, 2, i2)
     h  = axisvalue(g, 3, i3); vfx = axisvalue(g, 4, i4)

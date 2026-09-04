@@ -567,86 +567,216 @@ function sweep_cpu!(V, occ, pol, g, m, ctl, nctl, p::Params, phase::Integer;
     total[]
 end
 
+"""
+One asynchronous escape sweep on the CPU.
+
+The same loop as `sweep_cpu!` with `gpu_escape_kernel!`'s update rule, kept
+here so the two backends run the identical scheme and the self-test can hold
+them to the same answer. The in-place races are benign for the same reason:
+every write only ever lowers a cell's *escape time*, so the iteration is
+monotone in the quantity being minimised, which is all the argument in
+`sweep_cpu!` ever needed.
+"""
+function sweep_escape_cpu!(V, occ, g, m, ctl, nctl, p::Params, phase::Integer;
+                           rev::Bool = false)
+    n = ncells(g)
+    total = Threads.Atomic{Float64}(0.0)
+    Threads.@threads for i in 1:n
+        idx = rev ? Int64(n) - Int64(i) : Int64(i) - 1
+        @inbounds v0 = V[idx + 1]
+        is_terminal(v0, p.cap) && continue
+        e_old = escape_of(v0, p.cap)
+        c, _, _, _ = cell_update(idx, V, occ, nothing, g, m, ctl, Int32(nctl),
+                                 p, Int32(phase), Val(true))
+        if c < e_old
+            @inbounds V[idx + 1] = -c
+            Threads.atomic_add!(total, Float64(e_old - c))
+        end
+    end
+    total[]
+end
+
 # --------------------------------------------------------------------------
 # Encoding and output
 # --------------------------------------------------------------------------
 
+"""
+The four on-card representations, and where each one keeps the escape band.
+
+`escape_base` is the first raw code that means "no route, but here is the way
+out". Codes from there to `sentinel - 1` carry an escape time; `sentinel`
+itself still means no route and no way out, exactly as it always has. Float
+types have no band and no base -- a negative value is impossible for a real
+minimum time, so the sign carries it there for free.
+
+**Why a band at the top rather than a flag bit.** A flag bit would halve the
+representable range: u16 milliseconds would stop at 32.767 s, well inside the
+60 s `value_cap` defaults to, so real routes would start clipping. The codes
+above `value_cap / scale` are already unreachable by construction and cost
+nothing to take. It also degrades safely -- a robot that has not been updated
+reads an escape cell as a finite time worse than every real route, rather than
+as something it might prefer.
+"""
 const DTYPES = Dict(
-    "u8"  => (bytes = 1, sentinel = 0xff,       scale = 0.025),
-    "u16" => (bytes = 2, sentinel = 0xffff,     scale = 0.001),
-    "f16" => (bytes = 2, sentinel = NaN,        scale = 1.0),
-    "f32" => (bytes = 4, sentinel = NaN,        scale = 1.0),
+    "u8"  => (bytes = 1, sentinel = 0xff,   scale = 0.025, escape_base = 0x00e0),
+    "u16" => (bytes = 2, sentinel = 0xffff, scale = 0.001, escape_base = 0xfc00),
+    "f16" => (bytes = 2, sentinel = NaN,    scale = 1.0,   escape_base = 0),
+    "f32" => (bytes = 4, sentinel = NaN,    scale = 1.0,   escape_base = 0),
 )
+
+"""Raw codes available to the escape band, for an integer dtype."""
+escape_codes(dtype::AbstractString) =
+    DTYPES[dtype].escape_base == 0 ? 0 :
+    Int(DTYPES[dtype].sentinel) - Int(DTYPES[dtype].escape_base)
+
+"""
+The escape band's coefficient: escape seconds per code *squared*.
+
+**Why the band is square-law and not linear.** It has to span the whole range
+an escape time can take -- zero to `cap`, since `lookahead` mins against
+`cap` -- in 1023 codes, and a linear split of that is 59 ms a code. The
+gradient the robot actually descends is the difference between neighbouring
+cells inside an obstacle, which at full resolution is a 2.3 cm step and tens
+of milliseconds. A linear band would quantise that to a plateau and leave the
+robot with nothing to follow, which is the entire failure being fixed.
+
+`e = escape_scale * r^2` puts the resolution where the values are: about
+8 ms a code at a quarter-second escape, 15 ms at one second, coarsening to
+120 ms out at the far end where the number only has to mean "a long way".
+On the robot it is one multiply.
+
+Derived from `cap` alone, so it is fixed before the first target is written
+and every table on a card shares it.
+"""
+escape_scale_for(dtype::AbstractString, cap::Real) =
+    escape_codes(dtype) <= 1 ? 0.0 :
+    Float64(cap) / (escape_codes(dtype) - 1)^2
 
 """
 Encode seconds into the chosen on-card representation.
 
 A cell still sitting at `cap` was never reached, and becomes the dtype's
-unreachable sentinel. Anything that saturates the integer range becomes the
-sentinel too -- from the robot's point of view "longer than this table can
+unreachable sentinel. Anything that saturates the representable range becomes
+the sentinel too -- from the robot's point of view "longer than this table can
 express" and "no route" are the same instruction: don't go there.
+
+A cell holding a **negative** value is one the escape pass filled in: no route,
+but `-v` seconds to somewhere that has one. Those go into the escape band, and
+stay unreachable. See `DTYPES` and `EscapeView`.
 """
 function encode(V::AbstractVector{Float32}, dtype::String, scale::Float64,
-                cap::Float32)
+                cap::Float32, escape_scale::Float64 = 0.0)
     buf = Vector{UInt8}(undef, length(V) * DTYPES[dtype].bytes)
     encode_into!(buf, V, Int64(firstindex(V)), Int64(lastindex(V)), dtype,
-                 scale, cap)
+                 scale, cap, escape_scale)
     buf
 end
 
 """
 Encode `V[lo:hi]` into the front of `buf`, and count how many of those cells
-were reached.
+were reached and how many carry an escape.
 
 The range form is what lets a table be written without ever holding it, or
 its encoding, in memory at once: a full-scale grid is tens of gigabytes per
 target, so `encode` allocating a second copy of it is not a detail. The
 counting rides along because the alternative is a second pass over the same
-tens of gigabytes to learn one number.
+tens of gigabytes to learn two numbers.
+
+`reached` counts only cells with a real route, unchanged by any of this: an
+escape cell is still unreachable, so `reached_frac` means exactly what it
+meant before and is still comparable across runs.
+
+The order of the tests matters. **Escape is checked first**, because a
+negative value is also a value below `cap` and would otherwise be encoded as
+a very fast real route -- the worst possible failure, an obstacle that looks
+like the best move on the board. And a real value that would land *in* the
+escape band saturates to the sentinel rather than wrapping into it, for the
+same reason: better no answer than a wrong kind of answer. With the default
+`u16` and a 60 s `value_cap` that band starts 4.5 s above anything the solver
+can produce, so this is a guard rather than a routine path.
 """
 function encode_into!(buf::Vector{UInt8}, V::AbstractVector{Float32},
                       lo::Int64, hi::Int64, dtype::String, scale::Float64,
-                      cap::Float32)
+                      cap::Float32, escape_scale::Float64 = 0.0)
+    # A negative escape time is nonsense and a non-finite one cannot be
+    # encoded, so only finite negatives count as an escape; anything else
+    # falls through to the unreachable test below.
+    isesc(v) = v < 0.0f0 && isfinite(v)
     unreached(v) = v >= cap || isinf(v) || isnan(v)
+    # With no band -- `escape` off, or a dtype that has none -- the saturation
+    # threshold is the sentinel, exactly as it was before the band existed. A
+    # run with `escape: false` therefore encodes bit for bit as it always did,
+    # including the top of the value range, rather than quietly losing the
+    # codes a band it is not using would have taken.
+    hasband = escape_scale > 0.0 && DTYPES[dtype].escape_base != 0
+    ebase = hasband ? UInt32(DTYPES[dtype].escape_base) :
+            (dtype == "u8" ? UInt32(0xff) : UInt32(0xffff))
+    ecodes = UInt32(max(escape_codes(dtype), 1))
+    # Codes are `r^2 * escape_scale` seconds, so the code for a time is the
+    # square root. Guarded against a zero coefficient, which is what a dtype
+    # with no band reports.
+    einv = escape_scale > 0.0 ? 1.0 / escape_scale : 0.0
+    ecode(e) = ebase + min(round(UInt32, sqrt(max(Float64(e), 0.0) * einv)),
+                           ecodes - UInt32(1))
     n = hi - lo + 1
     reached = 0
+    escaped = 0
     if dtype == "f32"
         out = reinterpret(Float32, view(buf, 1:4n))
         @inbounds for i in 1:n
             v = V[lo + i - 1]
-            u = unreached(v)
-            reached += !u
+            e = isesc(v)
+            u = !e && unreached(v)
+            reached += !e & !u
+            escaped += e
+            # The sign is the flag: `-v` seconds to get out. No band and no
+            # requantisation, so a float table carries the escape at the full
+            # precision the pass computed it to.
             out[i] = u ? NaN32 : v
         end
     elseif dtype == "f16"
         out = reinterpret(Float16, view(buf, 1:2n))
         @inbounds for i in 1:n
             v = V[lo + i - 1]
-            u = unreached(v)
-            reached += !u
+            e = isesc(v)
+            u = !e && unreached(v)
+            reached += !e & !u
+            escaped += e
             out[i] = u ? Float16(NaN) : Float16(v)
         end
     elseif dtype == "u16"
         out = reinterpret(UInt16, view(buf, 1:2n))
         @inbounds for i in 1:n
             v = V[lo + i - 1]
-            u = unreached(v)
-            reached += !u
-            r = u ? 0xffff : round(UInt32, v / scale)
-            out[i] = r >= 0xffff ? 0xffff : UInt16(r)
+            if isesc(v)
+                escaped += 1
+                out[i] = UInt16(ecode(-v))
+            elseif unreached(v)
+                out[i] = 0xffff
+            else
+                reached += 1
+                r = round(UInt32, v / scale)
+                out[i] = r >= ebase ? 0xffff : UInt16(r)
+            end
         end
     elseif dtype == "u8"
         @inbounds for i in 1:n
             v = V[lo + i - 1]
-            u = unreached(v)
-            reached += !u
-            r = u ? 0xff : round(UInt32, v / scale)
-            buf[i] = r >= 0xff ? 0xff : UInt8(r)
+            if isesc(v)
+                escaped += 1
+                buf[i] = UInt8(ecode(-v))
+            elseif unreached(v)
+                buf[i] = 0xff
+            else
+                reached += 1
+                r = round(UInt32, v / scale)
+                buf[i] = r >= ebase ? 0xff : UInt8(r)
+            end
         end
     else
         error("unknown dtype '$dtype'")
     end
-    reached
+    (reached, escaped)
 end
 
 """
@@ -657,7 +787,7 @@ and a mask rather than a division. See docs/TABLE_FORMAT.md.
 """
 function write_table(dir::AbstractString, target_index::Int, V,
                      dtype::String, scale::Float64, chunk_elements::Int,
-                     cap::Float32)
+                     cap::Float32, escape_scale::Float64 = 0.0)
     eb = DTYPES[dtype].bytes
     mkpath(dir)
     cells = table_cells(V)
@@ -671,6 +801,7 @@ function write_table(dir::AbstractString, target_index::Int, V,
     buf = Vector{UInt8}(undef, chunk_elements * eb)
     ctx = SHA.SHA256_CTX()
     reached = Int64(0)
+    escaped = Int64(0)
     total = Int64(0)
     for ci in 0:nchunks-1
         lo = Int64(ci) * Int64(chunk_elements) + 1
@@ -678,7 +809,10 @@ function write_table(dir::AbstractString, target_index::Int, V,
         n = hi - lo + 1
         table_chunk!(vals, V, lo, n)
         nb = Int(n * eb)
-        reached += encode_into!(buf, vals, Int64(1), n, dtype, scale, cap)
+        r, e = encode_into!(buf, vals, Int64(1), n, dtype, scale, cap,
+                            escape_scale)
+        reached += r
+        escaped += e
         part = view(buf, 1:nb)
         name = @sprintf("T%02dC%04d.BIN", target_index, ci)
         open(joinpath(dir, name), "w") do io
@@ -688,7 +822,7 @@ function write_table(dir::AbstractString, target_index::Int, V,
         total += nb
     end
     (nchunks = nchunks, bytes = total, sha256 = bytes2hex(SHA.digest!(ctx)),
-     reached = reached, cells = cells)
+     reached = reached, escaped = escaped, cells = cells)
 end
 
 """

@@ -61,14 +61,20 @@ class Card:
         self.chunk_elements = e["chunk_elements"]
         self.chunk_shift = e["chunk_shift"]
         self.unreachable = e["unreachable"]
+        # The escape band. Absent, or zero codes, means a card solved before
+        # this existed or with `escape` off -- every unreachable cell is then
+        # simply unreachable, which is what the old decode already did.
+        self.escape_base = e.get("escape_base", 0) or 0
+        self.escape_codes = e.get("escape_codes", 0) or 0
+        self.escape_scale = e.get("escape_scale", 0.0) or 0.0
         self._fh: dict[tuple[int, int], object] = {}
 
     def flat_index(self, ix, iy, ih, ivx, ivy, iw) -> int:
         n = self.n
         return ((((ix * n[1] + iy) * n[2] + ih) * n[3] + ivx) * n[4] + ivy) * n[5] + iw
 
-    def cell(self, target: int, subs) -> float:
-        """Seconds to go, or inf. Exactly the robot's two-shift lookup."""
+    def raw(self, target: int, subs):
+        """The stored code for one cell, undecoded."""
         idx = self.flat_index(*subs)
         chunk = idx >> self.chunk_shift
         offset = (idx & (self.chunk_elements - 1)) * self.elem_bytes
@@ -79,12 +85,47 @@ class Card:
             self._fh[key] = open(path, "rb")
         fh = self._fh[key]
         fh.seek(offset)
-        raw = fh.read(self.elem_bytes)
+        buf = fh.read(self.elem_bytes)
         fmt, _ = DTYPE[self.dtype]
-        val = struct.unpack(fmt, raw)[0]
+        return struct.unpack(fmt, buf)[0]
+
+    def cell(self, target: int, subs) -> float:
+        """
+        Seconds to go, or inf. Exactly the robot's two-shift lookup.
+
+        An escape cell is unreachable and returns inf from here, deliberately:
+        this is the number every routing decision compares, and an escape time
+        must never win one. Read `escape` for the other half.
+        """
+        val = self.raw(target, subs)
         if self.dtype in ("u8", "u16"):
-            return math.inf if val == self.unreachable else val * self.scale
-        return math.inf if math.isnan(val) else float(val)
+            if val == self.unreachable:
+                return math.inf
+            if self.escape_codes and val >= self.escape_base:
+                return math.inf
+            return val * self.scale
+        if math.isnan(val) or val < 0:
+            return math.inf
+        return float(val)
+
+    def escape(self, target: int, subs):
+        """
+        Seconds to reach a state that has a route, for a cell that has none;
+        `None` if this cell is reachable or has no way out either.
+
+        Only for a robot that is already stuck. Section 6 of TABLE_FORMAT.md.
+        """
+        val = self.raw(target, subs)
+        if self.dtype in ("u8", "u16"):
+            if not self.escape_codes or val == self.unreachable:
+                return None
+            if val < self.escape_base:
+                return None
+            r = val - self.escape_base
+            return self.escape_scale * r * r
+        if math.isnan(val) or val >= 0:
+            return None
+        return -float(val)
 
     def nearest_subs(self, state):
         out = []
@@ -99,6 +140,91 @@ class Card:
     def close(self):
         for fh in self._fh.values():
             fh.close()
+
+
+def check_escape(card: "Card", m: dict, fails: list, warns: list) -> None:
+    """
+    Validate the escape band: the codes that mean "unreachable, but here is
+    the way out".
+
+    Checked from the manifest and the bytes, not from anything the solver
+    says it did, because the point of this file is to test the contract.
+    """
+    e = m["encoding"]
+    base = e.get("escape_base", 0) or 0
+    codes = e.get("escape_codes", 0) or 0
+    esc_scale = e.get("escape_scale", 0.0) or 0.0
+    on = bool((m.get("solver") or {}).get("escape"))
+    isfloat = card.dtype in ("f16", "f32")
+    print()
+    # A float dtype carries the escape in the sign and has no band, so
+    # `escape_codes` is legitimately 0 there and says nothing about whether
+    # the pass ran. Keyed off dtype rather than off the band for that reason.
+    if not on or (not codes and not isfloat):
+        print("  escape band: none (table has no escape values)")
+        return
+
+    if isfloat:
+        print(f"  escape: sign-encoded ({card.dtype} carries -seconds, "
+              "no band)")
+    else:
+        top = esc_scale * (codes - 1) ** 2
+        print(f"  escape band: {codes} codes from {base}, "
+              f"{esc_scale:.3e} s/code^2, spanning 0..{top:.2f} s")
+
+    if card.dtype in ("u8", "u16"):
+        top = esc_scale * (codes - 1) ** 2
+        # The band must sit strictly above every code a real time can use, or
+        # a route and an escape are the same bits and the robot cannot tell
+        # which it is holding.
+        if base <= 0 or base >= card.unreachable:
+            fails.append(f"escape_base {base} is not inside the code range "
+                         f"below the unreachable sentinel {card.unreachable}")
+        if base + codes != card.unreachable:
+            fails.append(
+                f"escape band does not stop at the sentinel: "
+                f"escape_base {base} + escape_codes {codes} = {base + codes}, "
+                f"expected {card.unreachable}")
+        # The band has to reach as far as a value can, or escape times get
+        # silently clipped at the top of it.
+        cap = ((m.get("solver") or {}).get("value_cap_s"))
+        if isinstance(cap, (int, float)) and top < cap - 1e-6:
+            warns.append(f"escape band tops out at {top:.2f} s but value_cap "
+                         f"is {cap} s, so long escapes saturate")
+    if not isfloat and esc_scale <= 0:
+        fails.append("escape band is declared but escape_scale is not positive")
+
+    # An escape cell must still read as unreachable. That is the property the
+    # whole design rests on: the robot compares `cell` and must never be able
+    # to prefer a state inside an obstacle.
+    fr = m["targets"][0].get("escape_frac")
+    if fr is not None:
+        print(f"    target 0: {fr * 100:.2f}% of cells carry an escape "
+              f"({m['targets'][0].get('escape_of_unreached_frac', 0) * 100:.1f}%"
+              " of those with no route)")
+
+    # Walk a line of states and confirm the two decodes are exclusive
+    # everywhere: a cell has a finite time, or an escape, never both.
+    st = list(m["targets"][0]["state"])
+    both = 0
+    seen = 0
+    for d in range(0, 200, 7):
+        s = list(st)
+        s[0] = min(s[0] + d, m["grid"]["max"][0])
+        subs = card.nearest_subs(s)
+        v = card.cell(0, subs)
+        x = card.escape(0, subs)
+        if x is not None:
+            seen += 1
+            if math.isfinite(v):
+                both += 1
+            if x < 0:
+                fails.append("an escape time decoded negative")
+    if both:
+        fails.append(f"{both} cells decode as both reachable and escapable; "
+                     "the escape band overlaps the value range")
+    print(f"    probed {len(range(0, 200, 7))} states, {seen} with an escape, "
+          f"{both} inconsistent")
 
 
 def check_model(root: str, fails: list, warns: list) -> None:
@@ -326,6 +452,8 @@ def main(root: str) -> int:
     else:
         warns.append("velocity-frame check skipped; the probe state is "
                      "unreachable (obstacle, or too coarse a grid)")
+
+    check_escape(card, m, fails, warns)
 
     card.close()
 

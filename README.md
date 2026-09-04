@@ -188,6 +188,27 @@ where the accuracy actually comes from:
   24% fewer cells for exactly the same set of legal states. `MANIFEST.JSON`
   reports the stored span under `grid.min`/`grid.max` and the field it was cut
   from under `grid.field_bounds`.
+- **An unreachable cell now carries the way out of it.** `unreachable` is the
+  right answer right up until the robot *is* there — shoved into an obstacle,
+  or a footprint-width from a wall at a heading that does not fit. It then
+  reads `unreachable` in every direction, has no gradient to descend, and
+  stops. So after each target converges, a second short pass fills those cells
+  with the time to reach the nearest state that *does* have a route, and the
+  robot descends that until the table starts answering normally again.
+
+  They are still unreachable, and must still lose every comparison against a
+  real route — the escape time is only for a robot already stuck. It rides in
+  the codes above the value range (`escape_base` and up, or a negative value
+  for a float dtype), so **the tables are exactly the same size**, and firmware
+  that has not been updated reads an escape cell as a finite time worse than
+  every real route and behaves as it always did. §6.1 of
+  `docs/TABLE_FORMAT.md` is the decode; `escape: false` turns the pass off.
+
+  It only ever writes cells that were going to be `unreachable`, so it cannot
+  make a table worse — the self-test holds every reachable cell bit-identical
+  across it. It will not route through a wall either: a cell in free space may
+  not escape *into* an obstacle, only a cell already inside one may move
+  through obstacle space to leave it.
 
 **A grid too big for the card is solved a tile at a time.** At full
 resolution the value function runs to tens of gigabytes, well past any

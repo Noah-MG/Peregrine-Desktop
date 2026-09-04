@@ -70,6 +70,10 @@ Nothing else belongs on the card.
     "scale": 0.001,
     "unit": "seconds",
     "unreachable": 65535,
+    "escape_base": 64512,
+    "escape_codes": 1023,
+    "escape_scale": 5.7448e-05,
+    "escape_unit": "seconds",
     "byte_order": "little",
     "order": "row_major_c",
     "chunk_elements": 8388608,
@@ -85,7 +89,9 @@ Nothing else belongs on the card.
       "n_chunks": 14,
       "bytes": 223144896,
       "sha256": "...",
-      "reached_frac": 0.88
+      "reached_frac": 0.88,
+      "escape_frac": 0.09,
+      "escape_of_unreached_frac": 0.75
     }
   ]
 }
@@ -106,6 +112,9 @@ Every name used in the rest of this document comes from that file:
 | `dtype` | `encoding.dtype` | how to decode those bytes |
 | `scale` | `encoding.scale` | seconds per raw unit, integer types only |
 | `unreachable` | `encoding.unreachable` | the "no route" sentinel |
+| `escape_base` | `encoding.escape_base` | first raw code of the escape band (§6.1) |
+| `escape_codes` | `encoding.escape_codes` | how many codes the band has; 0 = no band |
+| `escape_scale` | `encoding.escape_scale` | escape seconds per code squared |
 | `chunk_elements` | `encoding.chunk_elements` | values per chunk file, a power of two |
 | `chunk_shift` | `encoding.chunk_shift` | `log2(chunk_elements)` |
 
@@ -138,8 +147,12 @@ Three fields are informational rather than needed for lookup:
 `sha256` covers the concatenated logical table in index order, so it does not
 change if the chunking does; `reached_frac` is the fraction of cells that got
 a real answer, and a low value warns that much of the state space could not
-reach that target; `regression_sha256` and `field_sha256` identify which
-drivetrain fit and field description produced the tables.
+reach that target; `escape_frac` is the fraction carrying an escape (§6.1) and
+`escape_of_unreached_frac` the share of the cells *without* a route that got
+one, which is the number that says whether the escape pass did its job —
+`escape_frac` on its own falls simply because a table got better;
+`regression_sha256` and `field_sha256` identify which drivetrain fit and field
+description produced the tables.
 
 Everything under `solver` is informational too, and the robot reads none of
 it. `solver.driver` says whether the table came from a whole-grid solve or a
@@ -269,12 +282,18 @@ to `dtype`:
 Before scaling, check for the sentinel:
 
 ```
-integer dtypes:   raw == unreachable   ->  +infinity
+integer dtypes:   raw >= escape_base   ->  +infinity      (see 6.1)
+                  raw == unreachable   ->  +infinity
 float dtypes:     isnan(raw)           ->  +infinity
+                  raw < 0              ->  +infinity      (see 6.1)
 ```
 
 Integers compare exactly, so `==` is safe there. Floats need `isnan`, because
 `NaN == NaN` is false by definition and an equality test would never fire.
+
+When `escape_codes` is 0 the band is absent and the two `escape` lines can be
+dropped; a card solved with `escape` turned off, or written before 2026-09-04,
+has no band and decodes exactly as it used to.
 
 Unreachable must be treated as `+infinity`, not as a large finite number, so
 it loses every comparison against a real route. It covers three situations —
@@ -283,14 +302,64 @@ a state outside the solved envelope, or no route found within the solved
 horizon — which are deliberately not distinguished, since all three mean the
 same thing to the robot.
 
+### 6.1 The escape band — unreachable, with a way out
+
+An unreachable cell says "don't go there", which is the right answer right up
+until the robot **is** there. Shoved into an obstacle by a collision, or a
+footprint-width from a wall at a heading that does not fit, it reads
+`unreachable` in every direction and has no gradient to descend. It stops.
+
+So an unreachable cell can now also carry the **time to get out**: the
+shortest time from it to a state that does have a real route. Decode:
+
+```
+integer dtypes:   raw >= escape_base && raw != unreachable
+                      ->  escape_seconds = escape_scale * (raw - escape_base)^2
+
+float dtypes:     raw < 0 && !isnan(raw)
+                      ->  escape_seconds = -raw
+```
+
+`raw == unreachable` (and `NaN`) still means no route **and** no way out.
+
+**These cells are still unreachable.** `escape_seconds` is not a time-to-go
+and must never be compared against one, or fed to anything choosing where to
+drive. It is only for a robot that has already found itself with no reachable
+state anywhere nearby: descend `escape_seconds` until a cell decodes to a
+finite time, then use the table normally. Two separate reads, two separate
+uses — which is why §6 above returns `+infinity` for these and this section is
+a second lookup rather than a different answer from the first.
+
+**Why the band is square-law.** It has to span zero to `solver.value_cap_s`
+— 60 s by default — in 1023 codes, and splitting that evenly would be 59 ms a
+code. The gradient the robot descends is the difference between neighbouring
+cells inside an obstacle, which at full resolution is tens of milliseconds, so
+a linear band would flatten it into a plateau with nothing to follow. Squaring
+puts the resolution where the values are: about 8 ms a code at a quarter-second
+escape, 15 ms at one second, coarsening to 120 ms at the far end where the
+number only has to mean "a long way". On the robot it is one multiply.
+
+**Why a band at the top rather than a flag bit.** A flag bit would halve the
+range, stopping real routes at 32.767 s — well inside the 60 s `value_cap`, so
+they would start clipping. Codes above `value_cap / scale` are unreachable by
+construction and cost nothing to take.
+
+**Reading a new card with old firmware is safe.** Skip 6.1 entirely and an
+escape cell decodes as a finite 64.5–65.5 s. `value_cap` guarantees every real
+route is under 60 s, so it loses every comparison anyway and the robot behaves
+exactly as it did before — it just doesn't get the recovery. The band is
+additive; it is not a flag day.
+
 The wall case is worth calling out because it is new as of 2026-08-31 and it
 is common: cells within roughly a footprint of the table edge are unreachable
 at the headings whose chassis would not fit there, and reachable at the
 headings whose would. A robot that finds `unreachable` while hugging a wall
-is being told to turn, not that the table is broken.
+is being told to turn, not that the table is broken — and §6.1 now tells it
+which way, since those cells carry an escape.
 
 The default `u16` with `scale = 0.001` is plain milliseconds: exact to 1 ms up
-to 65.534 s, in half the space of `f32`. `f16` is the same size but carries
+to 64.511 s — the escape band takes the codes above that — in half the space
+of `f32`. `f16` is the same size but carries
 only about three significant digits, so prefer `u16` unless you specifically
 want floats. `u8` with `scale = 0.025` gives 25 ms steps up to 6.35 s in one
 byte, which is worth it when the horizon is short and the grid is large.
@@ -345,8 +414,16 @@ elem_in_chunk = 28035145 & 8388607  = 2869321
 byte_offset   = 2869321 * 2         = 5738642
 ```
 
-**Decode** (§6): read 2 bytes little-endian at 5738642. If they read `65535`,
-the state is unreachable; otherwise the answer is `raw * 0.001` seconds.
+**Decode** (§6): read 2 bytes little-endian at 5738642.
+
+```
+raw <  64512   ->  reachable, raw * 0.001 seconds
+raw >= 64512   ->  unreachable; and if raw != 65535 it also carries
+                   5.7448e-05 * (raw - 64512)^2 seconds to get out (§6.1)
+```
+
+So `12345` is 12.345 s to go; `64612` is unreachable with a 0.57 s escape;
+`65535` is unreachable with no way out.
 
 ---
 
@@ -686,6 +763,12 @@ solver happened to write. It checks chunk counts and sizes, SHA-256, FAT32
 file limits, that the value at each target is approximately zero, that
 time-to-go grows with distance, and that the velocity axes behave as field
 frame.
+
+For the escape band (§6.1) it checks that the band stops exactly at the
+sentinel, that it spans as far as `value_cap_s`, and — the property the whole
+design rests on — that **no cell decodes as both reachable and escapable**. A
+card where those two overlap is one where the robot cannot tell a route from
+an obstacle, so that check is a failure and not a warning.
 
 Change anything here and `verify_tables.py` needs the same change, and the
 robot side will too.

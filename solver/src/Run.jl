@@ -481,7 +481,19 @@ function runtime_estimate(cfg, g::Grid6, dec, iters::Int, ntargets::Int)
     rate = Float64(getc(cfg, "cell_rate", 23.4e6))
     disk = Float64(getc(cfg, "disk_rate", 500e6))
     cells = Float64(ncells(g))
-    out = Dict{String,Any}("cell_rate" => rate, "assumes_full_budget" => true)
+    # The escape pass is more sweeps over the same grid, so it is priced as
+    # more sweeps. That is a ceiling for a third reason on top of the two
+    # below: a sweep of it costs a full backup only on the cells with no
+    # route, and every cell that has one is a load and a retire. On a table
+    # that reaches most of its states the pass is far cheaper than this makes
+    # it look, but quoting the cheap number would be quoting an assumption
+    # about `reached_frac` that is not known until the run is over.
+    esc_iters = Bool(getc(cfg, "escape", true)) ?
+                Int(getc(cfg, "escape_iterations", 60)) : 0
+    solve_iters = iters
+    iters += esc_iters
+    out = Dict{String,Any}("cell_rate" => rate, "assumes_full_budget" => true,
+                           "escape_sweeps" => esc_iters)
     # Nothing fits, so there is no run to time. Saying "sweep" here would
     # quote the in-core cost of a solve that cannot start.
     dec.mode == :ooc && dec.tp === nothing &&
@@ -495,7 +507,12 @@ function runtime_estimate(cfg, g::Grid6, dec, iters::Int, ntargets::Int)
         return out
     end
     ts = Int(getc(cfg, "tile_sweeps", 4))
-    rounds = max(1, cld(iters, ts))
+    # The two passes round up to whole rounds separately, because that is how
+    # they run: the escape pass starts its own round count rather than
+    # continuing the solve's.
+    esc_rounds = esc_iters > 0 ? max(1, cld(esc_iters, ts)) : 0
+    rounds = max(1, cld(solve_iters, ts)) + esc_rounds
+    out["escape_rounds"] = esc_rounds
     sb = Float64(cell_bytes(Bool(getc(cfg, "warm_start_tiled", true))))
     pf, pfb, pfwhy = prefetch_plan(cfg, dec, Bool(getc(cfg, "warm_start_tiled", true)))
     r = round_seconds(cells, ts, dec.tp.amplification, sb, rate, disk;
@@ -1019,6 +1036,62 @@ function solve_value!(V, occ, g::Grid6, m::Model, tidx, ctl, nctl, p::Params;
 end
 
 """
+Fill in the cells the main solve could not reach, with the time to get out of
+them.
+
+Run immediately after `solve_value!` on the same `V`, for the same target,
+before the table is written. Every cell with a real route is the terminal set
+and is left exactly as it is; every other cell -- inside an obstacle, inside
+the wall inset at that heading, or simply never reached within the horizon --
+is given the shortest time to reach one of them, stored negated. See
+`EscapeView` for the convention and why it is in the sign bit.
+
+**There is no seeding step and no `fill!`.** The converged table *is* the
+initial condition: the terminal set is already there, and the escape cells are
+already at `cap`, which is what "no way out yet" means. That is also why this
+is cheap -- it starts from the answer rather than from nothing.
+
+**It cannot damage the table it is given.** The only write is to a cell that
+failed `is_terminal`, so a cell with a real route is never touched, and a cell
+that this pass fails to reach keeps the `cap` it already had and encodes as
+`unreachable` exactly as it does today. Running it can add information and
+cannot remove any, which is why it is on by default.
+
+`iters` is normally far smaller than the main solve's: escape distances are
+short -- a few cells to the edge of an obstacle -- so the front converges in
+tens of sweeps rather than hundreds. Cells that do not converge in the budget
+simply stay `unreachable`.
+"""
+function solve_escape!(V, occ, g::Grid6, m::Model, ctl, nctl, p::Params;
+                       iters::Int, tol::Float64, use_gpu::Bool, total = nothing,
+                       on_progress = nothing)
+    # Same rule as `solve_value!`, and for the same reason: with a rotating
+    # slice of the control lattice, one quiet sweep only proves that *this*
+    # slice helps nobody.
+    quiet_needed = p.ncoarse <= Int32(0) ? 1 :
+                   max(1, cld(Int(nctl) - 1, Int(p.ncoarse)))
+
+    last_delta = Inf
+    done_iters = 0
+    quiet = 0
+    for it in 1:iters
+        d = use_gpu ?
+            sweep_escape_gpu!(V, occ, g, m, ctl, nctl, p, it - 1, total;
+                              rev = isodd(it)) :
+            sweep_escape_cpu!(V, occ, g, m, ctl, nctl, p, it - 1;
+                              rev = isodd(it))
+        done_iters = it
+        last_delta = d
+        quiet = d <= tol ? quiet + 1 : 0
+        if on_progress !== nothing && (it % 5 == 0 || it == 1 || quiet >= quiet_needed)
+            on_progress(it, d)
+        end
+        quiet >= quiet_needed && break
+    end
+    (done_iters, last_delta)
+end
+
+"""
 Solve every target and write the card image.
 
 Tables are written into `out_dir/TABLES`, and the manifest to
@@ -1066,8 +1139,35 @@ function run_solve(cfg::AbstractDict)
     tau_max = sp.tau_max; hmax = sp.hmax; achecks = sp.achecks
     rk2 = sp.rk2; vclamp = sp.vclamp; simplex = sp.simplex
 
+    # The escape pass, and the band on the card that carries what it finds.
+    #
+    # On by default: it only ever writes cells that came out `unreachable`, so
+    # the worst it can do is spend its budget and leave the table exactly as
+    # the solve left it. `escape_iterations` is small next to `iterations`
+    # because escape distances are a few cells, not a field.
+    do_escape = Bool(getc(cfg, "escape", true))
+    esc_iters = Int(getc(cfg, "escape_iterations", 60))
+    esc_tol = Float64(getc(cfg, "escape_tolerance", tol))
+    escape_scale = do_escape ? escape_scale_for(dtype, cap) : 0.0
+    ebase = Int(DTYPES[dtype].escape_base)
+    # The band sits above every code a real value can produce. If the run has
+    # been configured so that it does not, real routes would saturate into the
+    # sentinel and the table would lose the top of its range silently -- so
+    # refuse instead, and name the two numbers that have to move.
+    if do_escape && ebase > 0 && Float64(cap) / scale >= ebase
+        error("value_cap $(cap) s at scale $(scale) needs codes up to " *
+              "$(round(Int, Float64(cap) / scale)), which runs into the " *
+              "escape band at $ebase. Lower value_cap below " *
+              "$(round(ebase * scale, digits = 2)) s, use a coarser scale, " *
+              "or set escape to false")
+    end
+    do_escape && escape_scale <= 0.0 && dtype in ("u8", "u16") &&
+        error("dtype '$dtype' has no escape band configured")
+
     progress(phase = "setup", cells = cells, n = collect(Int.(g.n)),
              controls = nctl, dtype = dtype,
+             escape = do_escape, escape_scale = escape_scale,
+             escape_base = ebase, escape_codes = escape_codes(dtype),
              bytes_per_target = cells * DTYPES[dtype].bytes,
              n_targets = length(names))
 
@@ -1302,6 +1402,37 @@ function run_solve(cfg::AbstractDict)
                 end)
         end
 
+        # Fill in the cells that solve could not reach, with the time to get
+        # out of them. This runs on the converged table, in place, and only
+        # ever writes cells that were going to be `unreachable` anyway -- so
+        # it is strictly additive and a budget that runs out costs nothing
+        # but the sweeps. See `solve_escape!`.
+        esc_iters_done = 0
+        esc_delta = 0.0
+        if do_escape
+            te = time()
+            if ooc
+                esc_iters_done, esc_delta = solve_escape_ooc!(
+                    store, occ, g, m, ctl, nctl, p, dec.tp;
+                    rounds = max(1, cld(esc_iters, tile_sweeps)), tol = esc_tol,
+                    tile_sweeps = tile_sweeps, prefetch = do_prefetch,
+                    on_progress = (rd, d) ->
+                        progress(phase = "escape", target = ti - 1,
+                                 target_name = names[ti], iter = rd,
+                                 iters = max(1, cld(esc_iters, tile_sweeps)),
+                                 delta = d, elapsed_s = time() - te))
+            else
+                esc_iters_done, esc_delta = solve_escape!(
+                    V, occ, g, m, ctl, nctl, p; iters = esc_iters,
+                    tol = esc_tol, use_gpu = use_gpu, total = total,
+                    on_progress = (it, d) ->
+                        progress(phase = "escape", target = ti - 1,
+                                 target_name = names[ti], iter = it,
+                                 iters = esc_iters, delta = d,
+                                 elapsed_s = time() - te))
+            end
+        end
+
         # The table is encoded straight out of whatever holds V -- device
         # array, host array or the memory-mapped store -- one chunk at a time.
         # Materialising it first would mean a second full-size copy, which at
@@ -1311,8 +1442,14 @@ function run_solve(cfg::AbstractDict)
                  iters_done = done_iters, delta = last_delta)
 
         info = write_table(tables_dir, ti - 1, Vout, dtype, scale,
-                           chunk_elements, cap)
+                           chunk_elements, cap, escape_scale)
         reached_frac = info.reached / info.cells
+        escape_frac = info.escaped / info.cells
+        # Of the cells with no route, the share that now has a way out. This
+        # is the number that says whether the pass did its job -- `escape_frac`
+        # alone falls just because a table got better.
+        dead = info.cells - info.reached
+        escape_of_unreached = dead > 0 ? info.escaped / dead : 0.0
         push!(entries, Dict(
             "index" => ti - 1,
             "name" => names[ti],
@@ -1324,10 +1461,16 @@ function run_solve(cfg::AbstractDict)
             "iterations" => done_iters,
             "final_delta" => last_delta,
             "reached_frac" => reached_frac,
+            "escape_frac" => escape_frac,
+            "escape_of_unreached_frac" => escape_of_unreached,
+            "escape_iterations" => esc_iters_done,
+            "escape_final_delta" => esc_delta,
         ))
         progress(phase = "target_done", target = ti - 1, target_name = names[ti],
                  chunks = info.nchunks, bytes = info.bytes,
-                 reached_frac = reached_frac, elapsed_s = time() - t0)
+                 reached_frac = reached_frac, escape_frac = escape_frac,
+                 escape_of_unreached_frac = escape_of_unreached,
+                 elapsed_s = time() - t0)
     end
     finally
         # The scratch file is the size of the value function -- tens of
@@ -1378,6 +1521,24 @@ function run_solve(cfg::AbstractDict)
             "unit" => "seconds",
             "unreachable" => dtype == "u8" ? 255 :
                              dtype == "u16" ? 65535 : "NaN",
+            # The escape band. A raw code at or above `escape_base` -- or, for
+            # a float dtype, any negative value -- is still unreachable, and
+            # additionally carries the time to reach a state that is not.
+            # Zero codes means the run was solved with `escape` off, and the
+            # table has none.
+            "escape_base" => do_escape ? ebase : 0,
+            "escape_codes" => do_escape ? escape_codes(dtype) : 0,
+            "escape_scale" => do_escape ? escape_scale : 0.0,
+            "escape_unit" => "seconds",
+            "escape_formula" => dtype in ("u8", "u16") ?
+                "raw >= escape_base -> unreachable, escape_seconds = " *
+                "escape_scale * (raw - escape_base)^2" :
+                "value < 0 -> unreachable, escape_seconds = -value",
+            "escape_note" => "an escape cell is UNREACHABLE and must lose " *
+                             "every comparison against a real route. The " *
+                             "escape time is only for a robot already in one " *
+                             "-- descend it to get out, then use the table " *
+                             "normally. See section 6 of TABLE_FORMAT.md",
             "byte_order" => "little",
             "order" => "row_major_c",
             "chunk_elements" => chunk_elements,
@@ -1389,6 +1550,8 @@ function run_solve(cfg::AbstractDict)
             "tolerance" => tol, "nearest" => nearest,
             "control_scan" => scan, "refine_rounds" => rounds,
             "refine_delta" => delta0, "warm_start" => warm,
+            "escape" => do_escape, "escape_iterations" => esc_iters,
+            "escape_tolerance" => esc_tol,
             "tau_levels" => ntau, "tau_ratio" => tau_ratio,
             "cfl" => cfl, "tau_min" => tau_min, "tau_max" => tau_max,
             # Derived per run unless pinned; see `settle`. Recorded because

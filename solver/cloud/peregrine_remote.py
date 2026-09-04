@@ -457,14 +457,21 @@ class ProgressReader:
             self.show((self.done_targets + within) / self.n_targets,
                       f"{ev['target_name']}  round {ev['round']}/{rounds}  "
                       f"tile {ev['tile']}/{ev['tiles']}")
+        elif ph == "escape":
+            self.show((self.done_targets + 1) / self.n_targets,
+                      f"{ev['target_name']}  escape "
+                      f"{ev['iter']}/{ev['iters']}")
         elif ph == "encode":
             self.show((self.done_targets + 1) / self.n_targets,
                       f"{ev['target_name']}  writing")
         elif ph == "target_done":
             self.done_targets += 1
+            esc = ev.get("escape_of_unreached_frac")
+            extra = ("" if not esc else
+                     f", {esc*100:.0f}% of the rest can escape")
             self.show(self.done_targets / self.n_targets,
                       f"{ev['target_name']} done "
-                      f"({ev['reached_frac']*100:.0f}% reachable)")
+                      f"({ev['reached_frac']*100:.0f}% reachable{extra})")
             if self.on_target_done is not None:
                 self.on_target_done(ev)
         elif ph == "done":

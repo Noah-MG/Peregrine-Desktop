@@ -361,6 +361,11 @@ solve runs its full iteration budget and writes a table that is `unreachable`
 everywhere, with a converged `delta` and nothing in the log to say why. It is
 much cheaper to hear about it in `plan`.
 
+The escape pass does not paper over this, which is worth knowing since it
+exists to put numbers in unreachable cells. Its terminal set is the cells with
+a real route, and a table that seeds nothing has none, so it escapes nothing
+and the symptom survives intact: `reached_frac` zero, `escape_frac` zero.
+
 The occupancy mask is the authority rather than a fresh geometry test,
 because it is what the solver will actually read -- including the union over
 substep angles, which is how a target legal at its own heading can still land
