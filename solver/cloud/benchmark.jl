@@ -1,13 +1,13 @@
 #!/usr/bin/env julia
 #
-# Measure what a machine is actually worth to this solver, in the two rates
-# `plan` estimates wall clocks from, plus what the prefetch buys on it.
+# Measure what a machine is actually worth to this solver -- what a cell
+# update costs it and what its disk does -- plus what the prefetch buys.
 #
 #   julia --project=solver -t auto solver/cloud/benchmark.jl [--seconds 30]
 #
 # Prints a JSON blob on the last line. Everything before it is commentary.
 #
-# Why this exists: `plan` costs a run from `cell_rate` and `disk_rate`, and
+# Why this exists: `plan` costs a run from `cell_cost` and `disk_rate`, and
 # both defaults are measurements of one 8 GB desktop card and one SATA SSD.
 # On any other machine the estimate is an extrapolation, and the whole point
 # of the estimate is to decide how long to rent for. Ten minutes here
@@ -15,14 +15,19 @@
 #
 # It needs no field, no targets and no regression: the model is the same
 # synthetic fit the self-test uses, so the answer is a property of the
-# machine rather than of a particular workspace.
+# machine rather than of a particular workspace. That last part is why the
+# answer is a cost *pair* rather than a cell rate -- see `measure_cell_cost`.
+# A rate is a property of a machine AND a workload, and quoting one measured
+# here against a workload solved there is what made an H200 job that took two
+# and a half hours get planned as an hour and a half.
 
 include(joinpath(@__DIR__, "..", "src", "PeregrineSolver.jl"))
 using .PeregrineSolver
 using .PeregrineSolver: Grid6, Params, Model, ncells, control_set, solve_value!,
                         solve_value_ooc!, target_cells, reach_extent,
                         halo_cells, tile_plan, open_store, open_policy_store,
-                        close_store!, _realistic, cell_bytes
+                        close_store!, _realistic, cell_bytes, sweep_work,
+                        effective_rate, REF_CELL_COST
 using CUDA, JSON3, Printf
 
 const WANT_S = let i = findfirst(==("--seconds"), ARGS)
@@ -46,7 +51,24 @@ function sized_grid(want::Float64)
              (350.0, 350.0, π, 150.0, 150.0, 7.0))
 end
 
-function make_case(g::Grid6)
+"""
+The solver parameters for one measurement point.
+
+The defaults are production's -- `cfl` 2, `tau_max` 0.5, three collision
+probes -- and NOT the short-step settings this file used to measure at. That
+was the bug the cost model exists to fix: a rate measured at `cfl` 1 /
+`tau_max` 0.2 and spent on a `cfl` 2 / `tau_max` 0.5 run under-quoted a real
+H200 job by 41%, because those settings buy a longer horizon and a longer
+horizon buys more integration substeps per lookahead.
+"""
+bench_params(; cfl = 2.0, tau_max = 0.5, checks = 3) =
+    Params(dt = 0.05f0, nsub = Int32(4), checks = Int32(checks),
+           adaptive_checks = true, cap = 60.0f0, ntau = Int32(5),
+           tau_ratio = 2.0f0, cfl = Float32(cfl), tau_min = 0.004f0,
+           tau_max = Float32(tau_max), hmax = 0.0125f0, ncoarse = Int32(8),
+           rounds = Int32(2), delta0 = 0.35f0, rk2 = true, simplex = true)
+
+function make_case(g::Grid6; p::Params = bench_params())
     m = _realistic()
     n = g.n
     occ = falses(Int(n[1]) * Int(n[2]) * Int(n[3]))
@@ -55,11 +77,6 @@ function make_case(g::Grid6)
     for i in lo:hi, j in 0:(Int(n[2]) - 1), k in 0:(Int(n[3]) - 1)
         occ[(i * Int(n[2]) + j) * Int(n[3]) + k + 1] = true
     end
-    p = Params(dt = 0.05f0, nsub = Int32(4), checks = Int32(2),
-               adaptive_checks = true, cap = 60.0f0, ntau = Int32(5),
-               tau_ratio = 2.0f0, cfl = 1.0f0, tau_min = 0.004f0,
-               tau_max = 0.2f0, hmax = 0.0125f0, ncoarse = Int32(8),
-               rounds = Int32(2), delta0 = 0.35f0, rk2 = true, simplex = true)
     ctl_t = control_set(4)
     nctl = length(ctl_t)
     ctl_h = Float32[getindex.(ctl_t, 1); getindex.(ctl_t, 2); getindex.(ctl_t, 3)]
@@ -70,47 +87,188 @@ function make_case(g::Grid6)
      seeds = seeds)
 end
 
-"""Cell updates a second, from a real in-core solve on a real grid."""
-function measure_cell_rate(free::Int64)
+"""
+Seconds a sweep of `g` takes on this card under `p`.
+
+`warmups` sweeps are thrown away first: they pay for compilation, for the
+first touch of every page, and for giving the warm-start policy something to
+be warm about -- a cell whose incumbent is still coast skips one of the
+lookaheads the cost model counts. `min_iters` bounds the timed run, which is
+what keeps a full-size grid from costing minutes for a number that needs
+seconds.
+"""
+function time_sweep(g::Grid6, p::Params, want_s::Float64;
+                    warmups::Int = 2, min_iters::Int = 3)
+    cells = ncells(g)
+    c = make_case(g; p = p)
+    V = CUDA.fill(p.cap, cells)
+    pol = CUDA.zeros(Int8, 3 * cells)   # the layout production allocates
+    docc = CuArray(c.occ); dctl = CuArray(c.ctl_h)
+    dseed = CuArray(c.seeds); total = CUDA.zeros(Float32, 1)
+    solve_value!(V, docc, g, c.m, dseed, dctl, c.nctl, p; iters = warmups,
+                 tol = 0.0, use_gpu = true, pol = pol, total = total)
+    CUDA.synchronize()
+    t1 = time()
+    solve_value!(V, docc, g, c.m, dseed, dctl, c.nctl, p; iters = 1,
+                 tol = 0.0, use_gpu = true, pol = pol, total = total)
+    CUDA.synchronize(); one_s = time() - t1
+    iters = clamp(round(Int, want_s / max(one_s, 1e-6)), min_iters, 200)
+    t0 = time()
+    solve_value!(V, docc, g, c.m, dseed, dctl, c.nctl, p; iters = iters,
+                 tol = 0.0, use_gpu = true, pol = pol, total = total)
+    CUDA.synchronize()
+    el = time() - t0
+    CUDA.unsafe_free!(V); CUDA.unsafe_free!(pol)
+    CUDA.unsafe_free!(docc); CUDA.unsafe_free!(dctl); CUDA.unsafe_free!(dseed)
+    blocked = count(c.occ) / length(c.occ)
+    (sweep_s = el / iters, sweeps = iters, seconds = el, cells = cells,
+     active = 1.0 - blocked,
+     work = sweep_work(g, c.m, p, c.nctl))
+end
+
+"""
+What a cell update costs here, as the two coefficients `plan` prices with.
+
+**Not one rate.** A cell update is a fixed number of lookaheads, but each one
+costs `substeps_for` RK2 substeps and a swept probe count that both come from
+the horizon `cfl_tau` derives from the grid and the model -- so the same card
+sweeping the same cells runs at very different rates depending on settings
+this file cannot know. Measuring one point and calling it "the" cell rate is
+what made a two-and-a-half hour H200 solve look like an hour and a half.
+
+So: sweep the same grid under several horizon regimes, and least-squares fit
+
+    seconds per active cell = a * lookaheads + b * (substeps + probes)
+
+against what `sweep_work` says each regime asks for. Two coefficients from
+five points; the residuals are reported so a bad fit is visible rather than
+silently shipped. `plan` then prices any grid, model and parameter set --
+including ones no benchmark regime resembled.
+
+The regimes are chosen to spread the per-cell cost about 3x, which is roughly
+the spread real configs cover, and to bracket production rather than sit at
+one end of it.
+"""
+function measure_cell_cost(free::Int64)
     # A quarter of what is free, at the 16 bytes an in-core cell costs (V plus
     # the Float32 warm-start policy). A quarter rather than all of it because
     # this is a rate measurement, not a capacity test, and a grid that only
     # just fits would measure the allocator.
     want = min(free * 0.25 / cell_bytes(true), 6.0e8)
     g = sized_grid(want)
-    cells = ncells(g)
-    c = make_case(g)
     note(@sprintf("grid %s = %d cells (%.2f GB in core)",
-                  string(Int.(g.n)), cells, cells * cell_bytes(true) / 2^30))
+                  string(Int.(g.n)), ncells(g), ncells(g) * cell_bytes(true) / 2^30))
 
-    V = CUDA.fill(c.p.cap, cells)
-    pol = CUDA.zeros(Int8, 3 * cells)   # the layout production allocates
-    docc = CuArray(c.occ); dctl = CuArray(c.ctl_h)
-    dseed = CuArray(c.seeds); total = CUDA.zeros(Float32, 1)
+    regimes = [("production   cfl 2   tau_max 0.5 ", bench_params()),
+               ("short step   cfl 1   tau_max 0.2 ", bench_params(cfl = 1.0, tau_max = 0.2)),
+               ("shortest     cfl 1   tau_max 0.05", bench_params(cfl = 1.0, tau_max = 0.05)),
+               ("long step    cfl 4   tau_max 0.5 ", bench_params(cfl = 4.0, tau_max = 0.5)),
+               ("mid          cfl 2   tau_max 0.15", bench_params(cfl = 2.0, tau_max = 0.15))]
+    # Split the time budget across the regimes rather than spending it all on
+    # one, so the whole fit costs what the single measurement used to.
+    each = max(WANT_S / length(regimes), 3.0)
+    pts = NamedTuple[]
+    for (name, p) in regimes
+        r = time_sweep(g, p, each)
+        ns = 1.0e9 * r.sweep_s / (r.cells * r.active)
+        note(@sprintf("%s  %6.3f s/sweep   %6.2f ns/cell   %5.1f substeps %5.1f probes",
+                      name, r.sweep_s, ns, r.work.substeps, r.work.probes))
+        push!(pts, (name = strip(name), p = p, r = r, ns = ns))
+    end
 
-    # One sweep to pay for compilation and the first-touch of every page.
-    solve_value!(V, docc, g, c.m, dseed, dctl, c.nctl, c.p; iters = 1,
-                 tol = 0.0, use_gpu = true, pol = pol, total = total)
-    CUDA.synchronize()
+    # Least squares on the two columns. Both are per *active* cell: a blocked
+    # cell returns before its first lookahead, and the benchmark's slab is a
+    # twentieth of the grid, so leaving it in would bias both coefficients low.
+    A = [pt.r.work.lookaheads for pt in pts]
+    B = [pt.r.work.substeps + pt.r.work.probes for pt in pts]
+    y = [pt.r.sweep_s / (pt.r.cells * pt.r.active) for pt in pts]
+    a, b = hcat(A, B) \ y
+    resid = [(A[i] * a + B[i] * b) / y[i] - 1 for i in eachindex(y)]
+    worst = maximum(abs, resid)
+    # A negative coefficient means the fit has gone through the points rather
+    # than along them -- too little spread, or a noisy box. The model is still
+    # usable with the fixed term dropped, and saying so beats shipping a
+    # coefficient that makes a bigger grid cost less.
+    if a < 0.0 || b <= 0.0
+        b = sum(y) / sum(B); a = 0.0
+        note("\033[1;33mfit degenerate -- falling back to a single per-step rate\033[0m")
+    end
+    note(@sprintf("shape: %.4f ns/lookahead + %.4f ns/step-unit  (worst residual %+.1f%%)",
+                  a * 1e9, b * 1e9, 100 * worst))
+    if worst > 0.15
+        note("\033[1;33mthat is a loose fit; estimates from it are rough\033[0m")
+    end
 
-    t1 = time(); solve_value!(V, docc, g, c.m, dseed, dctl, c.nctl, c.p;
-                              iters = 1, tol = 0.0, use_gpu = true,
-                              pol = pol, total = total)
-    CUDA.synchronize(); one_s = time() - t1
-    iters = clamp(round(Int, WANT_S / max(one_s, 1e-6)), 3, 200)
-    note(@sprintf("one sweep %.3f s -- timing %d more", one_s, iters))
+    # Second stage: one sweep of a grid the size people actually solve.
+    #
+    # The regimes above are swept on a quarter of free VRAM, which is small
+    # and fast and gives the fit the SHAPE it needs -- how cost moves with
+    # the horizon. It does not give the level. A cell update reads its
+    # successor's value through a 7-point simplex interpolation at a scattered
+    # address, so the cost per unit of work climbs as the value function
+    # outgrows the caches: measured +14% between a 73M-cell grid and a
+    # 731M-cell one on an 8 GB card, still climbing at the top. Extrapolating
+    # a quarter-VRAM measurement to a grid four times the size is the second
+    # reason the H200 estimate came in low, after the workload itself.
+    #
+    # So: predict this big sweep from the shape, measure it, and scale both
+    # coefficients by the ratio. One sweep, at the settings production uses.
+    # Sized to the biggest grid this card can hold, capped near the biggest
+    # anyone solves. The cap matters on a large card: two thirds of an H200
+    # is fourteen billion cells, an order of magnitude past any table that
+    # fits the 8 GB size budget, and calibrating against a working set nobody
+    # will ever have would trade one extrapolation for another.
+    scale = 1.0
+    big = try
+        gb = sized_grid(min(free * 0.7 / cell_bytes(true), 2.0e9))
+        ncells(gb) > 1.3 * ncells(g) ?
+            time_sweep(gb, bench_params(), 0.0; warmups = 1, min_iters = 2) :
+            nothing
+    catch e
+        note("full-size check skipped: " * first(sprint(showerror, e), 120))
+        nothing
+    end
+    if big !== nothing
+        want_s = big.sweep_s
+        pred = (a * big.work.lookaheads +
+                b * (big.work.substeps + big.work.probes)) *
+               big.cells * big.active
+        scale = want_s / max(pred, 1.0e-9)
+        note(@sprintf("full size: %d cells, %.3f s/sweep against %.3f s predicted -> x%.3f",
+                      big.cells, want_s, pred, scale))
+        # A big correction means the two stages disagree about the machine,
+        # not about the workload -- most often another process on the card.
+        if !(0.5 < scale < 2.0)
+            note("\033[1;33mthat is a large disagreement; is the card shared?\033[0m")
+            scale = clamp(scale, 0.5, 2.0)
+        end
+        a *= scale; b *= scale
+    end
 
-    t0 = time()
-    solve_value!(V, docc, g, c.m, dseed, dctl, c.nctl, c.p; iters = iters,
-                 tol = 0.0, use_gpu = true, pol = pol, total = total)
-    CUDA.synchronize()
-    el = time() - t0
-    rate = cells * iters / el
-    CUDA.unsafe_free!(V); CUDA.unsafe_free!(pol)
-    CUDA.unsafe_free!(docc); CUDA.unsafe_free!(dctl); CUDA.unsafe_free!(dseed)
-    note(@sprintf("\033[1;32m%.1fM cell-updates/s\033[0m  (%d cells x %d sweeps in %.1f s)",
-                  rate / 1e6, cells, iters, el))
-    (rate = rate, cells = cells, sweeps = iters, seconds = el,
+    cost = (per_lookahead_s = a, per_step_s = b)
+    note(@sprintf("\033[1;32m%.4f ns/lookahead + %.4f ns/step-unit\033[0m",
+                  a * 1e9, b * 1e9))
+
+    # The scalar the old config called `cell_rate`, quoted at the production
+    # regime so it is at least the right order for the runs people do. Kept
+    # for continuity, and for anything still reading it.
+    prod = pts[1]
+    rate = prod.r.cells * prod.r.active / prod.r.sweep_s
+    # What the desktop card this project was tuned on would do on THIS case,
+    # so "2.4x faster" is a comparison of two machines rather than of two
+    # workloads. Derived from the shipped reference pair, not a stored scalar.
+    ref = effective_rate(prod.r.work, REF_CELL_COST)
+    note(@sprintf("at production settings that is %.1fM cell-updates/s", rate / 1e6))
+    (cost = cost, rate = rate, ref_rate = ref, worst_residual = worst,
+     rate_work = prod.r.work, full_size_scale = scale,
+     points = [Dict("name" => pt.name, "sweep_s" => pt.r.sweep_s,
+                    "ns_per_cell" => pt.ns, "cfl" => Float64(pt.p.cfl),
+                    "tau_max" => Float64(pt.p.tau_max),
+                    "lookaheads" => pt.r.work.lookaheads,
+                    "substeps" => pt.r.work.substeps,
+                    "probes" => pt.r.work.probes,
+                    "residual" => resid[i]) for (i, pt) in enumerate(pts)],
+     cells = prod.r.cells, sweeps = prod.r.sweeps, seconds = prod.r.seconds,
      n = collect(Int.(g.n)))
 end
 
@@ -221,8 +379,8 @@ function main()
     dir = get(ENV, "PEREGRINE_SCRATCH", mktempdir())
     mkpath(dir)
 
-    say("cell rate")
-    cr = measure_cell_rate(Int64(free))
+    say("cell cost")
+    cr = measure_cell_cost(Int64(free))
 
     say("disk")
     dk = measure_disk(dir)
@@ -243,9 +401,25 @@ function main()
         "julia_threads" => Threads.nthreads(),
         "ram_total_bytes" => Sys.total_memory(),
         "ram_free_bytes" => Sys.free_memory(),
+        # What `plan` actually prices with. `cell_rate` is the same
+        # measurement collapsed to the one number the config used to carry,
+        # quoted at production settings; it is a fallback, not the answer.
+        "cell_cost" => Dict("per_lookahead_s" => cr.cost.per_lookahead_s,
+                            "per_step_s" => cr.cost.per_step_s),
+        "cell_cost_fit" => Dict("worst_residual" => cr.worst_residual,
+                                "full_size_scale" => cr.full_size_scale,
+                                "points" => cr.points),
         "cell_rate" => cr.rate,
+        # What that rate is a rate OF. Without it a scalar rate is ambiguous
+        # -- this file used to measure at `cfl` 1 / `tau_max` 0.2 and now
+        # measures at production settings, and the same number means very
+        # different machines under those two readings.
+        "cell_rate_work" => Dict("lookaheads" => cr.rate_work.lookaheads,
+                                 "substeps" => cr.rate_work.substeps,
+                                 "probes" => cr.rate_work.probes),
         "cell_rate_detail" => Dict("cells" => cr.cells, "sweeps" => cr.sweeps,
-                                   "seconds" => cr.seconds, "n" => cr.n),
+                                   "seconds" => cr.seconds, "n" => cr.n,
+                                   "regime" => "cfl 2, tau_max 0.5"),
         "disk_rate" => dk.rate,
         "disk_write_rate" => dk.write,
         "disk_read_rate_raw" => dk.read,
@@ -254,15 +428,17 @@ function main()
             "sequential_s" => pf.off_s, "prefetched_s" => pf.on_s,
             "gain" => pf.gain, "amplification" => pf.amplification,
             "tiles" => pf.tiles),
-        "reference_cell_rate" => 23.4e6,
-        "speedup_vs_reference" => cr.rate / 23.4e6)
+        "reference_cell_rate" => cr.ref_rate,
+        "speedup_vs_reference" => cr.rate / cr.ref_rate)
 
     say("result")
     note(@sprintf("\033[1;32m%.2fx the desktop card this project was tuned on\033[0m",
-                  cr.rate / 23.4e6))
-    note("put these two in your solver config and every estimate sharpens:")
-    note(@sprintf("    \"cell_rate\": %.4g,", cr.rate))
+                  cr.rate / cr.ref_rate))
+    note("put these in your solver config and every estimate sharpens:")
+    note(@sprintf("    \"cell_cost\": {\"per_lookahead_s\": %.4g, \"per_step_s\": %.4g},",
+                  cr.cost.per_lookahead_s, cr.cost.per_step_s))
     note(@sprintf("    \"disk_rate\": %.4g", dk.rate))
+    note("(the wizard's `benchmark` subcommand saves them for you)")
     println("\nBENCHMARK ", JSON3.write(out))
     return 0
 end

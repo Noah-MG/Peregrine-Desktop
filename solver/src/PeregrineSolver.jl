@@ -989,6 +989,98 @@ constant means a longer horizon is not silently a less accurate one.
 end
 
 """
+What one sweep asks of the machine, per cell that is not blocked.
+
+**Why an estimate needs this at all.** A cell update is not a fixed amount of
+arithmetic. `cell_update` evaluates a fixed NUMBER of lookaheads -- coast, the
+warm start, `control_scan` lattice entries, `6 * refine_rounds` pattern probes
+and the step-length ladder -- but each of those costs `substeps_for` RK2
+substeps and `lookahead`'s swept collision probes, and both of those are
+derived from the horizon, which `cfl_tau` derives from the grid and the model.
+So the same card, sweeping the same number of cells, runs at wildly different
+cell rates depending on `cfl`, `tau_max`, the cell sizes and how much yaw
+authority the drivetrain has. Measured on one card: 48 ns a cell at `cfl` 1 /
+`tau_max` 0.2 against 160 ns at `cfl` 4 / `tau_max` 0.5, a spread of 3.3x.
+
+Quoting a single `cell_rate` therefore only predicts runs that resemble the
+one it was measured on, and the benchmark's case did not resemble production:
+it under-quoted a real H200 job by 41%, which is an hour of rental on a
+two-and-a-half hour solve.
+
+Returned as three counts rather than one number so the caller can price the
+per-lookahead overhead (interpolation, the `sincos`, the successor lookup)
+separately from the per-substep work, which is what `cell_cost` does.
+
+  * `lookaheads` -- calls to `lookahead` per cell
+  * `substeps`   -- integration substeps summed over those calls
+  * `probes`     -- swept collision probes summed over those calls
+
+Exact for the first two. The probe count depends on how far the step actually
+moves, which is not known without running the dynamics, so it is estimated
+from the same `B`-row bound `cfl_tau` uses: `speed*tau + a_max*tau^2/2`. That
+over-states displacement for a command fighting drag and under-states nothing,
+which is the safe direction for a time estimate.
+
+The average is over the velocity sub-grid only, because `cfl_tau` depends on
+`(vx, vy, w)` and nothing else -- so this costs `n4*n5*n6` evaluations, a few
+thousand, not one per cell. `plan` can call it in an interactive loop.
+"""
+function sweep_work(g::Grid6, m::Model, p::Params, nctl::Integer)
+    B = m.B
+    ax = max(abs(B[1]), abs(B[2]), abs(B[3]))
+    ay = max(abs(B[4]), abs(B[5]), abs(B[6]))
+    aw = max(abs(B[7]), abs(B[8]), abs(B[9]))
+    axy = Float64(max(ax, ay))
+    dxy = Float64(min(g.step[1], g.step[2]))
+    dh = Float64(g.step[3])
+    # The lookaheads every cell runs at `tau0`, exactly as `cell_update`
+    # issues them: coast, the warm start, the lattice slice, the pattern
+    # search. The warm start is counted always -- it is skipped only on the
+    # first sweep, and on a cell whose incumbent is coast.
+    nnc = max(Int(nctl) - 1, 1)
+    span = p.ncoarse <= Int32(0) ? nnc : min(Int(p.ncoarse), nnc)
+    nfix = 2 + span + 6 * Int(p.rounds)
+
+    function nprobes(tau::Float64, speed::Float64, spin::Float64)
+        p.adaptive_checks || return Float64(p.checks)
+        dpos = speed * tau + 0.5 * axy * tau * tau
+        drot = spin * tau + 0.5 * Float64(aw) * tau * tau
+        cells = max(dpos / (0.5 * dxy), drot / (0.5 * dh))
+        Float64(max(Int(p.checks), min(trunc(Int, min(cells, 1.0e4)) + 1, 24)))
+    end
+
+    nL = 0.0; nS = 0.0; nP = 0.0
+    ncell = 0
+    tmin = Float64(p.tau_min); tmax = Float64(p.tau_max)
+    for i4 in 0:(Int(g.n[4]) - 1), i5 in 0:(Int(g.n[5]) - 1),
+        i6 in 0:(Int(g.n[6]) - 1)
+        vfx = axisvalue(g, 4, i4); vfy = axisvalue(g, 5, i5)
+        w = axisvalue(g, 6, i6)
+        speed = sqrt(Float64(vfx)^2 + Float64(vfy)^2); spin = abs(Float64(w))
+        tau0 = Float64(cfl_tau(g, m, vfx, vfy, w, p))
+
+        add(t, mult) = begin
+            nL += mult
+            nS += mult * Float64(substeps_for(Float32(t), p))
+            nP += mult * nprobes(t, speed, spin)
+        end
+        add(tau0, nfix)
+        if p.ntau > Int32(1)
+            tau = tau0 * 0.5
+            for k in 1:Int(p.ntau)
+                k != 2 && add(clamp(tau, tmin, tmax), 1)
+                tau *= Float64(p.tau_ratio)
+            end
+            # `cell_update` always tries the configured `dt` as well.
+            p.cfl > 0.0f0 && add(clamp(Float64(p.dt), tmin, tmax), 1)
+        end
+        ncell += 1
+    end
+    n = Float64(max(ncell, 1))
+    (lookaheads = nL / n, substeps = nS / n, probes = nP / n)
+end
+
+"""
 Cost of holding one control for `tau`: `tau + V(successor)`, or `cap` if the
 step is blocked.
 

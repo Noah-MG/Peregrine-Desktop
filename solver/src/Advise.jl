@@ -49,6 +49,121 @@ end
 """Percent added by moving the longest step from `from` down to `to`."""
 value_cost(from::Real, to::Real) = max(0.0, value_cost(to) - value_cost(from))
 
+# --------------------------------------------------------------------------
+# What a sweep costs on a given machine
+# --------------------------------------------------------------------------
+
+# Seconds per lookahead and per unit of step work, on the 8 GB desktop card
+# this was developed against (an RTX 3060 Ti).
+#
+# These replace the old scalar `cell_rate` default of 23.4e6, and the reason
+# is the whole point of `sweep_work`: a cell rate is not a property of a
+# machine, it is a property of a machine running one particular workload.
+# Measured by `solver/cloud/benchmark.jl` over five horizon regimes spanning
+# `cfl` 1 to 4 and `tau_max` 0.05 to 0.5, worst residual 3.2% against a 2.2x
+# spread in cost, then levelled against a 746M-cell sweep.
+#
+# The split is lopsided -- the per-lookahead term is about 5% of a production
+# sweep -- but it is what keeps the model honest at the cheap end, where the
+# substep count falls to two or three and the fixed cost of the interpolation
+# and the successor lookup stops being negligible.
+#
+# On the reference workload below they come to 57M cell-updates/s, against
+# the 23.4e6 that used to be quoted for the same card and the same case. That
+# constant was already known to be stale -- `solver/cloud/README.md` said so
+# -- and it had been stale in the flattering direction: it made every card
+# look ~2.4x faster than the desktop when the real figure is nearer 1x for a
+# card of this class. Two errors that partly cancelled, which is why the
+# estimate looked plausible for as long as it did.
+const REF_CELL_COST = (per_lookahead_s = 0.07646e-9, per_step_s = 0.1127e-9)
+
+# The workload a bare `cell_rate` with no `cell_rate_work` is taken to
+# describe: the case the retired single-point benchmark ran -- `cfl` 1,
+# `tau_max` 0.2, two collision probes, on the 6e8-cell grid every card in the
+# rental list was large enough to reach.
+const REF_WORK = (lookaheads = 27.0, substeps = 68.0, probes = 69.2)
+
+"""
+Seconds a single cell update costs, from what the sweep asks of the machine.
+
+`work` is a `sweep_work` result and `cost` a `(per_lookahead_s, per_step_s)`
+pair. Substeps and probes are charged at one rate: they scale together with
+the horizon, so a fit that separated them would be fitting collinear columns.
+"""
+cell_seconds(work, cost) =
+    cost.per_lookahead_s * work.lookaheads +
+    cost.per_step_s * (work.substeps + work.probes)
+
+"""
+The machine's two cost coefficients, from the config.
+
+`cell_cost` is what `benchmark.jl` measures and is preferred whenever it is
+there. A bare `cell_rate` is the older, workload-blind form: it is honoured
+as given -- scaled onto the reference workload so it still means what the
+person who wrote it meant -- because it may well have come from watching a
+real run rather than from the benchmark, and silently reinterpreting it would
+be worse than the error it fixes.
+
+Returns `(cost, source)`, where `source` is one of:
+
+  * `"cost"` -- measured on this machine by `benchmark.jl`, the good case;
+  * `"rate"` -- reconstructed from a scalar `cell_rate`, which means the
+    workload it was measured at is assumed rather than known. Worth saying
+    out loud, because assuming that workload wrongly is the whole bug this
+    model exists to fix;
+  * `"default"` -- nothing was configured and the desktop card is standing in.
+"""
+function cell_cost(cfg)
+    cc = getc(cfg, "cell_cost", nothing)
+    if cc !== nothing
+        pl = Float64(getc(cc, "per_lookahead_s", REF_CELL_COST.per_lookahead_s))
+        ps = Float64(getc(cc, "per_step_s", REF_CELL_COST.per_step_s))
+        ps > 0.0 && return ((per_lookahead_s = pl, per_step_s = ps), "cost")
+    end
+    rate = getc(cfg, "cell_rate", nothing)
+    if rate !== nothing && Float64(rate) > 0.0
+        # Anchor the pair to the workload the rate was measured at, keeping
+        # the reference split between fixed and per-step cost. `benchmark.jl`
+        # writes `cell_rate_work` alongside the rate; without it the guess is
+        # the regime the retired single-point benchmark used, which is what
+        # any rate old enough to lack the field was measured under.
+        w = getc(cfg, "cell_rate_work", nothing)
+        work = w === nothing ? REF_WORK :
+               (lookaheads = Float64(getc(w, "lookaheads", REF_WORK.lookaheads)),
+                substeps = Float64(getc(w, "substeps", REF_WORK.substeps)),
+                probes = Float64(getc(w, "probes", REF_WORK.probes)))
+        k = (1.0 / Float64(rate)) / cell_seconds(work, REF_CELL_COST)
+        return ((per_lookahead_s = REF_CELL_COST.per_lookahead_s * k,
+                 per_step_s = REF_CELL_COST.per_step_s * k),
+                w === nothing ? "rate" : "cost")
+    end
+    (REF_CELL_COST, "default")
+end
+
+"""
+Cell updates a second this machine sustains *on this run*.
+
+The number the old config called `cell_rate`, except derived rather than
+assumed: it is what the cost pair works out to once the grid, the model and
+the solver parameters have said how much work a cell update actually is.
+Reported so the estimate can be read the way it always was, and used wherever
+the tiling arithmetic needs to compare compute against I/O.
+"""
+effective_rate(work, cost) = 1.0 / max(cell_seconds(work, cost), 1.0e-18)
+
+# What a cell costs the escape pass, relative to what it costs a solve sweep.
+#
+# More than one, and for a reason visible in `cell_update`: with `ESC` set the
+# blocked test is not an early return, so an escape backup on a blocked cell
+# runs the whole lookahead set that a solve sweep skipped, on top of the
+# `esc_v` and `esc_occ` substitutions. Measured on four occupancies from 5% to
+# 54% blocked, against the cells each pass actually worked on: 1.16, 1.22,
+# 1.27, 1.38, rising as fewer cells are unreached. Charged at the top of that
+# range because the cell COUNT it multiplies is a floor -- see
+# `runtime_estimate` -- and two estimates in the same direction should not
+# both be optimistic.
+const ESCAPE_CELL_FACTOR = 1.4
+
 """
 Seconds for one round: `sweeps` passes over every cell, plus the traffic.
 
@@ -118,10 +233,25 @@ several times what the first few do.
 Returns one entry per candidate that produces a workable tiling, longest
 first, each carrying both sides: `cost` against `TAU_REF`, and `round_s` with
 the compute/io split that explains it.
+
+**Both sides move with `tau_max`, not just the halo.** A shorter step is
+cheaper to take as well as cheaper to load -- fewer integration substeps and
+fewer swept probes per lookahead -- so each candidate is priced at its own
+cell rate rather than at one rate for the whole ladder. Costing compute as a
+constant made short steps look like pure I/O savings, which is the direction
+that talks a tiled run into a shorter lookahead than it needs.
+
+Compute is priced over every cell, with no discount for the blocked ones that
+retire early. `settle` picks `tau_max` before the field has been rasterised
+-- it has to, since the plan and the solve must settle on the same lookahead
+and only one of them ever builds an occupancy grid -- so the discount is not
+available here. It over-states the compute side of the trade, which is the
+side that argues for keeping the longer step, so the error is in the
+direction that protects accuracy.
 """
 function tau_options(g::Grid6, m::Model, sp, budget::Int64, warm::Bool,
                      margin::Int, nang::Int, ncmd::Int, sb::Float64,
-                     sweeps::Int, rate::Float64, disk::Float64;
+                     sweeps::Int, cost, disk::Float64;
                      ladder::Vector{Float64} = TAU_LADDER)
     taus = sort(unique(Float64.(ladder)))
     curve = reach_curve(g, m, sp.p, sp.ctl_h, sp.nctl, taus;
@@ -134,14 +264,22 @@ function tau_options(g::Grid6, m::Model, sp, budget::Int64, warm::Bool,
         tp = plan_tiles(g, budget, hx, hy; warm = warm, dxy_cm = dxy,
                         dh_rad = dh)
         tp === nothing && continue
+        wk = sweep_work(g, m, retau(sp.p, tau), sp.nctl)
+        rate = effective_rate(wk, cost)
         r = round_seconds(cells, sweeps, tp.amplification, sb, rate, disk)
         push!(opts, (tau = tau, reach_cm = dxy, halo = hx, tile = tp.wx,
                      amplification = tp.amplification, round_s = r.total,
-                     compute_s = r.compute, io_s = r.io,
+                     compute_s = r.compute, io_s = r.io, cell_rate = rate,
                      cost = value_cost(TAU_REF, tau)))
     end
     opts
 end
+
+"""The same parameters with a different longest lookahead."""
+retau(p::Params, tau::Real) =
+    Params(p.dt, p.nsub, p.checks, p.adaptive_checks, p.nearest, p.cap,
+           p.ntau, p.tau_ratio, p.cfl, p.tau_min, Float32(tau), p.hmax,
+           p.ncoarse, p.rounds, p.delta0, p.rk2, p.vclamp, p.simplex)
 
 """
 Pick a `tau_max`, and be able to say why.
@@ -169,7 +307,7 @@ resolution, which is why the short circuit is worth having.
 """
 function recommend_tau(mode::Symbol, g::Grid6, m::Model, sp, budget::Int64,
                        warm::Bool, margin::Int, nang::Int, ncmd::Int,
-                       sb::Float64, sweeps::Int, rate::Float64, disk::Float64)
+                       sb::Float64, sweeps::Int, cost, disk::Float64)
     cur = Float64(sp.p.tau_max)
     if mode != :ooc
         return (tau_max = TAU_REF, cost = 0.0, current = cur,
@@ -180,7 +318,7 @@ function recommend_tau(mode::Symbol, g::Grid6, m::Model, sp, budget::Int64,
                          "integration substeps")
     end
     opts = tau_options(g, m, sp, budget, warm, margin, nang, ncmd, sb, sweeps,
-                       rate, disk)
+                       cost, disk)
     isempty(opts) && return (tau_max = nothing, cost = nothing, current = cur,
                 current_cost = nothing, io_minor = false, options = opts,
                 reason = "no tiling of this grid fits at any step length")

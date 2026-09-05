@@ -600,8 +600,17 @@ def target_overrides(target: str, measured: dict) -> dict:
         return {}
     out = {"vram_budget_bytes": gpu_budget_bytes(spec["vram_gb"])}
     rates = measured.get(target, {})
+    # `cell_cost` is what the planner prices with -- two coefficients rather
+    # than a rate, because how long a cell update takes depends on the
+    # lookahead horizon as much as on the card. `cell_rate` is the older
+    # single number, carried through for entries measured before that, and
+    # `cell_rate_work` says which workload it was a rate of.
+    if rates.get("cell_cost"):
+        out["cell_cost"] = rates["cell_cost"]
     if rates.get("cell_rate"):
         out["cell_rate"] = float(rates["cell_rate"])
+    if rates.get("cell_rate_work"):
+        out["cell_rate_work"] = rates["cell_rate_work"]
     if rates.get("disk_rate"):
         out["disk_rate"] = float(rates["disk_rate"])
     return out
@@ -1033,14 +1042,34 @@ def _count_targets(ws: Workspace) -> int:
 def _cost_preview(rt: dict, target: str, measured: dict) -> None:
     """What this run would cost to rent, and how much to trust the figure.
 
-    Two independent reasons the number is a ceiling, and both are worth
-    saying because they pull the same way: the estimate spends the whole
-    iteration budget, and unless the box has been benchmarked it spends it at
-    the desktop card's rate. A user who reads "$52" and does not know both of
-    those will over-buy.
+    The estimate spends the whole iteration budget, so it is a ceiling on
+    that count -- and unless the box has been benchmarked it spends it at the
+    desktop card's cost, which is a guess in an unknown direction. A user who
+    reads "$52" and does not know both of those will buy the wrong hours.
+
+    The two passes are shown apart because they are priced on different
+    grounds and can be wrong independently: the sweeps are the bulk and rest
+    on a measurement of the card, the escape pass is a floor built on how
+    much of the field is blocked. Adding them into one number hides which one
+    to distrust when a run overruns -- which is exactly what happened to the
+    H200 job that this split exists because of.
     """
     spec = TARGET_GPUS.get(target, {})
     hourly = spec.get("usd_hr", 0.0)
+
+    unit_s = rt.get("unit_s") or 0.0
+    esc_s = rt.get("escape_unit_s") or 0.0
+    units = rt.get("units") or 0
+    esc_n = rt.get("escape_sweeps") or 0
+    if unit_s and units:
+        word = rt.get("unit", "sweep")
+        print(f"  {word}s              {units - esc_n} x {unit_s:.1f} s"
+              f" = {hms(unit_s * (units - esc_n))}")
+        if esc_n:
+            print(f"  escape pass         {esc_n} x {esc_s:.1f} s"
+                  f" = {hms(esc_s * esc_n)}"
+                  + c(f"   (floor: {rt.get('blocked_frac', 0)*100:.0f}% of the "
+                      f"grid is blocked and cannot be reached)", "2"))
 
     # The prefetch, when the tiled driver is going to use it. Reported as what
     # it saves rather than as a flag, because on a slow card it saves nothing
@@ -1063,13 +1092,26 @@ def _cost_preview(rt: dict, target: str, measured: dict) -> None:
     print(f"  {c('rental cost', '1;33')}         "
           f"{c(f'up to ${cost:,.2f}', '1;33')} at ${hourly:.2f}/hr "
           f"on {spec['label']}")
-    if not measured.get(target, {}).get("cell_rate"):
-        print(c("                      ...but that is at THIS machine's cell "
-                "rate. The card is", "2"))
+    src = rt.get("cost_source", "cost")
+    if src == "default":
+        print(c("                      ...but that is at THIS machine's cost "
+                "per cell. The card is", "2"))
         print(c("                      faster, so the real bill is lower. "
                 "Measure it once with", "2"))
         print(c("                      peregrine_remote.py benchmark and this "
                 "becomes arithmetic.", "2"))
+    elif src == "rate":
+        # An old-style `cell_rate` says how fast the box was on one workload
+        # and not which one, so the planner has to assume it was the workload
+        # the retired benchmark used. When that assumption is wrong the
+        # estimate is wrong by however much the two workloads differ -- on
+        # the first H200 job, by 41%.
+        print(c("                      ...from an old-style cell rate, which "
+                "does not record what", "2"))
+        print(c("                      workload it was measured on. Re-run "
+                "peregrine_remote.py benchmark", "2"))
+        print(c("                      on this box; it fits the cost model "
+                "and this stops being a guess.", "2"))
 
 
 def _pick_target(default: str) -> str:
@@ -1085,11 +1127,18 @@ def _pick_target(default: str) -> str:
             bits.append(f"{spec['vram_gb']:.0f} GB")
         if spec["usd_hr"]:
             bits.append(f"${spec['usd_hr']:.2f}/hr")
-        if rates.get(k, {}).get("cell_rate"):
-            bits.append(c(f"measured {rates[k]['cell_rate']/1e6:.0f}M cells/s",
+        got = rates.get(k, {})
+        if got.get("cell_cost"):
+            bits.append(c(f"measured {got['cell_rate']/1e6:.0f}M cells/s",
                           "32"))
+        elif got.get("cell_rate"):
+            # Measured before the cost model, so the workload it was measured
+            # at has to be assumed rather than known. Better than nothing and
+            # worth re-measuring.
+            bits.append(c(f"{got['cell_rate']/1e6:.0f}M cells/s "
+                          f"(old-style -- re-benchmark)", "33"))
         elif spec["vram_gb"]:
-            bits.append(c("rate not measured -- estimates are ceilings", "33"))
+            bits.append(c("not measured -- estimates are ceilings", "33"))
         mark = "*" if k == default else " "
         print(f"   {mark}{i}. {spec['label']:<24s} {'  '.join(bits)}")
     print(c("     Measure a rented box with: julia --project=solver -t auto "
@@ -1210,7 +1259,16 @@ def save_job(ws: Workspace, cfg: dict, target: str, p: dict) -> str | None:
             "tau_applied": rec.get("tau_applied"),
             "tau_applied_cost": rec.get("tau_applied_cost"),
             "estimate_s": rt.get("total_s"),
+            # The rate the estimate used, what made it that rate, and whether
+            # it came from a measurement of the target card or from this
+            # desktop standing in. Kept so a run that overshoots can be
+            # checked against what was assumed rather than re-derived.
             "cell_rate": rt.get("cell_rate"),
+            "cell_cost": rt.get("cell_cost"),
+            "cost_measured": rt.get("cost_measured"),
+            "work": rt.get("work"),
+            "solve_sweep_s": rt.get("unit_s"),
+            "escape_sweep_s": rt.get("escape_unit_s"),
         },
     }
     with open(os.path.join(jdir, "job.json"), "w", encoding="utf-8") as fh:
@@ -1602,22 +1660,31 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
     tiled = False
     started = time.time()
     solve_started = [None]      # when the first target actually began
+    esc_share = [0.0]           # fraction of a target's slot the escape owns
 
-    def show(frac: float, note: str) -> None:
-        """Draw the bar with a whole-run estimate rather than a per-target one.
+    def show(frac: float, note: str, eta_s: float | None = None) -> None:
+        """Draw the bar, with the solver's own estimate of the time left.
 
-        The solver's own `eta_s` only covers the target it is on, which on a
-        three-target run understates by a factor of three near the start. This
-        measures the rate the whole run has actually achieved since the first
-        target began -- setup and occupancy excluded, because they happen once
-        and would flatter the rest -- and extrapolates from that.
+        `eta_s` now covers the whole run -- the sweeps left in this target,
+        the escape pass after them, and every target still to come -- priced
+        from sweeps this run has actually timed. That is better than anything
+        this end can work out, so it is used when it is there.
+
+        The fallback, for a solver too old to send one, extrapolates from the
+        rate the whole run has achieved since the first target began. Setup
+        and occupancy are excluded from that: they happen once and would
+        flatter the rest.
         """
         frac = min(1.0, max(0.0, frac))
         if solve_started[0] is None:
             solve_started[0] = time.time()
         el = time.time() - solve_started[0]
-        eta = (f"  left {hms(el * (1.0 - frac) / frac)}"
-               if frac > 0.01 and el > 5.0 else "")
+        if eta_s is not None and el > 5.0:
+            eta = f"  left {hms(eta_s)}"
+        elif frac > 0.01 and el > 5.0:
+            eta = f"  left {hms(el * (1.0 - frac) / frac)}"
+        else:
+            eta = ""
         bar.update(frac, note + eta)
 
     print()
@@ -1639,6 +1706,14 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
             ph = ev.get("phase")
             if ph == "setup":
                 n_targets = max(1, ev.get("n_targets", 1))
+                # How a target's slot on the bar divides between the two
+                # passes. Without this the bar reaches the end of the slot
+                # when the value iteration does and then sits there for the
+                # whole escape pass -- which on the first H200 job was twelve
+                # minutes of a bar that looked hung and an ETA of zero.
+                it = max(1, ev.get("iterations", 1))
+                esc = max(0, ev.get("escape_iterations", 0))
+                esc_share[0] = esc / (it + esc)
                 print(f"  {ev['cells']:,} cells, {ev['controls']} controls, "
                       f"{human(ev['bytes_per_target'])} per table")
             elif ph == "occupancy":
@@ -1659,28 +1734,32 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
                 print(f"  backend: {c(ev['backend'].upper(), '1;32')}")
                 print()
             elif ph == "solve":
-                frac = (done_targets + ev["iter"] / max(1, ev["iters"])) / n_targets
+                within = (ev["iter"] / max(1, ev["iters"])) * (1 - esc_share[0])
+                frac = (done_targets + within) / n_targets
                 unit = "round" if tiled else "it"
                 show(frac, f"{ev['target_name']}  {unit} "
-                           f"{ev['iter']}/{ev['iters']}")
+                           f"{ev['iter']}/{ev['iters']}", ev.get("eta_s"))
             elif ph == "tile":
                 # A round over a full-scale grid can be tens of minutes, so
                 # the bar has to move inside one or it looks hung. The tile
                 # index is a genuine fraction of the round, so this is real
                 # progress rather than a spinner.
                 rounds = max(1, ev.get("rounds", 1))
-                within = (ev["round"] - 1 + ev["tile"] / max(1, ev["tiles"])) / rounds
+                within = ((ev["round"] - 1 + ev["tile"] / max(1, ev["tiles"]))
+                          / rounds) * (1 - esc_share[0])
                 show((done_targets + within) / n_targets,
                      f"{ev['target_name']}  round {ev['round']}/{rounds}  "
                      f"tile {ev['tile']}/{ev['tiles']}")
             elif ph == "escape":
                 # Filling in the cells the solve could not reach with the time
-                # to get out of them. Its own phase because it runs after the
-                # bar has already reached the end of this target's slot, and
-                # a bar that sits still is a bar that looks hung.
-                show((done_targets + 1) / n_targets,
+                # to get out of them. It owns the last `esc_share` of this
+                # target's slot, so the bar keeps moving through it rather
+                # than sitting at the end of the slot looking hung.
+                within = (1 - esc_share[0]) + esc_share[0] * (
+                    ev["iter"] / max(1, ev["iters"]))
+                show((done_targets + within) / n_targets,
                      f"{ev['target_name']}  escape "
-                     f"{ev['iter']}/{ev['iters']}")
+                     f"{ev['iter']}/{ev['iters']}", ev.get("eta_s"))
             elif ph == "encode":
                 show((done_targets + 1) / n_targets,
                      f"{ev['target_name']}  writing")

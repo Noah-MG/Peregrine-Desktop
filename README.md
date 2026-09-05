@@ -241,11 +241,35 @@ round is mid-tile the next — and it is load-bearing. With no halo and the
 tiling pinned, mean value went 1.80 s to 14.33 s in the self-test; allowed to
 shift, it came back to 1.79 s.
 
-`plan` also estimates the wall clock. It is a ceiling — the full iteration
-budget, which `tolerance` usually cuts short — and it comes from two rates
-measured on one machine: about 23M cell-updates/s on an 8 GB card, and about
-500 MB/s of scratch. After one run, put the real numbers in `cell_rate` and
-`disk_rate` and every later estimate sharpens.
+`plan` also estimates the wall clock, and it prices a sweep from **what that
+sweep asks of the card**, not from a stored cell rate.
+
+The distinction is the difference between a useful estimate and a wrong one.
+A cell update is a fixed number of lookaheads — coast, the warm start, the
+lattice slice, the pattern probes, the step ladder — but each one costs RK2
+substeps and swept collision probes in proportion to its horizon, and the
+horizon comes from `cfl`, `tau_max`, the cell sizes and how much acceleration
+the drivetrain has. Two configs on one card differ by 3x in cost per cell. So
+the machine is described by a *cost pair* — seconds per lookahead and seconds
+per unit of step work (`cell_cost`) — and `sweep_work` says how many of each
+this particular run needs. `solver/cloud/benchmark.jl` measures the pair.
+
+It quoted an H200 job at 1.5 h that took 2.5 h before this: the rate had been
+measured at `cfl` 1 / `tau_max` 0.2 and was being spent on a `cfl` 2 /
+`tau_max` 0.5 run, which asks for more than twice the work per cell.
+
+Two more things the estimate now knows:
+
+- **Blocked cells are nearly free to a solve sweep** and are discounted —
+  they retire before their first lookahead. On a field that is 31% blocked
+  that is 31% off every sweep.
+- **The escape pass is the opposite**: it works on the cells the solve could
+  not reach, so it is priced over the blocked share rather than the whole
+  grid. It used to be charged as if nothing had been reached.
+
+It is still a ceiling on the *iteration count* — the full budget, which
+`tolerance` usually cuts short. `disk_rate` is still a plain rate (about
+500 MB/s of scratch, and it only matters to a tiled run).
 
 A round costs its compute **plus** its I/O, not the greater of the two. The
 driver loads a tile, sweeps it, stores it, and moves on — strictly in

@@ -437,6 +437,9 @@ class ProgressReader:
         self.cells = 0
         self.sweeps_per_unit = 1
         self.units_seen = 0
+        # Share of a target's slot on the bar that belongs to the escape
+        # pass, filled in from the setup line.
+        self.esc_share = 0.0
         # The reader's own idea of how far along the run is. Deliberately not
         # read back off the bar: the bar drops redraws less than 80 ms apart,
         # so on a fast tile stream its `frac` lags the run by an arbitrary
@@ -451,14 +454,25 @@ class ProgressReader:
         # big the output will be.
         self.on_setup = None
 
-    def show(self, frac: float, note: str) -> None:
+    def show(self, frac: float, note: str, eta_s = None) -> None:
+        """Draw the bar, preferring the solver's own estimate of what is left.
+
+        `eta_s` covers the whole run -- the sweeps left in this target, the
+        escape pass after them, and every target still to come -- priced from
+        sweeps this run has timed, so it beats extrapolating from a fraction.
+        The fallback is for a solver too old to send one.
+        """
         frac = min(1.0, max(0.0, frac))
         self.frac = frac
         if self.solve_started is None:
             self.solve_started = time.time()
         el = time.time() - self.solve_started
-        eta = (f"  left {hms(el * (1.0 - frac) / frac)}"
-               if frac > 0.01 and el > 5.0 else "")
+        if eta_s is not None and el > 5.0:
+            eta = f"  left {hms(eta_s)}"
+        elif frac > 0.01 and el > 5.0:
+            eta = f"  left {hms(el * (1.0 - frac) / frac)}"
+        else:
+            eta = ""
         self.bar.update(frac, note + eta)
 
     def feed(self, line: str) -> bool:
@@ -477,6 +491,12 @@ class ProgressReader:
         if ph == "setup":
             self.n_targets = max(1, ev.get("n_targets", 1))
             self.cells = ev.get("cells", 0)
+            # The escape pass owns the tail of each target's slot on the bar.
+            # Without this the bar finishes the slot when the value iteration
+            # does and then sits there for the whole escape pass.
+            _it = max(1, ev.get("iterations", 1))
+            _esc = max(0, ev.get("escape_iterations", 0))
+            self.esc_share = _esc / (_it + _esc)
             print(f"  {ev['cells']:,} cells, {ev['controls']} controls, "
                   f"{human(ev['bytes_per_target'])} per table")
             if self.on_setup is not None:
@@ -498,22 +518,25 @@ class ProgressReader:
             print()
         elif ph == "solve":
             self.units_seen = max(self.units_seen, ev["iter"])
-            frac = ((self.done_targets + ev["iter"] / max(1, ev["iters"]))
-                    / self.n_targets)
+            within = ((ev["iter"] / max(1, ev["iters"]))
+                      * (1 - self.esc_share))
+            frac = (self.done_targets + within) / self.n_targets
             unit = "round" if self.tiled else "it"
             self.show(frac, f"{ev['target_name']}  {unit} "
-                            f"{ev['iter']}/{ev['iters']}")
+                            f"{ev['iter']}/{ev['iters']}", ev.get("eta_s"))
         elif ph == "tile":
             rounds = max(1, ev.get("rounds", 1))
-            within = ((ev["round"] - 1 + ev["tile"] / max(1, ev["tiles"]))
-                      / rounds)
+            within = (((ev["round"] - 1 + ev["tile"] / max(1, ev["tiles"]))
+                       / rounds) * (1 - self.esc_share))
             self.show((self.done_targets + within) / self.n_targets,
                       f"{ev['target_name']}  round {ev['round']}/{rounds}  "
                       f"tile {ev['tile']}/{ev['tiles']}")
         elif ph == "escape":
-            self.show((self.done_targets + 1) / self.n_targets,
+            within = ((1 - self.esc_share) + self.esc_share *
+                      (ev["iter"] / max(1, ev["iters"])))
+            self.show((self.done_targets + within) / self.n_targets,
                       f"{ev['target_name']}  escape "
-                      f"{ev['iter']}/{ev['iters']}")
+                      f"{ev['iter']}/{ev['iters']}", ev.get("eta_s"))
         elif ph == "encode":
             self.show((self.done_targets + 1) / self.n_targets,
                       f"{ev['target_name']}  writing")
@@ -791,7 +814,10 @@ def _remember_rates(key: str, res: dict) -> None:
     except (OSError, json.JSONDecodeError):
         settings = {}
     rates = settings.setdefault("gpu_rates", {})
-    rates[key] = {"cell_rate": res.get("cell_rate"),
+    rates[key] = {"cell_cost": res.get("cell_cost"),
+                  "cell_rate": res.get("cell_rate"),
+                  "cell_rate_work": res.get("cell_rate_work"),
+                  "cell_cost_fit": res.get("cell_cost_fit"),
                   "disk_rate": res.get("disk_rate"),
                   "gpu": res.get("gpu"),
                   "vram_total_bytes": res.get("vram_total_bytes"),
@@ -1153,12 +1179,25 @@ def _print_plan(p: dict, rate: float, env: dict) -> None:
               f"({'i/o' if rt.get('io_bound') else 'compute'}-bound, "
               f"at {rt.get('cell_rate', 0)/1e6:.1f}M cells/s)")
         print(f"  {c(f'rental      ~${total / 3600 * rate:,.2f} at ${rate:.2f}/hr', '1;33')}")
-        if rt.get("cell_rate", 0) == 23.4e6:
-            print(c("               the cell rate is still the DESKTOP's "
-                    "measurement -- this box is", "2"))
-            print(c("               probably faster, so read the estimate as "
-                    "a ceiling until one run", "2"))
-            print(c("               has measured it.", "2"))
+        esc_n = rt.get("escape_sweeps") or 0
+        if esc_n and rt.get("escape_unit_s"):
+            print(c(f"               of which {hms(esc_n * rt['escape_unit_s'])}"
+                    f" is the escape pass, priced from the "
+                    f"{rt.get('blocked_frac', 0)*100:.0f}% blocked", "2"))
+        src = rt.get("cost_source", "cost")
+        if src == "default":
+            print(c("               that is at the DESKTOP card's cost -- "
+                    "this box has never been", "2"))
+            print(c("               measured, so read it as an order of "
+                    "magnitude. `benchmark` on", "2"))
+            print(c("               this box makes it arithmetic.", "2"))
+        elif src == "rate":
+            print(c("               that is from an old-style cell rate, "
+                    "which does not record the", "2"))
+            print(c("               workload it was measured on -- so this "
+                    "assumes one. Re-run", "2"))
+            print(c("               `benchmark` here to replace the "
+                    "assumption with a fit.", "2"))
     dl = p["bytes_total"]
     print(f"  download     {human(dl)} to bring home "
           f"({hms(dl / (12.5e6))} at 100 Mbit/s)")
@@ -1264,7 +1303,7 @@ def cmd_run(args, st) -> int:
 
 
 def _measured_rate(pr: ProgressReader, elapsed: float, cfg_path: str) -> None:
-    """Report the box's real cell rate, so the next `plan` estimates properly."""
+    """What the box really did, against what the plan said it would."""
     if not pr.cells or pr.done_targets < 1 or elapsed <= 0:
         return
     # Sweeps actually run, not the budget: the tolerance usually stops a
@@ -1275,8 +1314,16 @@ def _measured_rate(pr: ProgressReader, elapsed: float, cfg_path: str) -> None:
     rate = pr.cells * sweeps / elapsed
     print(f"\n  measured {c(f'{rate/1e6:.1f}M cell-updates/s', '1;32')} on this "
           f"box ({pr.cells:,} cells x {sweeps} sweeps in {hms(elapsed)})")
-    print(f"  put {c(f'\"cell_rate\": {rate:.3g}', '36')} in "
-          f"{os.path.basename(cfg_path)} and every later estimate sharpens")
+    # Deliberately NOT offered as a `cell_rate` to paste into the config. A
+    # rate is a rate of one workload -- this one -- and the planner needs the
+    # two coefficients that let it price a different grid, a different
+    # drivetrain or a different lookahead. That is what `benchmark` measures,
+    # and quoting a single number here is how a two-and-a-half hour job came
+    # to be planned as an hour and a half.
+    print(c(f"  to sharpen the next estimate run {c('benchmark', '36')} on "
+            f"this box -- it fits the", "2"))
+    print(c("  cost model rather than one rate, so it holds at other "
+            "settings too", "2"))
 
 
 def _pull(host: str, st: dict, rate: float, streamed=None) -> int:

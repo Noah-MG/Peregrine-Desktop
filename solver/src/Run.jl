@@ -381,21 +381,26 @@ function fit_advice(cfg, g::Grid6, m::Model, sp, budget::Int64, warm::Bool,
     maxcols = budget ÷ (col * per)
     hmax = maxcols <= 0 ? -1 : (isqrt(maxcols) - 1) ÷ 2
     ts = Int(getc(cfg, "tile_sweeps", 4))
-    rate = Float64(getc(cfg, "cell_rate", 23.4e6))
+    cost, _ = cell_cost(cfg)
     disk = Float64(getc(cfg, "disk_rate", 500e6))
 
     opts = filter(o -> o.tau < Float64(sp.p.tau_max),
                   tau_options(g, m, sp, budget, warm, margin, nang, ncmd,
-                              Float64(per), ts, rate, disk))
-    # "Worth starting" is not "lowest amplification". A round costs the
-    # greater of its compute and its I/O, and on this class of machine --
-    # ~23M cell-updates/s against a SATA SSD -- the two only cross at around
-    # eight cells loaded per cell updated. Below that the extra reads are
-    # free, hidden behind arithmetic that has to happen anyway, so buying
-    # amplification with `tau_max` past this point is paying accuracy for
-    # nothing. Measured on a 145x145 grid at the cell size a full-scale run
-    # uses: `tau_max` 0.2 costs +6% on mean value, 0.1 costs +21%, and 0.06
-    # costs +56%. That is the whole reason this threshold is not tighter.
+                              Float64(per), ts, cost, disk))
+    # "Worth starting" is not "lowest amplification". A round costs its
+    # compute plus its I/O, and on the class of machine this was tuned on --
+    # a desktop card against a SATA SSD -- the two are comparable at around
+    # eight cells loaded per cell updated. Past that the reads start to
+    # dominate; below it, buying amplification with `tau_max` is paying
+    # accuracy for very little time. Measured on a 145x145 grid at the cell
+    # size a full-scale run uses: `tau_max` 0.2 costs +6% on mean value, 0.1
+    # costs +21%, and 0.06 costs +56%. That is the whole reason this
+    # threshold is not tighter.
+    #
+    # The eight is a fixed rung rather than a crossing computed from the cost
+    # pair, so on a much faster card, or a much slower disk, it is the wrong
+    # rung -- it is a default for a shape of machine, and the `tau_options`
+    # table beside it carries the compute/io split for any other.
     comfy = findfirst(o -> o.amplification <= 8.0, opts)
     (column_bytes = col * per, budget_bytes = budget, max_halo = hmax,
      warm_helps = warm && !warm_fits(g, budget, sp, m, margin, nang, ncmd),
@@ -468,42 +473,87 @@ end
 """
 How long the whole thing is likely to take, in seconds.
 
-Both rates are measurements of the machine this was developed against -- an
-8 GB card sustaining about 23M cell-updates/s, and a SATA SSD at about
-500 MB/s -- so the answer is an order of magnitude, not a promise. After
-watching one run, put the real numbers in `cell_rate` and `disk_rate` and
-every later estimate sharpens.
+**A sweep is priced from what it asks of the machine, not from a stored cell
+rate.** `sweep_work` counts the lookaheads, integration substeps and swept
+probes one cell update actually costs at this grid, this drivetrain and these
+solver parameters; `cell_cost` says what those cost in seconds on this card.
+The product is the per-cell time, and it varies by more than 3x across the
+range of `cfl` and `tau_max` a real config spans -- which is why the earlier
+single-rate estimate under-quoted a production H200 run by 41%: the rate had
+been measured on the benchmark's short-step case and spent on a long-step one.
 
-It also assumes the full iteration budget is spent. `tolerance` usually stops
-a target earlier, so treat this as the ceiling.
+`disk_rate` is still a plain measurement: 500 MB/s, a SATA SSD, and it only
+enters a tiled run. `cell_cost` defaults to the same desktop card. Both are
+replaced by `solver/cloud/benchmark.jl` on any machine worth renting.
+
+**The two passes are priced over different cells.** A solve sweep retires a
+blocked cell before its first lookahead, so it only pays for the free ones.
+The escape pass is the opposite: it works on the cells the solve could not
+reach, and a cell that WAS reached costs it a load and a retire. Measured on
+four occupancies spanning 0.5 to 1.0 unreached, an escape sweep costs the
+unreached fraction of a full sweep times `ESCAPE_CELL_FACTOR` -- so it is
+priced that way, with `blocked_frac` standing in for the unreached share.
+
+`blocked_frac` is a floor on what the escape pass will work on rather than
+the true figure: every blocked cell is unreached, and the free states that
+are also unreachable are extra. On the H200 job that gap was small -- 31.0%
+blocked against 34.7% unreached -- but it is a floor, and it is the only part
+of this estimate that is. `ESCAPE_CELL_FACTOR` is taken at the top of its
+measured range to lean the other way.
+
+The remaining ceiling is the iteration budget: the full count is assumed
+spent, though `tolerance` usually stops a target earlier.
 """
-function runtime_estimate(cfg, g::Grid6, dec, iters::Int, ntargets::Int)
-    rate = Float64(getc(cfg, "cell_rate", 23.4e6))
+function runtime_estimate(cfg, g::Grid6, dec, iters::Int, ntargets::Int;
+                          m::Union{Nothing,Model} = nothing, sp = nothing,
+                          blocked_frac::Float64 = 0.0)
+    cost, cost_source = cell_cost(cfg)
     disk = Float64(getc(cfg, "disk_rate", 500e6))
     cells = Float64(ncells(g))
-    # The escape pass is more sweeps over the same grid, so it is priced as
-    # more sweeps. That is a ceiling for a third reason on top of the two
-    # below: a sweep of it costs a full backup only on the cells with no
-    # route, and every cell that has one is a load and a retire. On a table
-    # that reaches most of its states the pass is far cheaper than this makes
-    # it look, but quoting the cheap number would be quoting an assumption
-    # about `reached_frac` that is not known until the run is over.
+    # Without a model and parameters there is nothing to weigh the sweep
+    # with, so fall back to the workload the cost pair is anchored to. `plan`
+    # always passes both; the fallback is for callers that only have a grid.
+    work = (m === nothing || sp === nothing) ? REF_WORK :
+           sweep_work(g, m, sp.p, sp.nctl)
+    active = clamp(1.0 - blocked_frac, 0.0, 1.0)
+    rate = effective_rate(work, cost)
     esc_iters = Bool(getc(cfg, "escape", true)) ?
                 Int(getc(cfg, "escape_iterations", 60)) : 0
+    # A solve sweep's worth of work that the escape pass does: the share of
+    # the grid it backs up, times what one of its backups costs against one of
+    # the solve's. See the docstring for the first and `ESCAPE_CELL_FACTOR`
+    # for the second.
+    esc_active = clamp(blocked_frac, 0.0, 1.0) * ESCAPE_CELL_FACTOR
     solve_iters = iters
     iters += esc_iters
-    out = Dict{String,Any}("cell_rate" => rate, "assumes_full_budget" => true,
-                           "escape_sweeps" => esc_iters)
+    out = Dict{String,Any}(
+        "cell_rate" => rate, "assumes_full_budget" => true,
+        "escape_sweeps" => esc_iters, "cost_measured" => cost_source == "cost",
+        "cost_source" => cost_source,
+        "blocked_frac" => 1.0 - active, "escape_active_frac" => esc_active,
+        # What the rate above is a rate *of*, so a surprising estimate can be
+        # traced to the workload rather than only to the machine.
+        "work" => Dict("lookaheads" => work.lookaheads,
+                       "substeps" => work.substeps,
+                       "probes" => work.probes),
+        "cell_cost" => Dict("per_lookahead_s" => cost.per_lookahead_s,
+                            "per_step_s" => cost.per_step_s))
     # Nothing fits, so there is no run to time. Saying "sweep" here would
     # quote the in-core cost of a solve that cannot start.
     dec.mode == :ooc && dec.tp === nothing &&
         return merge!(out, Dict{String,Any}("unit" => "none"))
     if dec.mode != :ooc
-        per = cells / rate
+        # A blocked cell retires before its first lookahead, so a solve sweep
+        # only pays for the free ones; the escape pass pays for exactly the
+        # ones the solve skipped.
+        per = cells * active / rate
+        esc = cells * esc_active / rate
+        total = per * solve_iters + esc * esc_iters
         merge!(out, Dict{String,Any}(
             "unit" => "sweep", "units" => iters, "unit_s" => per,
-            "per_target_s" => per * iters,
-            "total_s" => per * iters * ntargets, "io_bound" => false))
+            "escape_unit_s" => esc,
+            "per_target_s" => total,
+            "total_s" => total * ntargets, "io_bound" => false))
         return out
     end
     ts = Int(getc(cfg, "tile_sweeps", 4))
@@ -515,19 +565,29 @@ function runtime_estimate(cfg, g::Grid6, dec, iters::Int, ntargets::Int)
     out["escape_rounds"] = esc_rounds
     sb = Float64(cell_bytes(Bool(getc(cfg, "warm_start_tiled", true))))
     pf, pfb, pfwhy = prefetch_plan(cfg, dec, Bool(getc(cfg, "warm_start_tiled", true)))
-    r = round_seconds(cells, ts, dec.tp.amplification, sb, rate, disk;
+    # Only the compute half of a round takes the blocked-cell discount: the
+    # tiled driver loads and stores a blocked cell like any other.
+    srate = rate / max(active, 1.0e-6)
+    erate = rate / max(esc_active, 1.0e-6)
+    r = round_seconds(cells, ts, dec.tp.amplification, sb, srate, disk;
                       prefetch = pf)
+    re = round_seconds(cells, ts, dec.tp.amplification, sb, erate, disk;
+                       prefetch = pf)
+    per_target = r.total * (rounds - esc_rounds) + re.total * esc_rounds
     # What the prefetch is worth on this grid, for the report. Costed against
     # the same round rather than asserted, because it is entirely a function
     # of how the compute and the reads compare, and that flips with the card.
-    plain = round_seconds(cells, ts, dec.tp.amplification, sb, rate, disk)
+    plain = round_seconds(cells, ts, dec.tp.amplification, sb, srate, disk)
+    plain_e = round_seconds(cells, ts, dec.tp.amplification, sb, erate, disk)
+    plain_total = plain.total * (rounds - esc_rounds) + plain_e.total * esc_rounds
     merge!(out, Dict{String,Any}(
         "prefetch" => pf, "prefetch_bytes" => pfb,
-        "prefetch_saves_s" => (plain.total - r.total) * rounds * ntargets,
+        "prefetch_saves_s" => (plain_total - per_target) * ntargets,
         "prefetch_off_because" => pfwhy,
         "unit" => "round", "units" => rounds, "unit_s" => r.total,
-        "per_target_s" => r.total * rounds,
-        "total_s" => r.total * rounds * ntargets,
+        "escape_unit_s" => re.total,
+        "per_target_s" => per_target,
+        "total_s" => per_target * ntargets,
         # Which half is the larger, not which one "limits": a round pays for
         # both, one after the other. See `round_seconds`.
         "io_bound" => r.io > r.compute, "compute_s" => r.compute,
@@ -580,7 +640,7 @@ function settle(cfg::AbstractDict, g::Grid6, m::Model)
                         Int(getc(cfg, "halo_scan_angles", 16)),
                         Int(getc(cfg, "halo_scan_commands", 128)),
                         wt ? 7.0 : 4.0, Int(getc(cfg, "tile_sweeps", 4)),
-                        Float64(getc(cfg, "cell_rate", 23.4e6)),
+                        first(cell_cost(cfg)),
                         Float64(getc(cfg, "disk_rate", 500e6)))
     # Nothing to change: in core, or no tiling fits at any step length (in
     # which case the caller reports the failure and the reference is the
@@ -752,7 +812,7 @@ function plan(cfg::AbstractDict)
                       Int(getc(cfg, "halo_scan_commands", 128)),
                       wt ? 7.0 : 4.0,
                       Int(getc(cfg, "tile_sweeps", 4)),
-                      Float64(getc(cfg, "cell_rate", 23.4e6)),
+                      first(cell_cost(cfg)),
                       Float64(getc(cfg, "disk_rate", 500e6)))
 
     Dict(
@@ -859,9 +919,14 @@ function plan(cfg::AbstractDict)
         "max_accel_cm_s2" => bal.accel_cm_s2,
         "cell_cm" => Float64(min(g.step[1], g.step[2])),
         "cell_cm_s" => Float64(min(g.step[4], g.step[5])),
-        # Ceiling on wall clock, from the configured iteration budget. See
-        # `runtime_estimate` for what the two rates are worth.
-        "runtime" => runtime_estimate(cfg, g, dec, iters, length(names)),
+        # Ceiling on wall clock, from the configured iteration budget. The
+        # model and the parameters go in with it because a sweep's cost is a
+        # property of the workload as much as of the card; the occupancy
+        # because a blocked cell retires before it costs anything. See
+        # `runtime_estimate`.
+        "runtime" => runtime_estimate(cfg, g, dec, iters, length(names);
+                                      m = mdl, sp = sp,
+                                      blocked_frac = osum.frac),
     )
 end
 
@@ -1169,6 +1234,11 @@ function run_solve(cfg::AbstractDict)
              escape = do_escape, escape_scale = escape_scale,
              escape_base = ebase, escape_codes = escape_codes(dtype),
              bytes_per_target = cells * DTYPES[dtype].bytes,
+             # Both sweep budgets, so a progress bar can give the escape pass
+             # its own share of a target's slot instead of sitting at 100%
+             # through it.
+             iterations = iters,
+             escape_iterations = do_escape ? esc_iters : 0,
              n_targets = length(names))
 
     hsub = gi.hsub
@@ -1358,6 +1428,52 @@ function run_solve(cfg::AbstractDict)
     # much work from one driver as from the other, and the two would not be
     # comparable on either time or quality.
     ooc_rounds = max(1, cld(iters, tile_sweeps))
+
+    # What is left to run, in the unit the driver reports progress in.
+    #
+    # **The escape pass and the remaining targets are part of the run.** The
+    # ETA used to count only the sweeps left in the value iteration of the
+    # target in flight, so it reached zero with the escape pass and every
+    # later table still to go -- on a one-target H200 job it read 0 s with
+    # twelve minutes of escape sweeps left, and on a four-target job it would
+    # have read zero three times. A number that says "done" three quarters of
+    # the way through a rented hour is worse than no number.
+    #
+    # Escape sweeps are priced from the solve sweep until the pass actually
+    # starts, then at their own measured cost. The conversion is the same one
+    # `runtime_estimate` uses and rests on the same measurement: a solve sweep
+    # pays for the free cells and an escape sweep pays for the unreached ones,
+    # so the ratio is `blocked / (1 - blocked)`, using the blocked share as
+    # the floor on what is unreached.
+    #
+    # Excludes the per-table encode and write, which is seconds to a couple
+    # of minutes against sweeps measured in hours.
+    blocked_frac = blocked / max(length(occ_h), 1)
+    esc_ratio = ESCAPE_CELL_FACTOR * blocked_frac / max(1.0 - blocked_frac, 1.0e-6)
+    solve_units = ooc ? ooc_rounds : iters
+    esc_units = !do_escape ? 0 :
+                ooc ? max(1, cld(esc_iters, tile_sweeps)) : esc_iters
+    ntargets = length(states)
+    run_eta(ti, solve_done, solve_unit_s, esc_done, esc_unit_s) =
+        max(0.0, (solve_units - solve_done) * solve_unit_s) +
+        max(0.0, (esc_units - esc_done) * esc_unit_s) +
+        (ntargets - ti) * (solve_units * solve_unit_s + esc_units * esc_unit_s)
+
+    # What a unit costs in the steady state, from the sweeps after the first.
+    #
+    # The first sweep of each kernel pays for its compilation, and pays a lot:
+    # 2.96 s against 0.03 s on a small grid here, 24.2 s against 20.6 s on the
+    # H200 run. Averaging it in makes the first ETA of every phase far too
+    # long -- a projection of the whole remaining run at a cost that will
+    # never be paid again -- so it is dropped once there is anything to
+    # measure without it.
+    steady(el, first_el, done) =
+        done > 1 ? max(el - first_el, 0.0) / (done - 1) : el
+    # And with only the compiling sweep timed there is nothing to project
+    # from, so no figure is offered rather than a wrong one. Consumers fall
+    # back to their own extrapolation for the one report it costs.
+    maybe_eta(done, eta) = done > 1 ? eta : nothing
+
     try
     for (ti, s) in enumerate(states)
         tcells = target_cells(g, s, ttol)
@@ -1365,6 +1481,7 @@ function run_solve(cfg::AbstractDict)
         tidx = (use_gpu && !ooc) ? CuArray(seeds) : seeds
 
         t0 = time()
+        first_el = Ref(0.0)      # elapsed at the first reported unit
         if ooc
             done_iters, last_delta = solve_value_ooc!(
                 store, occ, g, m, seeds, ctl, nctl, p, dec.tp;
@@ -1372,11 +1489,14 @@ function run_solve(cfg::AbstractDict)
                 warm = warm, pstore = pstore, prefetch = do_prefetch,
                 on_progress = (rd, d) -> begin
                     el = time() - t0
+                    rd == 1 && (first_el[] = el)
+                    per = steady(el, first_el[], rd)
                     progress(phase = "solve", target = ti - 1,
                              target_name = names[ti], iter = rd,
                              iters = ooc_rounds, delta = d, elapsed_s = el,
-                             sweep_s = el / rd,
-                             eta_s = (ooc_rounds - rd) * el / rd)
+                             sweep_s = per,
+                             eta_s = maybe_eta(rd, run_eta(ti, rd, per, 0,
+                                                           esc_ratio * per)))
                 end,
                 # A round over a full-scale grid is thousands of tiles and
                 # tens of minutes; without this the bar would sit still for
@@ -1395,12 +1515,20 @@ function run_solve(cfg::AbstractDict)
                 use_gpu = use_gpu, pol = pol, total = total,
                 on_progress = (it, d) -> begin
                     el = time() - t0
+                    it == 1 && (first_el[] = el)
+                    per = steady(el, first_el[], it)
                     progress(phase = "solve", target = ti - 1, target_name = names[ti],
                              iter = it, iters = iters, delta = d,
-                             elapsed_s = el, sweep_s = el / it,
-                             eta_s = (iters - it) * el / it)
+                             elapsed_s = el, sweep_s = per,
+                             eta_s = maybe_eta(it, run_eta(ti, it, per, 0,
+                                                           esc_ratio * per)))
                 end)
         end
+        # What a sweep of this target actually cost, for pricing everything
+        # still to come. `done_iters` rather than the budget: `tolerance` may
+        # have stopped it early, and dividing by the budget would quote a
+        # sweep that never ran.
+        solve_unit_s = steady(time() - t0, first_el[], max(done_iters, 1))
 
         # Fill in the cells that solve could not reach, with the time to get
         # out of them. This runs on the converged table, in place, and only
@@ -1411,25 +1539,38 @@ function run_solve(cfg::AbstractDict)
         esc_delta = 0.0
         if do_escape
             te = time()
+            esc_first = Ref(0.0)
             if ooc
                 esc_iters_done, esc_delta = solve_escape_ooc!(
                     store, occ, g, m, ctl, nctl, p, dec.tp;
                     rounds = max(1, cld(esc_iters, tile_sweeps)), tol = esc_tol,
                     tile_sweeps = tile_sweeps, prefetch = do_prefetch,
-                    on_progress = (rd, d) ->
+                    on_progress = (rd, d) -> begin
+                        el = time() - te
+                        rd == 1 && (esc_first[] = el)
+                        per = steady(el, esc_first[], rd)
                         progress(phase = "escape", target = ti - 1,
                                  target_name = names[ti], iter = rd,
                                  iters = max(1, cld(esc_iters, tile_sweeps)),
-                                 delta = d, elapsed_s = time() - te))
+                                 delta = d, elapsed_s = el, sweep_s = per,
+                                 eta_s = maybe_eta(rd,
+                                     run_eta(ti, solve_units, solve_unit_s, rd, per)))
+                    end)
             else
                 esc_iters_done, esc_delta = solve_escape!(
                     V, occ, g, m, ctl, nctl, p; iters = esc_iters,
                     tol = esc_tol, use_gpu = use_gpu, total = total,
-                    on_progress = (it, d) ->
+                    on_progress = (it, d) -> begin
+                        el = time() - te
+                        it == 1 && (esc_first[] = el)
+                        per = steady(el, esc_first[], it)
                         progress(phase = "escape", target = ti - 1,
                                  target_name = names[ti], iter = it,
                                  iters = esc_iters, delta = d,
-                                 elapsed_s = time() - te))
+                                 elapsed_s = el, sweep_s = per,
+                                 eta_s = maybe_eta(it,
+                                     run_eta(ti, solve_units, solve_unit_s, it, per)))
+                    end)
             end
         end
 

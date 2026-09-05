@@ -105,23 +105,47 @@ Two honesties about that table:
   and `plan` returns the *identical* 9.3 h estimate for all three cards. The
   H200 buys nothing there. Its case is full resolution, and only that.
 
-### Read those estimates as ceilings, twice over
+### Read those estimates as ceilings on the iteration count
 
-1. They assume the full `iterations` budget. `tolerance` normally stops a
-   target well short — on the 35.8M-cell grid it cut 612 s of budget to a
-   measured 171 s.
-2. They assume `cell_rate` 23.4e6, and **that constant is stale**. The same
-   desktop card measures 51-70M cell-updates/s across three grid shapes
-   (`benchmark.jl`), so it is not a shape artefact — it is roughly 2.5x
-   pessimistic, and every hour and every dollar in the tables above is
-   inflated by about that much. Divide them by the ratio `benchmark.jl`
-   reports for whatever card you are actually planning for. Section 5 has
-   the same numbers re-run at the measured rate.
+They assume the full `iterations` budget. `tolerance` normally stops a target
+well short — on the 35.8M-cell grid it cut 612 s of budget to a measured
+171 s.
 
-So treat 33.3 h as "not more than 33.3 h, probably a good deal less", get the
-real number from the first run — `run` prints the measured cell rate when it
-finishes — and put it in the config as `cell_rate` before planning the next
-one.
+They no longer assume a cell rate. That is worth spelling out, because the
+old `cell_rate` 23.4e6 was wrong in two directions at once and the errors hid
+each other:
+
+- **It was stale, in the flattering direction.** The same desktop card
+  measures 51-70M cell-updates/s across grid shapes, so every card looked
+  ~2.5x faster than the desktop when the honest figure for a modern card of
+  that class is nearer 1x.
+- **It was measured on the wrong workload, in the other direction.** The
+  benchmark swept at `cfl` 1 / `tau_max` 0.2 with a synthetic drivetrain that
+  has 1.7x the yaw authority of a real fit. All three make the step shorter,
+  and a shorter step means fewer integration substeps per lookahead. A
+  production sweep — `cfl` 2, `tau_max` 0.5, a real fit — asks for **2.2x**
+  the work per cell that the benchmark's did.
+
+The second one is the one that bit. Job `H200_med_one`, 1.78e9 cells on a
+rented H200, was planned at **1 h 29 m** and took **2 h 32 m**: 400 sweeps at
+20.6 s where the plan had priced them at 11.6 s, plus 12 minutes of escape
+pass the plan had priced but the progress bar had not.
+
+What replaced it: `benchmark.jl` sweeps the same grid under five horizon
+regimes and fits
+
+    seconds per active cell = a * lookaheads + b * (substeps + probes)
+
+then levels the pair against one sweep of a production-sized grid. `plan`
+computes the three counts for the actual grid, drivetrain and settings
+(`sweep_work`) and multiplies. Fitting on two regimes and predicting a third
+lands within 5%; the H200 job, priced with a pair matching its measured
+sweep, comes out at 2 h 30 m against 2 h 32 m actual.
+
+Two coefficients instead of one number is the whole change, and it is why
+`run` no longer offers you a `cell_rate` to paste into a config: a rate is a
+rate of one workload, and the next job is a different one. Run `benchmark` on
+the box instead.
 
 On the second point, one risk is already ruled out: the sweep kernel is
 Float32 throughout (`Grid6`, `Model` and `Params` hold only `Float32`/`Int32`,
@@ -276,15 +300,20 @@ Measure a box before trusting any of it:
 py -3.12 solver/cloud/peregrine_remote.py benchmark
 ```
 
-That runs `solver/cloud/benchmark.jl` on the droplet -- a real in-core solve
-for the cell rate, a real file for the disk rate, and the same tiled rounds
-both ways for what the prefetch buys -- and writes the answers where the
-wizard's planner reads them. Takes a couple of minutes.
+That runs `solver/cloud/benchmark.jl` on the droplet -- five real in-core
+solves at different lookahead horizons for the cost pair, one more at
+production size to level it, a real file for the disk rate, and the same
+tiled rounds both ways for what the prefetch buys -- and writes the answers
+where the wizard's planner reads them. Takes a few minutes.
 
-**This matters more than it sounds.** The `cell_rate` default of 23.4e6 is
-stale: the same desktop card now measures **51-70M cell-updates/s** across
-three grid shapes, so every wall clock and every dollar the planner has been
-quoting is roughly 2.5x too high.
+**This matters more than it sounds**, and for a reason that is easy to get
+backwards. It is not only that an unmeasured card is quoted at the desktop's
+speed. It is that a card measured the *old* way was quoted at one number for
+every workload, and the workload moves the answer by more than the card does:
+2.2x between the settings the old benchmark used and the settings production
+runs. A box whose `gpu_rates` entry predates the cost model shows as
+`old-style -- re-benchmark` in the wizard's card list, and the plan says so
+too. Re-run it; it is a few minutes against an hour of misjudged rental.
 
 ## 6. The prefetch
 

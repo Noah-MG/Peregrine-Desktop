@@ -1696,6 +1696,172 @@ function test_escape(; use_gpu = CUDA.functional())
     nothing
 end
 
+"""
+Test 17: does the estimate know what a sweep costs?
+
+This is the test the H200 job needed and did not have. `plan` quoted an hour
+and a half for a run that took two and a half hours, because it priced every
+sweep at a cell rate measured under settings that ask for a third of the work
+production asks for. Nothing was broken -- the rate was real, the arithmetic
+was right, and the number was still wrong by 41%, which on a rented card is a
+real bill.
+
+So there are two things to hold:
+
+  1. `sweep_work` counts what `cell_update` will actually do. The lookahead
+     count is exact and checkable by hand; the substep count follows from
+     `cfl_tau` and `substeps_for`, so it must move when the horizon moves.
+  2. The cost model built on it must predict a real sweep. On a GPU this is
+     measured: fit the coefficients on one regime and predict another, which
+     is exactly what `plan` does when it prices a job the benchmark never ran.
+
+The monotonicity checks are the part that runs everywhere. They are weaker
+than the measurement but they catch the failure that actually happened --
+a work count that does not respond to the settings that change the work.
+"""
+function test_sweep_cost()
+    println("\n[17] the estimate prices the sweep it is going to run")
+    ok = true
+    m = _realistic()
+    g = Grid6((16, 16, 24, 15, 15, 15), (0.0, 0.0, -π, -150.0, -150.0, -7.0),
+                                        (350.0, 350.0, π, 150.0, 150.0, 7.0))
+    nctl = length(control_set(4))
+    par(; cfl, tau_max, scan = 8, rounds = 2) =
+        Params(dt = 0.05f0, nsub = Int32(4), checks = Int32(3),
+               adaptive_checks = true, cap = 60.0f0, ntau = Int32(5),
+               tau_ratio = 2.0f0, cfl = Float32(cfl), tau_min = 0.004f0,
+               tau_max = Float32(tau_max), hmax = 0.0125f0,
+               ncoarse = Int32(scan), rounds = Int32(rounds), delta0 = 0.35f0,
+               rk2 = true, simplex = true)
+
+    # -- the lookahead count is exact, and countable by hand --------------
+    # `cell_update` runs: coast, the warm start, `ncoarse` lattice entries,
+    # `6 * rounds` pattern probes, `ntau - 1` ladder rungs and the `dt` rung.
+    w = sweep_work(g, m, par(cfl = 2.0, tau_max = 0.5), nctl)
+    ok &= _check(w.lookaheads == 2 + 8 + 12 + 4 + 1,
+                 "the lookahead count is the one `cell_update` issues",
+                 "$(w.lookaheads) vs $(2 + 8 + 12 + 4 + 1)")
+    w2 = sweep_work(g, m, par(cfl = 2.0, tau_max = 0.5, scan = 16, rounds = 3),
+                    nctl)
+    ok &= _check(w2.lookaheads == 2 + 16 + 18 + 4 + 1,
+                 "and it follows `control_scan` and `refine_rounds`",
+                 "$(w2.lookaheads) vs $(2 + 16 + 18 + 4 + 1)")
+
+    # -- the step work follows the horizon --------------------------------
+    # The failure that shipped: these two regimes were treated as costing the
+    # same, and they do not.
+    lo = sweep_work(g, m, par(cfl = 1.0, tau_max = 0.2), nctl)
+    hi = sweep_work(g, m, par(cfl = 2.0, tau_max = 0.5), nctl)
+    ok &= _check(hi.substeps > 1.3 * lo.substeps,
+                 "a longer horizon costs more integration substeps",
+                 @sprintf("%.0f vs %.0f", hi.substeps, lo.substeps))
+    ok &= _check(hi.probes > lo.probes,
+                 "and more swept collision probes",
+                 @sprintf("%.0f vs %.0f", hi.probes, lo.probes))
+    # Monotone in both knobs separately, since either alone can lengthen the
+    # step and either alone was enough to make the estimate wrong.
+    taus = [sweep_work(g, m, par(cfl = 2.0, tau_max = t), nctl).substeps
+            for t in (0.05, 0.1, 0.2, 0.5)]
+    ok &= _check(issorted(taus), "monotone in `tau_max`", string(taus))
+    cfls = [sweep_work(g, m, par(cfl = cf, tau_max = 0.5), nctl).substeps
+            for cf in (0.5, 1.0, 2.0, 4.0)]
+    ok &= _check(issorted(cfls), "monotone in `cfl`", string(cfls))
+
+    # -- a slower drivetrain gets a longer step, so it costs more ---------
+    # `cfl_tau` divides the velocity cell by the largest acceleration `B` can
+    # produce, so half the authority is twice the horizon. This is the half
+    # of the H200 miss that no setting would have revealed: the benchmark's
+    # synthetic model has 1.7x the yaw authority of the real fit.
+    half = Model(m.B ./ 2, m.A, m.q, m.S, m.D, m.c, m.eps, m.knee)
+    ok &= _check(sweep_work(g, half, par(cfl = 2.0, tau_max = 0.5), nctl).substeps >
+                 hi.substeps,
+                 "a weaker drivetrain takes longer steps and costs more",
+                 @sprintf("%.0f vs %.0f",
+                          sweep_work(g, half, par(cfl = 2.0, tau_max = 0.5),
+                                     nctl).substeps, hi.substeps))
+
+    # -- the config reader --------------------------------------------------
+    c0, src0 = cell_cost(Dict{String,Any}())
+    ok &= _check(src0 == "default" && c0.per_step_s == REF_CELL_COST.per_step_s,
+                 "an unmeasured config falls back to the desktop reference",
+                 src0)
+    c1, src1 = cell_cost(Dict{String,Any}("cell_rate" => 1.0 /
+                              cell_seconds(REF_WORK, REF_CELL_COST)))
+    ok &= _check(src1 == "rate" &&
+                 isapprox(c1.per_step_s, REF_CELL_COST.per_step_s; rtol = 1e-9),
+                 "a legacy `cell_rate` at the reference workload reproduces it",
+                 @sprintf("%s, %.4g vs %.4g", src1, c1.per_step_s,
+                          REF_CELL_COST.per_step_s))
+    # A rate that carries its workload is as good as a cost pair: the point of
+    # the reconstruction is that it stops being an assumption.
+    _, src1b = cell_cost(Dict{String,Any}("cell_rate" => 5.0e7,
+        "cell_rate_work" => Dict("lookaheads" => 27.0, "substeps" => 100.0,
+                                 "probes" => 100.0)))
+    ok &= _check(src1b == "cost",
+                 "a `cell_rate` that names its workload is not an assumption",
+                 src1b)
+    c2, src2 = cell_cost(Dict{String,Any}("cell_cost" =>
+                Dict("per_lookahead_s" => 1.0e-11, "per_step_s" => 2.0e-11)))
+    ok &= _check(src2 == "cost" && c2.per_lookahead_s == 1.0e-11 &&
+                 c2.per_step_s == 2.0e-11,
+                 "an explicit `cell_cost` is taken as given")
+
+    if !CUDA.functional()
+        println("  SKIP  no CUDA device to check the model against a real sweep")
+        return ok
+    end
+
+    # -- does it predict a sweep it was not fitted on? --------------------
+    # Fit on two regimes, predict a third. This is the extrapolation `plan`
+    # makes every time it prices a job on a card the benchmark measured under
+    # other settings, so it is the one that has to hold.
+    gm = Grid6((40, 40, 24, 15, 15, 15), (0.0, 0.0, -π, -150.0, -150.0, -7.0),
+                                         (350.0, 350.0, π, 150.0, 150.0, 7.0))
+    cells = ncells(gm)
+    occ = falses(Int(gm.n[1]) * Int(gm.n[2]) * Int(gm.n[3]))
+    for i in 13:16, j in 0:(Int(gm.n[2]) - 1), k in 0:(Int(gm.n[3]) - 1)
+        occ[(i * Int(gm.n[2]) + j) * Int(gm.n[3]) + k + 1] = true
+    end
+    act = 1 - count(occ) / length(occ)
+    ct = control_set(4)
+    ctl_h = Float32[getindex.(ct, 1); getindex.(ct, 2); getindex.(ct, 3)]
+    ttol = NTuple{6,Float32}(Float32[gm.step[k] * 0.5f0 for k in 1:6])
+    seeds = Int64.(target_cells(gm, (280.0f0, 175.0f0, 0.0f0, 0.0f0, 0.0f0,
+                                     0.0f0), ttol)) .+ 1
+    docc = CuArray(occ); dctl = CuArray(ctl_h); dseed = CuArray(seeds)
+    V = CUDA.fill(60.0f0, cells); pol = CUDA.zeros(Int8, 3 * cells)
+    total = CUDA.zeros(Float32, 1)
+    function per_cell(p)
+        solve_value!(V, docc, gm, m, dseed, dctl, nctl, p; iters = 2, tol = 0.0,
+                     use_gpu = true, pol = pol, total = total)
+        CUDA.synchronize(); t0 = time()
+        solve_value!(V, docc, gm, m, dseed, dctl, nctl, p; iters = 3, tol = 0.0,
+                     use_gpu = true, pol = pol, total = total)
+        CUDA.synchronize()
+        ((time() - t0) / 3) / (cells * act)
+    end
+    fit = [(par(cfl = 1.0, tau_max = 0.05)), (par(cfl = 4.0, tau_max = 0.5))]
+    ys = [per_cell(p) for p in fit]
+    ws = [sweep_work(gm, m, p, nctl) for p in fit]
+    A = [w.lookaheads for w in ws]; B = [w.substeps + w.probes for w in ws]
+    a, b = hcat(A, B) \ ys
+    held = par(cfl = 2.0, tau_max = 0.5)
+    got = per_cell(held)
+    pred = cell_seconds(sweep_work(gm, m, held, nctl),
+                        (per_lookahead_s = a, per_step_s = b))
+    CUDA.unsafe_free!(V); CUDA.unsafe_free!(pol); CUDA.unsafe_free!(docc)
+    CUDA.unsafe_free!(dctl); CUDA.unsafe_free!(dseed)
+    err = pred / got - 1
+    # 15% is loose on purpose. It is a timing measurement on a card that may
+    # be doing other things, and the bar it has to clear is the 41% error the
+    # single-rate model made -- not a benchmark's repeatability.
+    ok &= _check(abs(err) < 0.15,
+                 "the fitted cost predicts a regime it was not fitted on",
+                 @sprintf("%+.1f%% (%.2f vs %.2f ns/cell)", 100 * err,
+                          pred * 1e9, got * 1e9))
+    ok
+end
+
 """Run every self-test. Returns a process exit code."""
 function self_test()
     _PASS[] = 0; _FAIL[] = 0
@@ -1717,6 +1883,7 @@ function self_test()
     test_prefetch()
     test_cell_bytes()
     test_escape()
+    test_sweep_cost()
     @printf("\n%d passed, %d failed\n", _PASS[], _FAIL[])
     _FAIL[] == 0 ? 0 : 1
 end
