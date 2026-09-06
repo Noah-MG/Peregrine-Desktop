@@ -29,6 +29,9 @@ Deliberately simulated the way the robot runs it, not the way it was derived:
 `e0` is the body-frame error at handoff, `v0` the body-frame velocity there.
 Returns settling time, final error, peak commanded 1-norm, worst overshoot as
 a fraction of the initial error, and the share of ticks that clipped.
+Overshoot ignores excursions that stay inside `tol`, and measures the rest
+against the initial error floored at `tol` -- an axis that starts already on
+target would otherwise report huge overshoot for a sub-millimetre wander.
 """
 function honing_rollout(h::Dict, plant::PS.Model;
                         e0 = [15.0, 15.0, 0.25], v0 = [0.0, 0.0, 0.0],
@@ -38,6 +41,7 @@ function honing_rollout(h::Dict, plant::PS.Model;
     budget = h["config"]["budget"]
     period = 1.0 / h["config"]["loop_hz"]
 
+    base = [max(abs(float(e0[i])), float(tol[i])) for i in 1:3]
     e = collect(float(e0)); v = collect(float(v0)); acc = zeros(3)
     u = zeros(3); tnext = 0.0
     peak = 0.0; over = 0.0; settle = NaN; clipped = 0; ticks = 0
@@ -65,7 +69,12 @@ function honing_rollout(h::Dict, plant::PS.Model;
         a = PS.body_accel(plant, u[1], u[2], u[3], v[1], v[2], v[3])
         v .+= [a[1], a[2], a[3]] .* dt
         e .-= v .* dt
-        over = max(over, maximum(-(e ./ e0)))
+        # Overshoot is going past the target by an amount we care about, and
+        # `tol` is where we said we stop caring: an excursion that stays
+        # inside the box we call settled does not count. Without both parts
+        # of this an axis that starts already on target -- the heading-only
+        # case -- reports large overshoot for a sub-millimetre wander.
+        over = max(over, maximum(max.(-e .- tol, 0.0) ./ base))
         isnan(settle) && all(abs.(e) .< tol) && (settle = t)
         all(isfinite, e) || return (settle = NaN, err = fill(Inf, 3),
                                     peak = Inf, over = Inf, clip = 1.0)
