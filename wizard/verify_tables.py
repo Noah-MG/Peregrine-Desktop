@@ -319,6 +319,192 @@ def check_model(root: str, fails: list, warns: list) -> None:
                      "body-frame while the tables are field-frame")
 
 
+def _inv3(M: list) -> list | None:
+    """3x3 inverse by cofactors, or None if singular."""
+    (a, b, c), (d, e, f), (g, h, i) = M[0], M[1], M[2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if not math.isfinite(det) or abs(det) < 1e-12:
+        return None
+    return [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
+
+
+def check_honing(root: str, fails: list, warns: list) -> None:
+    """
+    Validate MODEL.JSON's honing block by deriving it again from scratch.
+
+    The block is additive to schema 2, so a card without one is only a
+    warning -- but a card *with* one has to be right, because these gains
+    drive the robot at the point where it is closest to whatever it is
+    scoring against.
+
+    The re-derivation here is deliberately an independent reimplementation
+    of the solver's, working from the matrices on the card rather than from
+    the fit: that is what makes it a check rather than a restatement. If the
+    two ever disagree, one of them has a bug and the card does not ship.
+    """
+    path = os.path.join(root, "MODEL.JSON")
+    if not os.path.exists(path):
+        return                       # check_model already failed on this
+    m = read_json(path)
+    hn = m.get("honing")
+    if hn is None:
+        warns.append("MODEL.JSON has no honing block; written by a solver "
+                     "from before the PID gains were derived, so the robot "
+                     "has no tuning for its final approach")
+        return
+
+    print()
+    print("  honing: PID for the final approach")
+
+    for name in ("Kp", "Ki", "Kd", "B_eff_inv", "Lambda"):
+        M = hn.get(name)
+        if not M or len(M) != 3 or any(len(r) != 3 for r in M):
+            fails.append(f"MODEL.JSON honing.{name} should be 3x3")
+            return
+        if any(not math.isfinite(v) for r in M for v in r):
+            fails.append(f"MODEL.JSON honing.{name} has a non-finite entry")
+            return
+
+    cfgh = hn.get("config") or {}
+    budget = cfgh.get("budget")
+    ishare = cfgh.get("integral_share")
+    hz = cfgh.get("loop_hz")
+    scale = cfgh.get("bandwidth_scale", 1.0)
+    fcm = cfgh.get("fine_cm")
+    frad = cfgh.get("fine_rad")
+    if not all(isinstance(v, (int, float)) and v > 0
+               for v in (budget, ishare, hz, scale, fcm, frad)):
+        fails.append("MODEL.JSON honing.config is missing a positive budget, "
+                     "integral_share, loop_hz, bandwidth_scale or fine band")
+        return
+
+    # Rebuild the plant the gains claim to describe, from the card's own
+    # matrices. Lambda is the linearised damping: the velocity block plus the
+    # Coulomb block straightened out inside its band.
+    A_u = m["A_u"]
+    A_s = m["A_s"]
+    A_sgn = m["A_sgn"]
+    eps = (m.get("csign") or {}).get("coulomb_eps") or []
+    if len(eps) < 6 or any(e <= 0 for e in eps[3:6]):
+        fails.append("MODEL.JSON honing needs a positive coulomb_eps on all "
+                     "three velocity axes to linearise the Coulomb term")
+        return
+    Lam = [[-(A_s[r][3 + c] + A_sgn[r][3 + c] / eps[3 + c]) for c in range(3)]
+           for r in range(3)]
+    for r in range(3):
+        for c in range(3):
+            if abs(Lam[r][c] - hn["Lambda"][r][c]) > 1e-6 * max(1.0, abs(Lam[r][c])):
+                fails.append("MODEL.JSON honing.Lambda does not match the "
+                             "model's own A_s and A_sgn blocks")
+                return
+
+    knee = ((m.get("control") or {}).get("saturation") or {}).get("knee")
+    if not isinstance(knee, (int, float)) or knee <= 0:
+        return                       # check_model already failed on this
+    r_op = budget / knee
+    tgain = 1.0 if r_op < 1e-6 else math.tanh(r_op) / r_op
+    Binv = _inv3([[tgain * A_u[r][c] for c in range(3)] for r in range(3)])
+    if Binv is None:
+        fails.append("MODEL.JSON A_u is singular, so the honing gains cannot "
+                     "be derived from it")
+        return
+
+    lam = [Lam[i][i] for i in range(3)]
+    Loff = [[0.0 if r == c else Lam[r][c] for c in range(3)] for r in range(3)]
+    efine = [fcm, fcm, frad]
+
+    def gains_at(w):
+        p = [max(lam[i] - 2 * w, w) for i in range(3)]
+        kp = [w * w + 2 * p[i] * w for i in range(3)]
+        ki = [p[i] * w * w for i in range(3)]
+        kd = [p[i] + 2 * w - lam[i] for i in range(3)]
+        Kp = [[Binv[r][c] * kp[c] for c in range(3)] for r in range(3)]
+        Ki = [[Binv[r][c] * ki[c] for c in range(3)] for r in range(3)]
+        Kd = [[Binv[r][c] * kd[c] - sum(Binv[r][k] * Loff[k][c]
+                                        for k in range(3))
+               for c in range(3)] for r in range(3)]
+        return Kp, Ki, Kd, p, kd
+
+    def prop_norm(w):
+        Kp = gains_at(w)[0]
+        return sum(abs(sum(Kp[r][c] * efine[c] for c in range(3)))
+                   for r in range(3))
+
+    w_hi = 1e-3
+    while prop_norm(w_hi) < budget and w_hi < 1e4:
+        w_hi *= 2
+    w_lo = w_hi / 2
+    for _ in range(80):
+        mid = 0.5 * (w_lo + w_hi)
+        if prop_norm(mid) < budget:
+            w_lo = mid
+        else:
+            w_hi = mid
+    w = scale * min(w_lo, 2 * math.pi * hz / 10)
+
+    if abs(w - hn["omega"]) > 1e-6 * max(1.0, abs(w)):
+        fails.append(f"MODEL.JSON honing.omega is {hn['omega']:.6f} but the "
+                     f"model re-derives {w:.6f}")
+        return
+    Kp, Ki, Kd, p, kd = gains_at(w)
+    for name, M in (("Kp", Kp), ("Ki", Ki), ("Kd", Kd)):
+        for r in range(3):
+            for c in range(3):
+                got = hn[name][r][c]
+                if abs(got - M[r][c]) > 1e-6 * max(1.0, abs(M[r][c])):
+                    fails.append(f"MODEL.JSON honing.{name}[{r}][{c}] is "
+                                 f"{got:.6g}, re-derived {M[r][c]:.6g}")
+                    return
+
+    print("    omega = %.4f (bound by %s), gains re-derived and matched"
+          % (w, (hn.get("omega_limits") or {}).get("bound_by", "?")))
+    print("    third poles = %s" % [round(v, 3) for v in p])
+
+    # Negative derivative gain means the controller spends command cancelling
+    # the drivetrain's own friction. It places the poles correctly and is
+    # badly fragile to fit error, so the design rules it out; seeing one here
+    # means the card was written by a solver that regressed.
+    if any(v < -1e-9 for v in kd):
+        fails.append("MODEL.JSON honing.Kd has a negative diagonal term "
+                     f"({[round(v, 4) for v in kd]}): the controller would "
+                     "cancel the drivetrain's own damping")
+
+    # The whole point of the bandwidth rule: inside the fine band the command
+    # stays within budget, so the robot hones gently instead of at full stick.
+    n1 = prop_norm(w)
+    if n1 > budget * (1 + 1e-6):
+        fails.append(f"MODEL.JSON honing Kp*fine_band has 1-norm {n1:.4f}, "
+                     f"over the {budget:.4f} budget: the controller would "
+                     "saturate even close to the target")
+    else:
+        print("    |Kp * fine band|_1 = %.4f, inside the %.4f budget"
+              % (n1, budget))
+
+    # Anti-windup is required, not advisory: without it the integrator walks
+    # the command out of the octahedron and the loop never settles.
+    ilim = (hn.get("integral_limit") or {}).get("value")
+    if not ilim or len(ilim) != 3 or any(
+            not math.isfinite(v) or v <= 0 for v in ilim):
+        fails.append("MODEL.JSON honing has no usable integral_limit; "
+                     "without an anti-windup clamp the loop does not settle")
+    else:
+        worst = sum(abs(sum(Ki[r][c] * ilim[c] for c in range(3)))
+                    for r in range(3))
+        if worst > ishare * budget * (1 + 1e-6):
+            fails.append(f"MODEL.JSON honing integral_limit lets the integral "
+                         f"term reach {worst:.4f}, over its "
+                         f"{ishare * budget:.4f} share of the budget")
+        else:
+            print("    integral term capped at %.4f of the %.4f budget"
+                  % (worst, budget))
+
+    if hn.get("frame") != "robot body":
+        warns.append("MODEL.JSON honing does not declare the body frame; the "
+                     "error must be rotated by -h before these gains apply")
+
+
 def main(root: str) -> int:
     card = Card(root)
     m = card.m
@@ -458,6 +644,7 @@ def main(root: str) -> int:
     card.close()
 
     check_model(root, fails, warns)
+    check_honing(root, fails, warns)
 
     print()
     for w in warns:

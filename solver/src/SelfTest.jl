@@ -1862,6 +1862,136 @@ function test_sweep_cost()
     ok
 end
 
+"""
+The honing gains: the PID `MODEL.JSON` ships for the final approach.
+
+These are not a benchmark -- `bench/honing.jl` measures how the loop actually
+lands -- but the invariants the derivation must never lose. Each one is a bug
+that shipped, or that the design deliberately rules out.
+"""
+function test_honing()
+    println("\n[18] the honing gains derive from the model, not from tuning")
+    ok = true
+    ex() = Model((318.44f0, 6.12f0, -4.87f0, -5.33f0, 241.07f0, 3.94f0,
+                  0.128f0, -0.061f0, 13.706f0),
+                 (-2.418f0, 0.061f0, 1.472f0, 0.037f0, -3.106f0, -0.884f0,
+                  0.0021f0, 0.0009f0, -4.233f0), (0f0, 0f0, 0f0),
+                 (-21.66f0, -0.42f0, 0.53f0, -0.31f0, -27.94f0, -0.18f0,
+                  0.004f0, -0.002f0, -1.882f0),
+                 (-0.00417f0, 0.00008f0, 0.0312f0, 0.00011f0, -0.00583f0,
+                  -0.0204f0, 0f0, 0f0, -0.2461f0),
+                 (0f0, 0f0, 0f0), (5f0, 5f0, 0.15f0), 0.55f0)
+    m = ex()
+    h = honing_gains(m, Dict())
+
+    # Lambda is the linearised damping: the velocity block plus the Coulomb
+    # block straightened out inside its band. Getting the 1/eps wrong here is
+    # silent -- the gains still look plausible -- so pin one entry by hand.
+    lam00 = -(-2.418 + -21.66 / 5)
+    ok &= _check(isapprox(h["Lambda"][1][1], lam00; rtol = 1e-6),
+                 "Lambda linearises Coulomb inside its band",
+                 @sprintf("%.4f vs %.4f", h["Lambda"][1][1], lam00))
+
+    # B_eff, not A_u. Designing against raw A_u claims about twice the
+    # acceleration the tyres deliver and the loop overshoots badly.
+    tg = tanh(0.5) / 0.5
+    ok &= _check(isapprox(h["traction_gain"]["value"], tg; rtol = 1e-6),
+                 "the design uses the authority the tyres deliver",
+                 @sprintf("gain %.5f at half the knee", tg))
+    Beff = [[tg * Float64(m.B[(r - 1) * 3 + c]) for c in 1:3] for r in 1:3]
+    prod = mul3(h["B_eff_inv"], Beff)
+    err = maximum(abs(prod[r][c] - (r == c ? 1.0 : 0.0)) for r in 1:3, c in 1:3)
+    ok &= _check(err < 1e-9, "B_eff_inv really inverts B_eff",
+                 @sprintf("max |B_eff_inv*B_eff - I| = %.2e", err))
+
+    # The one that matters most. A negative kd is a controller spending
+    # command to cancel the drivetrain's own friction: correct on paper,
+    # badly fragile in simulation. The max() in the third pole rules it out.
+    ok &= _check(all(h["poles"]["kd_diag"] .>= 0),
+                 "no axis gets negative derivative gain",
+                 string(round.(h["poles"]["kd_diag"], digits = 4)))
+
+    # Well-damped axes keep their own drag rather than paying gain for it.
+    w = h["omega"]
+    lam = [h["Lambda"][i][i] for i in 1:3]
+    ok &= _check(all(lam[i] >= 3w ? h["poles"]["kd_diag"][i] == 0.0 :
+                     h["poles"]["kd_diag"][i] > 0 for i in 1:3),
+                 "a well-damped axis takes kd = 0, a light one does not",
+                 @sprintf("lambda = %s, 3w = %.3f",
+                          string(round.(lam, digits = 2)), 3w))
+
+    # Bandwidth is pinned by the budget in the fine band, and the bisection
+    # should sit right on it rather than merely under it.
+    ef = [h["fine_band"]["cm"], h["fine_band"]["cm"], h["fine_band"]["rad"]]
+    n1 = sum(abs, mulv3(h["Kp"], ef))
+    bud = h["config"]["budget"]
+    ok &= _check(n1 <= bud * (1 + 1e-6) && n1 > bud * 0.999,
+                 "Kp is exactly as hot as the fine-band budget allows",
+                 @sprintf("|Kp*e_fine|_1 = %.5f vs budget %.5f", n1, bud))
+    ok &= _check(h["omega_limits"]["bound_by"] in ("saturation", "loop_rate"),
+                 "the block says which bound set the bandwidth",
+                 h["omega_limits"]["bound_by"])
+
+    # Anti-windup is required, not advisory: without a clamp the integrator
+    # walks the command out of the octahedron and the loop never settles.
+    il = h["integral_limit"]["value"]
+    worst = sum(abs, mulv3(h["Ki"], il))
+    share = h["config"]["integral_share"]
+    ok &= _check(all(il .> 0) && worst <= share * bud * (1 + 1e-6),
+                 "the integral term cannot claim more than its share",
+                 @sprintf("%.4f of %.4f", worst, share * bud))
+
+    # A diagonal plant must reproduce the textbook scalar gains, or the
+    # matrix algebra is dressing up something wrong.
+    md = Model((300f0, 0f0, 0f0, 0f0, 200f0, 0f0, 0f0, 0f0, 12f0),
+               (-0.4f0, 0f0, 0f0, 0f0, -0.3f0, 0f0, 0f0, 0f0, -0.5f0),
+               (0f0, 0f0, 0f0), (0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 0f0),
+               (0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 0f0),
+               (0f0, 0f0, 0f0), (5f0, 5f0, 0.15f0), 0.55f0)
+    hd = honing_gains(md, Dict())
+    wd = hd["omega"]
+    tgd = hd["traction_gain"]["value"]
+    good = true
+    for i in 1:3
+        b = tgd * Float64(md.B[(i - 1) * 3 + i])
+        l = hd["Lambda"][i][i]
+        p = max(l - 2wd, wd)
+        good &= isapprox(hd["Kp"][i][i], (wd^2 + 2p * wd) / b; rtol = 1e-9)
+        good &= isapprox(hd["Ki"][i][i], p * wd^2 / b; rtol = 1e-9)
+        good &= isapprox(hd["Kd"][i][i], (p + 2wd - l) / b; rtol = 1e-9)
+        good &= all(abs(hd["Kp"][i][c]) < 1e-12 for c in 1:3 if c != i)
+    end
+    ok &= _check(good, "a diagonal plant collapses to the scalar gains",
+                 @sprintf("all three axes, w = %.4f", wd))
+
+    # A singular A_u means the three axes do not have independent authority.
+    # No controller can be derived from that, so it must be refused rather
+    # than shipped as infinities.
+    sing = Model((1f0, 2f0, 3f0, 2f0, 4f0, 6f0, 3f0, 6f0, 9f0), m.A, m.q, m.S,
+                 m.D, m.c, m.eps, m.knee)
+    threw = try
+        honing_gains(sing, Dict()); false
+    catch
+        true
+    end
+    ok &= _check(threw, "a singular A_u is refused, not shipped")
+
+    # The block has to survive the trip through JSON: model_json is what the
+    # card actually gets, and a key renamed there is a robot that reads zero.
+    mj = model_json(m, @__FILE__, true, Dict())
+    hj = get(mj, "honing", nothing)
+    ok &= _check(hj !== nothing &&
+                 all(haskey(hj, k) for k in ("Kp", "Ki", "Kd", "B_eff_inv",
+                                             "Lambda", "integral_limit",
+                                             "omega", "poles", "fine_band",
+                                             "config", "traction_gain")),
+                 "model_json carries the whole honing block")
+    ok &= _check(mj["schema_version"] == 2,
+                 "honing is additive: the schema does not bump",
+                 "schema_version 2")
+    ok
+end
+
 """Run every self-test. Returns a process exit code."""
 function self_test()
     _PASS[] = 0; _FAIL[] = 0
@@ -1884,6 +2014,7 @@ function self_test()
     test_cell_bytes()
     test_escape()
     test_sweep_cost()
+    test_honing()
     @printf("\n%d passed, %d failed\n", _PASS[], _FAIL[])
     _FAIL[] == 0 ? 0 : 1
 end

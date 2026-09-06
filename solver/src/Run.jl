@@ -930,6 +930,280 @@ function plan(cfg::AbstractDict)
     )
 end
 
+# --- Honing gains -------------------------------------------------------
+#
+# The tables drive the robot to a handoff region, not to the target point.
+# A PID owns the last few centimetres, and its gains are not tuned by hand:
+# inside that region the fitted model linearises to a plant whose gains have
+# a closed form, so the regression that produced `A_u` and `A_s` also
+# produces the controller.
+
+"""3x3 inverse by cofactors.
+
+Written out rather than pulling in LinearAlgebra: the matrices here are
+always exactly 3x3, and the module has no linear-algebra dependency to
+justify for nine multiplies.
+"""
+function inv3(M)
+    a, b, c = M[1][1], M[1][2], M[1][3]
+    d, e, f = M[2][1], M[2][2], M[2][3]
+    g, h, i = M[3][1], M[3][2], M[3][3]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    isfinite(det) && abs(det) > 1e-12 ||
+        error("A_u is singular (det = $det); the drivetrain fit does not " *
+              "give the three axes independent authority, so no controller " *
+              "can be derived from it")
+    [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+     [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+     [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
+end
+
+mul3(X, Y) = [[sum(X[r][k] * Y[k][c] for k in 1:3) for c in 1:3] for r in 1:3]
+mulv3(X, v) = [sum(X[r][k] * v[k] for k in 1:3) for r in 1:3]
+scale3(s, X) = [[s * X[r][c] for c in 1:3] for r in 1:3]
+
+"""
+Derive the three honing PID controllers from the fitted model.
+
+Near the target both the error and the velocity are small, and in that
+regime the model collapses. Quadratic drag `A_absv*(abs(v).*v)` has zero
+slope at `v = 0`; the omega^2 block likewise; and the smoothed Coulomb term
+is *linear* inside its band, contributing a Jacobian `S * diag(1/eps)`. What
+is left is a damped double integrator in the body frame:
+
+    dp/dt = v
+    dv/dt = Beff*u - Lambda*v,   Lambda = -(A + S*diag(1/eps))
+
+`Beff` is **not** `A_u`. The command during honing is small but not
+negligible, and the traction knee bites well before the octahedron edge, so
+the authority the robot actually delivers is `A_u * tanh(r)/r` at the design
+operating point `r = budget/knee`. Designing against raw `A_u` claims about
+twice the acceleration the tyres will give and the loop overshoots badly --
+this is the same trap section 8.7 of TABLE_FORMAT.md warns about, and the
+reason `honing_budget` defaults to *half* the knee: there the traction gain
+is still ~0.92, so the linear design is honest about itself.
+
+The gains come out as full 3x3 matrices because `Beff` and `Lambda` are.
+That is still three PID loops -- three errors, three integrators, three
+derivatives -- but each output mixes all three errors, which is what it
+means for the axes to be coupled.
+
+# Pole placement
+
+Multiplying by `inv(Beff)` turns the command into a requested acceleration,
+and `Kd` additionally cancels `Lambda`'s *off-diagonal* part, so the three
+channels decouple. Channel `i` then has
+
+    s^3 + (lambda_i + kd_i)*s^2 + kp_i*s + ki_i
+
+for the drivetrain's own damping `lambda_i = Lambda[i,i]`. Placing poles at
+`-p_i` and a double `-w` gives `kd_i = p_i + 2w - lambda_i`,
+`kp_i = w^2 + 2*p_i*w`, `ki_i = p_i*w^2`.
+
+The third pole is `p_i = max(lambda_i - 2w, w)`, which is what keeps
+`kd_i >= 0`:
+
+- A **well-damped** axis (`lambda_i >= 3w`) takes `p_i = lambda_i - 2w` and
+  `kd_i = 0`. The controller uses the drag the robot already has instead of
+  paying derivative gain for it.
+- A **lightly damped** axis (`lambda_i < 3w`) takes `p_i = w`, giving the
+  triple pole at `-w` and `kd_i = 3w - lambda_i > 0`.
+
+The two branches meet continuously at `lambda_i = 3w`. The naive triple pole
+everywhere would demand `kd_i = 3w - lambda_i < 0` on a well-damped axis:
+*negative* derivative gain, i.e. a controller spending command to cancel the
+drivetrain's own friction. It places the poles correctly on paper and is
+badly fragile in simulation -- a robot 30% less draggy than its fit
+overshoots by five times -- so it is ruled out by construction.
+
+# Bandwidth
+
+`w` is not a free parameter. It is pinned by the command budget: requiring
+the proportional term alone to stay inside the budget at the worst-case
+error in the *fine band* bounds it, and a sampled loop cannot track a pole
+faster than about a tenth of its rate. `norm1(Kp(w)*efine)` is increasing in `w` but
+no longer a closed form once `p_i` has a max in it, so the saturation bound
+is bisected rather than solved. Take the smaller of the two bounds.
+"""
+function honing_gains(m::Model, cfg)
+    row3(t, r) = [Float64(t[(r - 1) * 3 + c]) for c in 1:3]
+    B = [row3(m.B, r) for r in 1:3]
+    A = [row3(m.A, r) for r in 1:3]
+    S = [row3(m.S, r) for r in 1:3]
+    eps = [Float64(m.eps[i]) for i in 1:3]
+    knee = Float64(m.knee)
+
+    # Coulomb linearised inside its band: csign(v) = v/eps there, so the
+    # column scales by 1/eps. This is why the band is part of the model and
+    # not a solver convenience -- it sets how much damping the robot sees at
+    # a standstill.
+    Lambda = [[-(A[r][c] + S[r][c] / eps[c]) for c in 1:3] for r in 1:3]
+
+    # Reported, not used: the gains are sized against the fine band, so
+    # where the robot chooses to hand over does not change them. It is on
+    # the card so the robot side can see what the design had in mind.
+    hcm  = Float64(getc(cfg, "honing_handoff_cm", 15.0))
+    hrad = Float64(getc(cfg, "honing_handoff_rad", 0.25))
+    hz     = Float64(getc(cfg, "honing_loop_hz", 50.0))
+    # Half the knee: honing is meant to be gentle, and staying well inside
+    # the knee is also what makes the linear design honest (see above).
+    budget = Float64(getc(cfg, "honing_budget", 0.5 * knee))
+    scale  = Float64(getc(cfg, "honing_bandwidth_scale", 1.0))
+    ishare = Float64(getc(cfg, "honing_integral_share", 0.25))
+    (budget > 0 && hz > 0 && scale > 0 && 0 < ishare < 1) ||
+        error("honing config must be positive (honing_budget=$budget, " *
+              "honing_loop_hz=$hz, honing_bandwidth_scale=$scale, " *
+              "honing_integral_share=$ishare), with the integral share below 1")
+
+    # Authority the tyres actually deliver at the design operating point.
+    r_op = budget / knee
+    tgain = r_op < 1e-6 ? 1.0 : tanh(r_op) / r_op
+    Beff = scale3(tgain, B)
+    Binv = inv3(Beff)
+
+    lam = [Lambda[i][i] for i in 1:3]
+    Loff = [[r == c ? 0.0 : Lambda[r][c] for c in 1:3] for r in 1:3]
+    # The band the bandwidth is actually sized against. Saturating on the way
+    # in from the handoff corner is fine and fast -- kd >= 0 and the clamped
+    # integrator make it safe, and measured overshoot stays under 5%. What
+    # matters is that the controller is linear and gentle once it is close,
+    # which is the whole point of honing. Sizing against the handoff corner
+    # instead costs a factor of eight in bandwidth and never settles.
+    fcm = Float64(getc(cfg, "honing_fine_cm", 2.0))
+    efine = [fcm, fcm, Float64(getc(cfg, "honing_fine_rad", 0.03))]
+
+    # Scalar per-channel design, then back through inv(Beff).
+    function gains_at(w)
+        p  = [max(lam[i] - 2w, w) for i in 1:3]
+        kp = [w^2 + 2 * p[i] * w for i in 1:3]
+        ki = [p[i] * w^2 for i in 1:3]
+        kd = [p[i] + 2w - lam[i] for i in 1:3]
+        Kp = [[Binv[r][c] * kp[c] for c in 1:3] for r in 1:3]
+        Ki = [[Binv[r][c] * ki[c] for c in 1:3] for r in 1:3]
+        # Kd = Binv*(diag(kd) - Loff): the diagonal adds damping where the
+        # drivetrain lacks it, the off-diagonal cancels axis coupling.
+        Kd = [[Binv[r][c] * kd[c] - sum(Binv[r][k] * Loff[k][c] for k in 1:3)
+               for c in 1:3] for r in 1:3]
+        (Kp, Ki, Kd, p, kd)
+    end
+    prop_norm(w) = sum(abs, mulv3(gains_at(w)[1], efine))
+
+    # Bisect the saturation bound. prop_norm is increasing in w, so bracket
+    # upward from a bandwidth no loop would ever use, then halve in.
+    w_hi = 1e-3
+    while prop_norm(w_hi) < budget && w_hi < 1e4
+        w_hi *= 2
+    end
+    w_lo = w_hi / 2
+    for _ in 1:80
+        mid = 0.5 * (w_lo + w_hi)
+        prop_norm(mid) < budget ? (w_lo = mid) : (w_hi = mid)
+    end
+    w_sat = w_lo
+    w_loop = 2pi * hz / 10
+    w = scale * min(w_sat, w_loop)
+    isfinite(w) && w > 0 ||
+        error("honing bandwidth came out as $w; check honing_loop_hz, " *
+              "honing_budget and honing_bandwidth_scale are positive")
+
+    Kp, Ki, Kd, p, kd = gains_at(w)
+
+    # Anti-windup. Without a clamp the integrator walks the command straight
+    # out of the octahedron and the loop never settles -- measured, not
+    # assumed. The limit gives the integral term at most `ishare` of the
+    # budget when every axis is pinned, split evenly across the three.
+    ilim = [begin
+                col = sum(abs(Ki[r][c]) for r in 1:3)
+                col > 0 ? ishare * budget / (3 * col) : 0.0
+            end for c in 1:3]
+
+    Dict(
+        "note" => "Gains for the PID that takes over from the tables for " *
+            "the final approach. Derived from this same model, so there is " *
+            "no separate tuning step. Additive to schema 2: a reader that " *
+            "does not know this block is unaffected by it.",
+        "frame" => "robot body",
+        "law" => "u = Kp*e + Ki*clamp(integral(e), -integral_limit, " *
+                 "integral_limit) + Kd*d(e)/dt + u_ff",
+        "error" => Dict(
+            "vector" => ["e_fwd", "e_strafe", "e_turn"],
+            "units" => ["cm", "cm", "rad"],
+            "note" => "e = target - current, rotated into the ROBOT BODY " *
+                "frame, same as the state block. The tables are field " *
+                "frame, so rotate by -h first.",
+        ),
+        "feedforward" => Dict(
+            "formula" => "u_ff = B_eff_inv*(a_ref + Lambda*v_ref)",
+            "why" => "Model inversion: it asks for the command the fit says " *
+                "produces the reference motion, leaving the PID only the " *
+                "residual to clean up. Optional -- the gains stand alone -- " *
+                "but it is two matrix products and it tracks far better. " *
+                "Lambda already contains the linearised Coulomb term, so no " *
+                "separate break-away command is needed.",
+        ),
+        "Kp" => Kp, "Ki" => Ki, "Kd" => Kd,
+        "B_eff_inv" => Binv, "Lambda" => Lambda,
+        "traction_gain" => Dict(
+            "value" => tgain,
+            "why" => "B_eff = A_u * tanh(r)/r at r = budget/knee = " *
+                "$(round(r_op, digits = 4)), the authority the tyres " *
+                "actually deliver at the command this controller commands. " *
+                "Designing against raw A_u claims roughly twice the " *
+                "acceleration the robot has. B_eff_inv already contains it, " *
+                "so do NOT apply it again -- but DO still apply the " *
+                "section 8.4 saturation to the final command.",
+        ),
+        "integral_limit" => Dict(
+            "value" => ilim,
+            "units" => ["cm*s", "cm*s", "rad*s"],
+            "why" => "Clamp each integrator to this before multiplying by " *
+                "Ki, so the integral term can claim at most " *
+                "$(round(ishare * 100)) percent of the command budget. " *
+                "Required, not optional: without it the integrator winds " *
+                "past the octahedron and the loop does not settle. Also " *
+                "stop integrating while the command is saturated.",
+        ),
+        "omega" => w,
+        "poles" => Dict(
+            "double" => w,
+            "third" => p,
+            "kd_diag" => kd,
+            "why" => "Per axis the closed loop is (s+third)(s+omega)^2. An " *
+                "axis whose own damping already exceeds 3*omega takes " *
+                "kd = 0 and keeps that damping; a lighter one gets the " *
+                "triple pole at -omega. kd is never negative, so the " *
+                "controller never cancels the drivetrain's own friction.",
+        ),
+        "omega_limits" => Dict(
+            "saturation" => w_sat,
+            "loop_rate" => w_loop,
+            "bound_by" => w_sat <= w_loop ? "saturation" : "loop_rate",
+            "why" => "The smaller of the two sets the bandwidth. " *
+                "`saturation` keeps Kp*e inside the budget everywhere " *
+                "in the fine band; `loop_rate` keeps the poles within a " *
+                "tenth of the sampling rate. Outside the fine band the " *
+                "command may saturate, which is intended.",
+        ),
+        "handoff" => Dict(
+            "cm" => hcm, "rad" => hrad,
+            "note" => "Where the tables hand over. Engaging further out " *
+                "than this is allowed but saturates the command for longer.",
+        ),
+        "fine_band" => Dict(
+            "cm" => efine[1], "rad" => efine[3],
+            "why" => "Inside this band the command is guaranteed to stay " *
+                "within the budget, so the controller is linear and gentle " *
+                "exactly where precision matters. Outside it, saturating is " *
+                "intended and harmless: it is what makes the approach quick.",
+        ),
+        "config" => Dict("loop_hz" => hz, "budget" => budget,
+                         "bandwidth_scale" => scale,
+                         "integral_share" => ishare,
+                         "fine_cm" => efine[1], "fine_rad" => efine[3]),
+        "derivation" => "TABLE_FORMAT.md section 8.8",
+    )
+end
+
 """
 Build the dynamics model the robot needs alongside the tables.
 
@@ -948,7 +1222,8 @@ The matrices describe the model **as the solver actually used it**, so if
 `zero_c` was set the constant here is zero too. Otherwise the robot's
 dynamics would disagree with the tables that were solved from them.
 """
-function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
+function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool,
+                    cfg = Dict())
     row3(t, r) = [Float64(t[(r - 1) * 3 + c]) for c in 1:3]
     Am = [row3(m.A, r) for r in 1:3]      # velocity -> acceleration
     Bm = [row3(m.B, r) for r in 1:3]      # control  -> acceleration
@@ -1045,6 +1320,7 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool)
             ("A_sgn", any(any(!iszero, r) for r in A_sgn)),
             ("A_absv", any(any(!iszero, r) for r in A_abs)),
             ("k", any(!iszero, k))) if nz],
+        "honing" => honing_gains(m, cfg),
     )
 end
 
@@ -1744,12 +2020,14 @@ function run_solve(cfg::AbstractDict)
         JSON3.pretty(io, manifest)
     end
 
-    mj = model_json(m, reg_path, Bool(getc(cfg, "zero_c", true)))
+    mj = model_json(m, reg_path, Bool(getc(cfg, "zero_c", true)), cfg)
     open(joinpath(out_dir, "MODEL.JSON"), "w") do io
         JSON3.pretty(io, mj)
     end
     progress(phase = "model", file = "MODEL.JSON",
-             nonzero_blocks = mj["nonzero_blocks"])
+             nonzero_blocks = mj["nonzero_blocks"],
+             honing_omega = mj["honing"]["omega"],
+             honing_bound_by = mj["honing"]["omega_limits"]["bound_by"])
     progress(phase = "done", out_dir = out_dir, targets = length(entries))
     manifest
 end

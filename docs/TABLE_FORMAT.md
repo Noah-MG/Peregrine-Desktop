@@ -703,7 +703,227 @@ a = A_u * u = [166.2, -2.78, 0.067]        (s = 0, so every other block drops)
 166 cm/s², not the 318 that `A_u` alone suggests. Skipping step 4 would have
 the robot plan for nearly double the acceleration it can produce.
 
+### 8.8 Honing gains — the PID for the final approach
+
+The value tables stop at a **handoff region**, not at the target point. Getting
+the last few centimetres exactly right is a different problem: it wants
+precision and a light touch, not a minimum-time policy running at full stick.
+So `MODEL.JSON` also carries a ready-tuned PID for that stage, under `honing`.
+
+**There is no tuning step.** The gains are derived from the same regression as
+the rest of the file. Near the target the drivetrain linearises, and the gains
+of a controller for the linearised plant have a closed form. Nothing here needs
+a calibration run of its own, and nothing here is a knob to twiddle on the
+field.
+
+The block is **additive to schema 2**. A reader written before it existed is
+unaffected; a card written by an older solver simply has no `honing` key.
+
+#### 8.8.1 Symbols
+
+| Symbol | Where it comes from | Meaning |
+| --- | --- | --- |
+| `e` | you | `target - current` **pose** error, body frame: `[fwd, strafe, turn]` in cm, cm, rad |
+| `Kp`, `Ki`, `Kd` | the block | 3×3 gain matrices |
+| `Lambda` | the block | 3×3 linearised damping, 1/s |
+| `B_eff_inv` | the block | 3×3 inverse of the authority the tyres actually deliver |
+| `integral_limit` | the block | per-axis clamp on the integrator, cm·s / cm·s / rad·s |
+| `omega` | the block | the closed-loop bandwidth the design was sized to, rad/s |
+| `fine_band` | the block | the error inside which the command is guaranteed not to saturate |
+
+`e` is a **pose** error, not a velocity error, and it is **body frame** — the
+same frame as everything else in §8. The tables are field frame, so rotate by
+`-h` first, exactly as §8.3 requires for velocities.
+
+#### 8.8.2 The control law
+
+```
+i     = clamp(i + e*dt, -integral_limit, +integral_limit)   # only if not saturated
+u_fb  = Kp*e + Ki*i + Kd*de/dt
+u     = u_fb + u_ff                                        # u_ff optional, see 8.8.5
+```
+
+Then apply the §8.4 traction saturation and clip to the octahedron
+`|fwd| + |strafe| + |turn| <= 1`, exactly as you would any other command.
+
+Three things about this are not optional:
+
+- **The integrator must be clamped**, to `integral_limit`. Without it the
+  integrator winds the command straight out of the octahedron and the loop
+  never settles. This is measured, not theoretical.
+- **Freeze the integrator while the command is saturated.** Integrating
+  against a limit you cannot exceed only buys authority that does not exist.
+- **`de/dt` is the derivative of the error.** With a stationary target that is
+  just `-v` in the body frame, which is what you already have; use it rather
+  than differencing `e`, which is noisy.
+
+#### 8.8.3 Why these gains
+
+Near the target both the error and the velocity are small, and the model of
+§8.2 collapses:
+
+- quadratic drag `A_absv*(|s|.*s)` has **zero slope** at `v = 0` — it vanishes;
+- the `omega²` block likewise;
+- the smoothed Coulomb term is **linear** inside its band, since
+  `csign(v) = v/eps` there. It contributes `A_sgn * diag(1/coulomb_eps)`.
+
+What is left is a damped double integrator in the body frame:
+
+```
+dp/dt = v
+dv/dt = B_eff*u - Lambda*v,     Lambda = -(A_s_v + A_sgn*diag(1/coulomb_eps))
+```
+
+where `A_s_v` is the velocity half of `A_s` (its x/y/h columns are zero, §8.5).
+
+`B_eff` is **not** `A_u`. The honing command is small, but the traction knee
+bites well before the octahedron edge, so what the tyres deliver is
+`A_u * tanh(r)/r` at the operating point `r = budget/knee`. This is the §8.7
+trap in miniature: design against raw `A_u` and you claim roughly twice the
+acceleration you have, and the loop overshoots badly. `B_eff_inv` already
+contains this factor — **do not apply the traction gain to the gains a second
+time.** You still apply §8.4 to the final command, as always.
+
+Both matrices are full 3×3, so the gains are too. That is still **three PID
+loops** — three errors, three integrators, three derivatives — but each
+output mixes all three errors. That is simply what it means for the axes to
+be coupled; a mecanum chassis is not three independent robots.
+
+#### 8.8.4 Pole placement, and why `Kd` is never negative
+
+Multiplying by `B_eff_inv` turns the command into a requested acceleration, and
+`Kd` additionally cancels `Lambda`'s off-diagonal part, so the three channels
+decouple. Channel `i` then has characteristic polynomial
+
+```
+s³ + (lambda_i + kd_i)s² + kp_i*s + ki_i
+```
+
+against the drivetrain's own damping `lambda_i = Lambda[i][i]`. Placing poles
+at `-p_i` and a double `-omega` gives `kd_i = p_i + 2w - lambda_i`,
+`kp_i = w² + 2*p_i*w`, `ki_i = p_i*w²`. The third pole is
+`p_i = max(lambda_i - 2w, w)`:
+
+- a **well-damped** axis (`lambda_i >= 3w`) takes `kd_i = 0` and keeps the drag
+  it already has, rather than paying derivative gain for it;
+- a **lightly damped** axis (`lambda_i < 3w`) takes `p_i = w`, giving a triple
+  pole at `-omega` and `kd_i = 3w - lambda_i > 0`.
+
+The branches meet continuously at `lambda_i = 3w`, and `kd_i >= 0` always.
+
+This matters. The obvious design — a triple pole at `-omega` everywhere —
+demands `kd_i = 3w - lambda_i`, which on a well-damped axis is **negative**:
+a controller spending command to cancel the drivetrain's own friction. It
+places the poles correctly on paper and is badly fragile in practice. Simulated
+against the nonlinear model it overshoots by a factor of four nominally, and by
+five and a half on a robot 30% less draggy than its fit. `verify_tables.py`
+fails any card whose `Kd` has a negative diagonal term.
+
+#### 8.8.5 Bandwidth, and the fine band
+
+`omega` is not a free parameter either. It is the smaller of two bounds:
+
+- **saturation**: `|Kp*e|₁ <= budget` for every `e` inside `fine_band`;
+- **loop rate**: `omega <= 2*pi*loop_hz/10`, since a sampled loop cannot track
+  a pole much faster than a tenth of its rate.
+
+Note the first is sized against the **fine band**, not the handoff distance.
+Saturating on the way in from the handoff corner is intended and harmless —
+`Kd >= 0` and the clamped integrator make it safe, and it is what makes the
+approach quick. What matters is that the controller is linear and gentle once
+it is *close*, which is the whole point of honing. Sizing against the handoff
+corner instead costs about a factor of eight in bandwidth and the robot never
+settles.
+
+`config.budget` defaults to **half the traction knee**, so honing runs at a
+fraction of full power and the linearisation stays honest about itself (the
+traction gain is still ~0.92 there).
+
+**Feedforward** is optional and worth having. `u_ff = B_eff_inv*(a_ref +
+Lambda*v_ref)` asks for the command the fit says produces the reference motion,
+leaving the PID only the residual. `Lambda` already contains the linearised
+Coulomb term, so no separate break-away command is needed. With a stationary
+target, `a_ref = v_ref = 0` and `u_ff` drops out.
+
+#### 8.8.6 A worked example
+
+The `honing` block that the §8.7 model produces, at the default config
+(`loop_hz` 50, `budget` = 0.5 × 0.55 = 0.275, `fine_band` 2 cm / 0.03 rad):
+
+```json
+"honing": {
+  "frame": "robot body",
+  "law": "u = Kp*e + Ki*clamp(integral(e), -integral_limit, integral_limit) + Kd*d(e)/dt + u_ff",
+  "Kp": [[ 0.0360318, -0.0012504,  0.0381302],
+         [ 0.0008021,  0.0652998, -0.0391032],
+         [-0.0003329,  0.0003023,  2.4441237]],
+  "Ki": [[ 0.0165087, -0.0005896,  0.0187047],
+         [ 0.0003675,  0.0307902, -0.0191820],
+         [-0.0001525,  0.0001425,  1.1989574]],
+  "Kd": [[ 5.71816e-06, -7.74879e-05,  0.0171762],
+         [-1.15812e-04, -2.37000e-06, -0.0089704],
+         [ 2.28362e-04,  4.01840e-05, -0.0002003]],
+  "B_eff_inv": [[ 0.00339581, -0.00008590,  0.00123129],
+                [ 0.00007559,  0.00448599, -0.00126271],
+                [-0.00003138,  0.00002077,  0.07892471]],
+  "Lambda": [[ 6.750000,  0.023000, -5.005333],
+             [ 0.025000,  8.694000,  2.084000],
+             [-0.002900, -0.000500, 16.779666]],
+  "traction_gain": { "value": 0.9242 },
+  "integral_limit": { "value": [1.3457636, 0.7269980, 0.0185283],
+                      "units": ["cm*s", "cm*s", "rad*s"] },
+  "omega": 1.0148450,
+  "poles": { "double": 1.0148450,
+             "third": [4.720310, 6.664310, 14.749976],
+             "kd_diag": [0.0, 0.0, 0.0] },
+  "omega_limits": { "saturation": 1.0148450, "loop_rate": 31.4159265,
+                    "bound_by": "saturation" },
+  "handoff": { "cm": 15.0, "rad": 0.25 },
+  "fine_band": { "cm": 2.0, "rad": 0.03 },
+  "config": { "loop_hz": 50.0, "budget": 0.275, "bandwidth_scale": 1.0,
+              "integral_share": 0.25, "fine_cm": 2.0, "fine_rad": 0.03 }
+}
+```
+
+Checks you can do by hand:
+
+```
+Lambda[0][0] = -(A_s[0][3] + A_sgn[0][3]/coulomb_eps[3])
+             = -(-2.418 + -21.66/5) = 6.750           ✓
+traction gain: r = 0.275/0.55 = 0.5, tanh(0.5)/0.5 = 0.92423       ✓
+B_eff[0][0]  = 318.44 * 0.92423 = 294.31; the 3x3 inverse of B_eff
+               has [0][0] = 0.00339581                             ✓
+lambda_0 = 6.750 >= 3*omega = 3.045, so axis 0 is well damped:
+  kd_0 = 0, p_0 = 6.750 - 2*1.014845 = 4.720310                    ✓
+  kp_0 = omega^2 + 2*p_0*omega = 1.02992 + 9.58079 = 10.61071
+  Kp[0][0] = B_eff_inv[0][0] * kp_0 = 0.00339581 * 10.61071
+           = 0.0360318                                             ✓
+saturation is tight, as it should be — omega was solved for it:
+  |Kp * [2, 2, 0.03]|_1 = 0.2750 = budget                          ✓
+```
+
+Note `Kd`'s diagonal is zero here: all three axes are well damped, so the
+controller adds no derivative gain at all and `Kd` carries only the small
+off-diagonal terms that decouple the axes.
+
+The honing loop against the full **nonlinear** model, from the worst-case
+handoff corner (15 cm, 15 cm, 0.25 rad), settles in **1.9 s to under 0.005 cm
+and 0.0003 rad**, with 3.6% overshoot, clipping the command for the first ~10%
+of ticks. It stays inside a 0.1 cm final error across ±50% drag error and ±20%
+authority error. Reproduce with:
+
+```
+julia --project=solver solver/bench/honing.jl --example
+```
+
 ## 9. Notes for the robot side
+
+**The tables hand over; they do not arrive.** The value function is a
+minimum-time policy to the *handoff region*, not to the target point. Drive it
+with the rule below until you are inside roughly 15 cm and 0.25 rad, then hand
+to the honing PID of §8.8, which owns the last stretch and settles on the point
+without running at full stick. Those two stages answer different questions and
+neither substitutes for the other.
 
 **Keep chunk files open.** Reopening a file every loop cycle costs far more
 than the read. Consecutive queries almost always land in the same chunk or
