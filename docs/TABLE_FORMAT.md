@@ -716,6 +716,14 @@ of a controller for the linearised plant have a closed form. Nothing here needs
 a calibration run of its own, and nothing here is a knob to twiddle on the
 field.
 
+There is **one choice**, and it is a choice about the robot rather than about
+the controller: how much of the traction knee the approach may spend, in
+`config.budget_frac`. Half the knee by default. It sets the command budget and,
+through it, the bandwidth — see §8.8.5 — so it is the single dial from "gentle
+and slow" to "quick and close to the knee". Everything else in `config`
+describes the loop the gains will run in. All of it is recorded on the card, so
+a card always says what it was designed for.
+
 The block is **additive to schema 2**. A reader written before it existed is
 unaffected; a card written by an older solver simply has no `honing` key.
 
@@ -835,9 +843,23 @@ it is *close*, which is the whole point of honing. Sizing against the handoff
 corner instead costs about a factor of eight in bandwidth and the robot never
 settles.
 
-`config.budget` defaults to **half the traction knee**, so honing runs at a
-fraction of full power and the linearisation stays honest about itself (the
-traction gain is still ~0.92 there).
+`config.budget` defaults to **half the traction knee** (`budget_frac` 0.5), so
+honing runs at a fraction of full power and the linearisation stays honest
+about itself (the traction gain is still ~0.92 there). Raising `budget_frac`
+raises the saturation bound with it, which is why it is the dial to reach for
+when the approach is too slow: it buys command and bandwidth together, and the
+fine-band guarantee still holds at the new budget. `bandwidth_scale` above 1
+does not: it steps over that bound rather than lifting it, and
+`verify_tables.py` rejects any card whose `Kp` then leaves the budget inside
+the fine band. A budget outside the octahedron
+(`budget_frac` above `1/knee`) is refused outright: the wheels would clip the
+command the gains were sized against.
+
+Both ends of the dial are real mistakes, and only the nonlinear rollout of
+§8.8.6 tells them apart — too hot overshoots, too gentle is still short of the
+point when the time is up. At `budget_frac` 0.25 the §8.7 model misses its
+landing budget on most of the robustness cases; at 0.9 it settles in 1.3 s and
+passes them all, at the cost of more overshoot to absorb.
 
 **Feedforward** is optional and worth having. `u_ff = B_eff_inv*(a_ref +
 Lambda*v_ref)` asks for the command the fit says produces the reference motion,
@@ -880,8 +902,9 @@ The `honing` block that the §8.7 model produces, at the default config
                     "bound_by": "saturation" },
   "handoff": { "cm": 15.0, "rad": 0.25 },
   "fine_band": { "cm": 2.0, "rad": 0.03 },
-  "config": { "loop_hz": 50.0, "budget": 0.275, "bandwidth_scale": 1.0,
-              "integral_share": 0.25, "fine_cm": 2.0, "fine_rad": 0.03 }
+  "config": { "loop_hz": 50.0, "budget": 0.275, "budget_frac": 0.5,
+              "bandwidth_scale": 1.0, "integral_share": 0.25,
+              "fine_cm": 2.0, "fine_rad": 0.03 }
 }
 ```
 
@@ -915,6 +938,27 @@ authority error. Reproduce with:
 ```
 julia --project=solver solver/bench/honing.jl --example
 ```
+
+Against a real fit, pass a config instead of `--example`; only its
+`regression`, `zero_c` and `honing_*` keys are read, so no field, target list
+or solve is needed. The `honing_*` keys are the `config` block above, prefixed:
+`honing_budget_frac`, `honing_bandwidth_scale`, `honing_loop_hz`,
+`honing_fine_cm`, `honing_fine_rad`, `honing_handoff_cm`,
+`honing_handoff_rad`, `honing_integral_share`. `honing_budget` pins the budget
+outright instead of as a fraction of the knee.
+
+To see what a setting does without solving anything:
+
+```
+julia --project=solver solver/solve.jl config.json honing            # print
+julia --project=solver solver/solve.jl config.json honing <run_dir>  # and write
+```
+
+With a run directory it rebuilds that run's `MODEL.JSON` in place, which is
+sound because the gains never depended on the tables — only on the fit both
+were made from. It refuses if that is not the fit the run was solved from. The
+desktop wizard drives all of this from its optional `h` step, which also runs
+the rollout above.
 
 ## 9. Notes for the robot side
 

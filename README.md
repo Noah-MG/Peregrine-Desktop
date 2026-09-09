@@ -341,6 +341,43 @@ cannot quietly change what the job solves. `solver/cloud/README.md` §8.
 model itself — the online optimizer needs both. Nothing else goes on the
 card.
 
+## The final approach
+
+The tables stop at a **handoff region**, about 15 cm and 0.25 rad out, not at
+the target point. `MODEL.JSON` carries a PID for the rest of it under `honing`,
+and its gains are *derived* from the same regression as everything else: near
+the target the drivetrain linearises, and the controller for the linearised
+plant has a closed form. There is no tuning step and nothing to twiddle on the
+field. §8.8 of `docs/TABLE_FORMAT.md` is the spec.
+
+There is one choice in it, and it is about the robot rather than the
+controller: **how much of the traction knee the approach may spend**. Half the
+knee by default. It sets the command budget, and the budget is what limits the
+gains, so it moves command and bandwidth together — one dial from "gentle and
+slow" to "quick and close to the knee".
+
+Option `h` in the wizard is where you set it. Like `d`, it is optional and
+nothing downstream needs it; unlike `d` it can also write its answer back into
+a run that is already solved, because the gains never depended on the tables:
+
+```bash
+julia --project=solver solver/solve.jl config.json honing [<run_dir>]
+```
+
+Both ends of the dial are real mistakes, and neither shows up in the gains
+themselves — too hot overshoots, too gentle is still short of the point when
+the time is up. So the step offers to drive the **nonlinear** model with them
+and score where the robot actually stops, nominal and under fit error:
+
+```bash
+julia --project=solver solver/bench/honing.jl <config.json | --example>
+```
+
+On the §8.7 model at the default setting it settles in 1.9 s from the
+worst-case corner with 3.6% overshoot, and holds a 0.1 cm landing across ±50%
+drag error and ±20% authority error. At a quarter of the knee it misses that
+landing on most of the robustness cases: gentle is not the same as safe.
+
 ## Checking the model form
 
 ```bash

@@ -379,6 +379,14 @@ def check_honing(root: str, fails: list, warns: list) -> None:
         fails.append("MODEL.JSON honing.config is missing a positive budget, "
                      "integral_share, loop_hz, bandwidth_scale or fine band")
         return
+    # The octahedron is a hard limit on the command. Gains sized against a
+    # budget outside it are designed for authority the wheels clip away, and
+    # then the fine band below does not mean what it says.
+    if budget > 1:
+        fails.append(f"MODEL.JSON honing.config.budget is {budget:.4f}, "
+                     "outside the octahedron |fwd| + |strafe| + |turn| <= 1: "
+                     "the gains are sized against a command the wheels clip")
+        return
 
     # Rebuild the plant the gains claim to describe, from the card's own
     # matrices. Lambda is the linearised damping: the velocity block plus the
@@ -460,6 +468,11 @@ def check_honing(root: str, fails: list, warns: list) -> None:
 
     print("    omega = %.4f (bound by %s), gains re-derived and matched"
           % (w, (hn.get("omega_limits") or {}).get("bound_by", "?")))
+    # How hard the approach was told it could push. It is the one setting in
+    # the block anyone chooses, so it is worth reading back off the card
+    # rather than inferring it from the gains.
+    print("    budget %.4f, %.0f%% of the %.2f traction knee"
+          % (budget, 100 * budget / knee, knee))
     print("    third poles = %s" % [round(v, 3) for v in p])
 
     # Negative derivative gain means the controller spends command cancelling

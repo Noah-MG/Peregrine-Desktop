@@ -1932,6 +1932,43 @@ function test_honing()
                  "the block says which bound set the bandwidth",
                  h["omega_limits"]["bound_by"])
 
+    # The one setting anyone is expected to have an opinion about: how much
+    # of the traction knee the approach may spend. It has to move the budget
+    # *and* the bandwidth, because a knob that only bought command would let
+    # a user ask for a harder push and get a slower loop.
+    hot = honing_gains(m, Dict("honing_budget_frac" => 0.8))
+    ok &= _check(isapprox(hot["config"]["budget"], 0.8 * Float64(m.knee);
+                          rtol = 1e-6) &&
+                 isapprox(hot["config"]["budget_frac"], 0.8; rtol = 1e-6) &&
+                 hot["omega"] > w,
+                 "aggressiveness buys budget and bandwidth together",
+                 @sprintf("frac 0.8: budget %.4f, omega %.4f vs %.4f at 0.5",
+                          hot["config"]["budget"], hot["omega"], w))
+
+    # The absolute form still wins, and the fraction the card reports is the
+    # one that was actually used rather than the one that was asked for.
+    pinned = honing_gains(m, Dict("honing_budget_frac" => 0.8,
+                                  "honing_budget" => 0.11))
+    ok &= _check(isapprox(pinned["config"]["budget"], 0.11; rtol = 1e-6) &&
+                 isapprox(pinned["config"]["budget_frac"],
+                          0.11 / Float64(m.knee); rtol = 1e-6),
+                 "an absolute budget overrides the fraction, and is reported " *
+                 "as the fraction it is",
+                 @sprintf("budget %.4f, frac %.4f", pinned["config"]["budget"],
+                          pinned["config"]["budget_frac"]))
+
+    # Outside the octahedron the wheels clip the command the gains are sized
+    # against, so the fine band would stop meaning what it says. Refused
+    # rather than shipped: it is the one way the aggressiveness knob could
+    # produce a controller designed for authority that does not exist.
+    over = try
+        honing_gains(m, Dict("honing_budget_frac" => 2.5)); false
+    catch
+        true
+    end
+    ok &= _check(over, "a budget outside the octahedron is refused",
+                 @sprintf("2.5 x a knee of %.2f", Float64(m.knee)))
+
     # Anti-windup is required, not advisory: without a clamp the integrator
     # walks the command out of the octahedron and the loop never settles.
     il = h["integral_limit"]["value"]

@@ -10,6 +10,10 @@
 # deliberately wrong. Exits non-zero if any case misses its budget, so it can
 # gate a card.
 #
+# Only the `regression`, `zero_c` and `honing_*` keys of the config are read:
+# the gains do not depend on the grid, the field or the targets, so neither
+# does this. That is what makes it cheap enough to run while tuning.
+#
 # `--example` uses the model from TABLE_FORMAT.md section 8.7 instead of a
 # config, so the check runs without a field, a target list or a solve.
 
@@ -48,13 +52,24 @@ function main()
         println("model: TABLE_FORMAT.md section 8.7 example\n")
         example_model(), Dict()
     else
-        case = load_case(ARGS[1])
-        println("model: ", cfg_regression(ARGS[1]), "\n")
-        case.m, case.cfg
+        cfg = PS.readjson(ARGS[1], Dict)
+        println("model: ", String(cfg["regression"]), "\n")
+        load_honing_model(cfg), cfg
     end
     honing_report(m, cfg) ? 0 : 1
 end
 
-cfg_regression(p) = String(PS.readjson(p, Dict)["regression"])
+"""The model the gains come from, and nothing else.
+
+Deliberately not `load_case`: the honing loop never touches the grid, the
+field or the occupancy, and building them would make a check that answers in
+a moment take as long as a plan does. It is also what lets the wizard offer
+this straight after a fit, with no field file in the workspace yet.
+"""
+function load_honing_model(cfg)
+    m, _ = PS.load_model(String(cfg["regression"]))
+    Bool(PS.getc(cfg, "zero_c", true)) || return m
+    PS.Model(m.B, m.A, m.q, m.S, m.D, (0.0f0, 0.0f0, 0.0f0), m.eps, m.knee)
+end
 
 exit(main())

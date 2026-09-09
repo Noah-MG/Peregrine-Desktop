@@ -20,7 +20,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 from datetime import datetime, timezone
 
 import sdcard
@@ -32,6 +34,7 @@ DIAGNOSER = os.path.join(REPO, "calibration", "diagnose_fit.py")
 PODFINDER = os.path.join(REPO, "calibration", "find_pod_offsets.py")
 SOLVER = os.path.join(REPO, "solver", "solve.jl")
 SOLVER_PROJ = os.path.join(REPO, "solver")
+HONING_BENCH = os.path.join(REPO, "solver", "bench", "honing.jl")
 EXAMPLES = os.path.join(REPO, "solver", "examples")
 SETTINGS = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Peregrine",
                         "wizard.json")
@@ -652,7 +655,28 @@ DEFAULTS = {
     # unreachable anyway, so there is no reason to turn it off.
     "escape": True,
     "escape_iterations": 60,
+    # The final-approach PID that MODEL.JSON carries beside the tables. These
+    # are not gains: the gains are derived from the fit (TABLE_FORMAT.md
+    # section 8.8), and these are the handful of judgements the derivation
+    # takes. `honing_budget_frac` is the one worth an opinion -- how much of
+    # the traction knee the approach may spend -- and the rest describe the
+    # loop it will run in. Step `h` edits them; a solve only carries them.
+    "honing_budget_frac": 0.5,
+    "honing_bandwidth_scale": 1.0,
+    "honing_loop_hz": 50.0,
+    "honing_fine_cm": 2.0,
+    "honing_fine_rad": 0.03,
+    "honing_handoff_cm": 15.0,
+    "honing_handoff_rad": 0.25,
+    "honing_integral_share": 0.25,
 }
+
+# Passed through to the solver under exactly these names, so the wizard's
+# saved answers and the solver config say the same thing in the same words.
+HONING_KEYS = ("honing_budget_frac", "honing_bandwidth_scale",
+               "honing_loop_hz", "honing_fine_cm", "honing_fine_rad",
+               "honing_handoff_cm", "honing_handoff_rad",
+               "honing_integral_share")
 
 
 ELEM_BYTES = {"u8": 1, "u16": 2, "f16": 2, "f32": 4}
@@ -842,6 +866,11 @@ def config_from(ws: Workspace, run_dir: str, d: dict) -> dict:
         "control_level": d["level"],
         "escape": d.get("escape", True),
         "escape_iterations": d.get("escape_iterations", 60),
+        # The honing PID is derived from the same regression the tables are
+        # and ships in MODEL.JSON beside them, so its settings travel in the
+        # solve config. Written even when untouched: what the card claims it
+        # was designed for should not depend on which wizard wrote it.
+        **{k: d.get(k, DEFAULTS[k]) for k in HONING_KEYS},
         "zero_c": True,
         "backend": "auto",
         # The scratch file for a tiled solve is the whole value function --
@@ -1658,6 +1687,7 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
     n_targets = 1
     done_targets = 0
     tiled = False
+    honing = {}
     started = time.time()
     solve_started = [None]      # when the first target actually began
     esc_share = [0.0]           # fraction of a target's slot the escape owns
@@ -1760,6 +1790,12 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
                 show((done_targets + within) / n_targets,
                      f"{ev['target_name']}  escape "
                      f"{ev['iter']}/{ev['iters']}", ev.get("eta_s"))
+            elif ph == "model":
+                # Held rather than printed: the bar owns the line until it is
+                # done with it. The honing gains are the one thing on the card
+                # the user may have chosen by hand (step `h`), so the run
+                # should say what actually landed there.
+                honing.update(ev)
             elif ph == "encode":
                 show((done_targets + 1) / n_targets,
                      f"{ev['target_name']}  writing")
@@ -1782,6 +1818,11 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
         print(err.strip()[:1500])
         return
     print(c(f"  tables written to {run_dir}", "32"))
+    if honing:
+        print(c("  honing PID: omega %.3f rad/s at %.0f%% of the traction knee "
+                "(bound by %s)"
+                % (honing["honing_omega"], 100 * honing["honing_budget_frac"],
+                   honing["honing_bound_by"]), "2"))
 
     print()
     print(c("  verifying against the format spec...", "2"))
@@ -1790,6 +1831,330 @@ def _stream_solve(cfgpath: str, run_dir: str) -> None:
     sys.stdout.write(v.stdout)
     if v.returncode != 0:
         print(c("  verification FAILED -- do not write this to the card", "31"))
+
+
+# --------------------------------------------------------------------------
+# Honing PID (optional)
+# --------------------------------------------------------------------------
+
+def traction_knee(ws: Workspace) -> float | None:
+    """The command at which the tyres stop returning what they are asked for.
+
+    Read from the fit rather than from a solved card, so the step works with
+    nothing but step 1 done. `None` means the file did not say, and then the
+    aggressiveness is shown as a bare fraction -- the solver reads the knee
+    itself, so the derivation is unaffected either way.
+    """
+    if not ws.regression:
+        return None
+    try:
+        with open(ws.regression, "rb") as fh:
+            k = float(tomllib.load(fh)["mecanum_basis"]["traction_knee"])
+    except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
+        return None
+    return k if k > 0 else None
+
+
+def honing_config(ws: Workspace, d: dict, base: dict | None = None) -> dict:
+    """The smallest config that derives the gains: the fit, and the settings.
+
+    The block depends on the regression and on these settings and on nothing
+    else -- not the grid, not the field, not the targets -- which is what lets
+    this step answer in a moment, and run before there is a field file at all.
+    """
+    cfg = dict(base) if base else {"regression": ws.regression, "zero_c": True}
+    cfg.update({k: d.get(k, DEFAULTS[k]) for k in HONING_KEYS})
+    return cfg
+
+
+def derive_honing(cfg: dict, run_dir: str | None = None) -> dict | None:
+    """Ask the solver for the gains. With `run_dir`, its MODEL.JSON is rebuilt.
+
+    The derivation stays in the solver rather than being repeated here: two
+    implementations of one closed form drift apart, and the gains the card
+    gets have to be the gains the wizard showed.
+    """
+    fd, path = tempfile.mkstemp(prefix="honing_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        cmd = [julia_exe(), f"--project={SOLVER_PROJ}", SOLVER, path, "honing"]
+        if run_dir:
+            cmd.append(run_dir)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    for line in r.stdout.splitlines():
+        if line.startswith("HONING "):
+            return json.loads(line[7:])
+    print(c("  deriving the gains failed:", "31"))
+    print((r.stderr or r.stdout).strip()[:1500])
+    return None
+
+
+def show_honing(h: dict) -> None:
+    """What the settings just bought, in the same terms the bench reports."""
+    lim = h["omega_limits"]
+    hc = h["config"]
+    print()
+    print(f"  bandwidth     omega = {c('%.4f' % h['omega'], '1;36')} rad/s"
+          f"   (bound by {lim['bound_by']}: saturation "
+          f"{lim['saturation']:.4f}, loop {lim['loop_rate']:.4f})")
+    print(f"  command       budget {hc['budget']:.4f} of full stick,"
+          f" traction gain {h['traction_gain']['value']:.4f}")
+    print(f"  third poles   {[round(v, 3) for v in h['poles']['third']]}"
+          f"   kd diagonal {[round(v, 4) for v in h['poles']['kd_diag']]}")
+    print(f"  anti-windup   "
+          f"{[round(v, 4) for v in h['integral_limit']['value']]}"
+          f"   (cm*s, cm*s, rad*s)")
+    print(f"  fine band     {hc['fine_cm']:.2f} cm / {hc['fine_rad']:.3f} rad"
+          f"   handoff {h['handoff']['cm']:.1f} cm /"
+          f" {h['handoff']['rad']:.2f} rad")
+    # Past the saturation bound the proportional term leaves the budget while
+    # still inside the fine band -- the one guarantee the block makes -- and
+    # verify_tables rejects a card for it. Only a bandwidth scale above 1 can
+    # get here, and the fix is nearly always the other knob: aggressiveness
+    # raises the bound rather than stepping over it.
+    if h["omega"] > lim["saturation"] * (1 + 1e-9):
+        print()
+        print(c("  omega is past the saturation bound: the command would",
+                "31"))
+        print(c("  saturate close in, which is exactly what the fine band",
+                "31"))
+        print(c("  promises it will not, and verify_tables refuses a card",
+                "31"))
+        print(c("  whose gains do that. Lower the bandwidth scale, or raise",
+                "31"))
+        print(c("  the aggressiveness -- that lifts the bound with it.", "31"))
+    if any(v < 0 for v in h["poles"]["kd_diag"]):
+        print(c("  negative derivative gain: the controller would be "
+                "cancelling the robot's own damping", "31"))
+
+
+def simulate_honing(cfg: dict) -> bool | None:
+    """Drive the full nonlinear model with these gains and print the verdict.
+
+    The gains are designed against a linearisation, so the only honest answer
+    to "is this too aggressive" is to run the real dynamics with them. Both
+    ends of the dial fail here, for opposite reasons -- too hot overshoots,
+    too gentle is still short when the time is up -- and the marks it scores
+    against are the ones `bench/honing.jl` gates a card with.
+
+    Returns the verdict, or `None` if the simulation could not run. It is
+    advice and not a veto: nothing on the card records it, and a robot whose
+    real behaviour disagrees with the model is the user's call to make, not
+    the wizard's.
+    """
+    fd, path = tempfile.mkstemp(prefix="honing_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        print(c("  simulating the approach...", "2"))
+        r = subprocess.run([julia_exe(), f"--project={SOLVER_PROJ}",
+                            HONING_BENCH, path],
+                           capture_output=True, text=True)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    # The report is the product here, verdict line and all: it marks its own
+    # failures, against the same budgets that gate a card. Only its "model:"
+    # line is dropped -- a workspace has one regression, and this step is
+    # already about it.
+    body = "\n".join(ln for ln in r.stdout.splitlines()
+                     if not ln.startswith("model: ")).strip()
+    print(body)
+    if not body:
+        print(c("  the simulation could not run:", "31"))
+        print((r.stderr or "").strip()[:1500])
+        return None
+    return r.returncode == 0
+
+
+def step_honing(ws: Workspace) -> None:
+    """
+    Optional: how hard the final approach pushes, and what that does to it.
+
+    Deliberately not one of the numbered steps -- the defaults are what
+    section 8.8 of TABLE_FORMAT.md was designed and measured against, and a
+    run is perfectly valid without ever opening this.
+
+    There is still one judgement in it that the fit cannot make: how much of
+    the traction knee the robot may spend on the last few centimetres. Gentle
+    is not automatically safe -- too little authority and the loop is still
+    short of the point when the match has moved on -- so the step derives the
+    gains and then offers to drive the *nonlinear* model with them, which is
+    the only place either mistake actually shows up.
+
+    Nothing downstream depends on it. The settings ride along with the rest of
+    the solver answers into the next solve, and a run that is already solved
+    can have its MODEL.JSON rebuilt in place, since the gains never depended
+    on the tables.
+    """
+    rule("Honing PID for the final approach  (optional)")
+    if not ws.regression:
+        print(c("  No regression yet -- run step 1 first.", "33")); return
+    if not julia_exe():
+        print(c("  julia is not on PATH.", "31")); return
+
+    print("  The tables stop at a handoff region, roughly 15 cm and 0.25 rad")
+    print("  out; a PID owns the rest and settles on the point. Its gains are")
+    print("  derived from the same fit the tables are, so there is nothing to")
+    print("  tune here in the usual sense and nothing to twiddle on the field.")
+    print("  What is a choice is how much command it is allowed to spend.")
+
+    st = load_settings()
+    d = dict(DEFAULTS)
+    d.update({k: v for k, v in st.get("solver", {}).items()
+              if k in HONING_KEYS})
+    knee = traction_knee(ws)
+
+    # One attempt: ask, derive, and see it driven. Declining to keep them
+    # offers another go rather than dropping the answers on the floor --
+    # finding the setting is a loop, and the simulation is what closes it.
+    while True:
+        rule("Aggressiveness")
+        print("  A fraction of the traction knee -- the command where the tyres")
+        print("  stop returning what they are asked for. Half the knee is the")
+        print("  default: the approach is gentle there, and the linear design the")
+        print("  gains come from is honest about itself.")
+        print()
+        print("  It is the whole dial. A bigger share is more command and more")
+        print("  bandwidth together, because what limits the gains is the budget.")
+        print(c("    0.25  gentle, and slow enough that a fit error leaves it "
+                "short", "2"))
+        print(c("    0.50  the default; settles in about 2 s from the corner", "2"))
+        print(c("    0.90  quick, near the knee, with more overshoot to absorb",
+                "2"))
+        while True:
+            f = ask_float("  aggressiveness (fraction of the knee)",
+                          d["honing_budget_frac"])
+            if f <= 0:
+                print(c("    must be positive", "31")); continue
+            # The octahedron is a hard limit on the command, so gains sized
+            # against one outside it are designed for authority the wheels clip
+            # away before the robot ever sees it.
+            if knee and f * knee > 1.0:
+                print(c("    that is a command of %.2f at a knee of %.2f, outside "
+                        "the octahedron" % (f * knee, knee), "31")); continue
+            break
+        d["honing_budget_frac"] = f
+        if knee:
+            print(c("    -> command budget %.3f of full stick (knee %.2f)"
+                    % (f * knee, knee), "2"))
+
+        if confirm("Change the rest of the honing settings?"):
+            rule("Loop")
+            print("  The rate the robot will actually run this loop at. It caps")
+            print("  the bandwidth at a tenth of itself: a sampled loop cannot")
+            print("  track a pole much faster than that.")
+            d["honing_loop_hz"] = ask_float("  loop rate, Hz", d["honing_loop_hz"])
+            print()
+            print("  The fine band -- the error inside which the command is")
+            print("  guaranteed not to saturate. The bandwidth is sized against")
+            print("  it, so a wider band buys gentler gains.")
+            d["honing_fine_cm"] = ask_float("  fine band, cm", d["honing_fine_cm"])
+            d["honing_fine_rad"] = ask_float("  fine band, rad",
+                                             d["honing_fine_rad"])
+            print()
+            print("  Where the tables hand over. Recorded on the card for the")
+            print("  robot side to read; it does not move the gains, which are")
+            print("  sized against the fine band above.")
+            d["honing_handoff_cm"] = ask_float("  handoff, cm",
+                                               d["honing_handoff_cm"])
+            d["honing_handoff_rad"] = ask_float("  handoff, rad",
+                                                d["honing_handoff_rad"])
+            print()
+            print("  The share of the budget the integrator may claim before it")
+            print("  is clamped. The clamp itself is not optional: without it the")
+            print("  integrator winds the command out of the octahedron and the")
+            print("  loop never settles.")
+            d["honing_integral_share"] = ask_float("  integral share (0-1)",
+                                                   d["honing_integral_share"])
+            print()
+            print("  A last multiplier on the bandwidth, for detuning. Below 1 is")
+            print("  slower and gentler than the design would allow.")
+            print(c("  Above 1 breaks the fine-band guarantee and the card fails "
+                    "verification;", "33"))
+            print(c("  to go faster, raise the aggressiveness instead.", "33"))
+            d["honing_bandwidth_scale"] = ask_float("  bandwidth scale",
+                                                    d["honing_bandwidth_scale"])
+
+        cfg = honing_config(ws, d)
+        h = derive_honing(cfg)
+        if h is None:
+            return
+        show_honing(h)
+
+        verdict = None
+        print()
+        if confirm("Drive the nonlinear model with these gains?", default_yes=True):
+            print()
+            verdict = simulate_honing(cfg)
+
+        print()
+        if verdict is False:
+            # Keeping them anyway is allowed -- the simulation is the model's
+            # opinion of itself, and the robot is the one that settles the
+            # argument -- but it should not be the answer Enter gives.
+            print(c("  A case above missed its budget: with these settings "
+                    "the model does not", "33"))
+            print(c("  land the robot where it says it will. Enter takes "
+                    "another go at it.", "33"))
+        if confirm("Keep these settings for the next solve?",
+                   default_yes=verdict is not False):
+            break
+        if not confirm("Try a different setting?",
+                       default_yes=verdict is False):
+            print(c("  left as they were", "2"))
+            return
+
+    st = load_settings()
+    solver = dict(st.get("solver", {}))
+    solver.update({k: d[k] for k in HONING_KEYS})
+    st["solver"] = solver
+    save_settings(st)
+    print(c("  saved -- the next solve writes them into MODEL.JSON", "32"))
+
+    # The gains do not depend on the tables, so a solved run does not have to
+    # be solved again to carry new ones. Offering the rebuild is the whole
+    # reason this is safe to fiddle with: the alternative is waiting out a run
+    # for a number that takes a millisecond.
+    run = ws.latest_run()
+    if not run or not os.path.exists(os.path.join(run, "MODEL.JSON")):
+        return
+    print()
+    print(f"  The last run is already solved: {c(os.path.basename(run), '36')}")
+    print("  Its gains can be rebuilt in place -- they never depended on the")
+    print("  tables, only on the fit both were made from.")
+    if not confirm("Rebuild that run's MODEL.JSON with these settings?",
+                   default_yes=True):
+        return
+    runcfgpath = os.path.join(run, "config.json")
+    try:
+        with open(runcfgpath, encoding="utf-8") as fh:
+            base = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        # A run that arrived without its config: rebuild from the fit this
+        # workspace holds. The solver refuses the write unless that is the fit
+        # the run was solved from, so guessing here cannot mis-pair them.
+        base = None
+        print(c("  no config.json in the run; using the workspace regression",
+                "2"))
+    newcfg = honing_config(ws, d, base)
+    if derive_honing(newcfg, run) is None:
+        return
+    if base is not None:
+        with open(runcfgpath, "w", encoding="utf-8") as fh:
+            json.dump(newcfg, fh, indent=2)
+    print(c("  rebuilt " + os.path.join(run, "MODEL.JSON"), "32"))
+    if ws.card_record(run):
+        print(c("  The card written from this run still has the old gains -- "
+                "write it again (step 4).", "33"))
 
 
 # --------------------------------------------------------------------------
@@ -1962,6 +2327,7 @@ def status(ws: Workspace) -> None:
     print(f"  {mark(bool(card))}  4. Write the SD card{detail}")
     print()
     print(c("  d. diagnose the regression fit (optional)", "2"))
+    print(c("  h. tune the honing PID for the final approach (optional)", "2"))
     print()
     print("  w. change workspace     q. quit")
 
@@ -1976,7 +2342,8 @@ def main() -> int:
         os.path.dirname(ws_path) or ws_path) else pick_workspace(settings)
 
     steps = {"0": step_pods, "1": step_calibration, "2": step_field,
-             "3": step_solve, "4": step_card, "d": step_diagnose}
+             "3": step_solve, "4": step_card, "d": step_diagnose,
+             "h": step_honing}
     while True:
         try:
             status(ws)

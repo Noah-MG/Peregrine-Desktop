@@ -1045,15 +1045,34 @@ function honing_gains(m::Model, cfg)
     hcm  = Float64(getc(cfg, "honing_handoff_cm", 15.0))
     hrad = Float64(getc(cfg, "honing_handoff_rad", 0.25))
     hz     = Float64(getc(cfg, "honing_loop_hz", 50.0))
-    # Half the knee: honing is meant to be gentle, and staying well inside
-    # the knee is also what makes the linear design honest (see above).
-    budget = Float64(getc(cfg, "honing_budget", 0.5 * knee))
+    # How hard the approach is allowed to push, as a fraction of the traction
+    # knee. This is the aggressiveness knob, and it is a fraction of the knee
+    # rather than an absolute command because the knee is what makes the
+    # number mean anything: it is where the tyres stop returning what they
+    # are asked for. Half the knee by default -- honing is meant to be
+    # gentle, and staying well inside the knee is also what makes the linear
+    # design honest (see above). Raising it raises `w_sat` with it, so the
+    # loop gets faster as well as stronger, and the fine-band guarantee still
+    # holds at the new budget. `honing_budget` pins the budget outright
+    # instead, for a caller that would rather say it in octahedron units.
+    frac   = Float64(getc(cfg, "honing_budget_frac", 0.5))
+    budget = Float64(getc(cfg, "honing_budget", frac * knee))
     scale  = Float64(getc(cfg, "honing_bandwidth_scale", 1.0))
     ishare = Float64(getc(cfg, "honing_integral_share", 0.25))
-    (budget > 0 && hz > 0 && scale > 0 && 0 < ishare < 1) ||
+    (budget > 0 && frac > 0 && hz > 0 && scale > 0 && 0 < ishare < 1) ||
         error("honing config must be positive (honing_budget=$budget, " *
-              "honing_loop_hz=$hz, honing_bandwidth_scale=$scale, " *
+              "honing_budget_frac=$frac, honing_loop_hz=$hz, " *
+              "honing_bandwidth_scale=$scale, " *
               "honing_integral_share=$ishare), with the integral share below 1")
+    # The octahedron is a hard limit on the command, so a budget outside it
+    # is a design against authority the robot does not have: `Kp*e` would be
+    # sized to a command the wheels clip away, and the fine band would stop
+    # meaning what it says.
+    budget <= 1 ||
+        error("honing_budget is $budget, outside the octahedron " *
+              "|fwd| + |strafe| + |turn| <= 1; the wheels would clip the " *
+              "command the gains are sized against " *
+              "(honing_budget_frac=$frac at a knee of $knee)")
 
     # Authority the tyres actually deliver at the design operating point.
     r_op = budget / knee
@@ -1120,8 +1139,13 @@ function honing_gains(m::Model, cfg)
     Dict(
         "note" => "Gains for the PID that takes over from the tables for " *
             "the final approach. Derived from this same model, so there is " *
-            "no separate tuning step. Additive to schema 2: a reader that " *
-            "does not know this block is unaffected by it.",
+            "no separate tuning step and nothing here to adjust on the " *
+            "field. Everything that was chosen rather than derived is in " *
+            "`config`, and `budget_frac` is the choice that matters: the " *
+            "share of the traction knee this approach was allowed to " *
+            "spend, which sets both the command budget and the bandwidth. " *
+            "Additive to schema 2: a reader that does not know this block " *
+            "is unaffected by it.",
         "frame" => "robot body",
         "law" => "u = Kp*e + Ki*clamp(integral(e), -integral_limit, " *
                  "integral_limit) + Kd*d(e)/dt + u_ff",
@@ -1197,6 +1221,7 @@ function honing_gains(m::Model, cfg)
                 "intended and harmless: it is what makes the approach quick.",
         ),
         "config" => Dict("loop_hz" => hz, "budget" => budget,
+                         "budget_frac" => budget / knee,
                          "bandwidth_scale" => scale,
                          "integral_share" => ishare,
                          "fine_cm" => efine[1], "fine_rad" => efine[3]),
@@ -1322,6 +1347,50 @@ function model_json(m::Model, reg_path::AbstractString, zeroed_c::Bool,
             ("k", any(!iszero, k))) if nz],
         "honing" => honing_gains(m, cfg),
     )
+end
+
+"""
+Derive the honing block on its own, and optionally write it into a solved run.
+
+The gains depend on the regression and on the `honing_*` config, and on
+nothing else -- not the grid, not the field, not the targets, not the tables.
+So changing them does not need a solve, which is the whole reason this exists:
+a run is hours and the gains are a millisecond, and asking for the second by
+paying for the first is how a knob stops being used.
+
+With `write_dir` the run's `MODEL.JSON` is rebuilt in place. It is rebuilt
+whole rather than spliced, from the same `model_json` the solve calls, so the
+file cannot drift into a shape only this path produces. The guard is the
+regression hash: the tables were solved from a particular fit, and dropping a
+different fit's gains beside them would describe a robot the tables do not
+plan for. Everything else in the file is a function of that fit, so if the
+hash matches, only the honing block can have moved.
+"""
+function honing_only(cfg::AbstractDict; write_dir = nothing)
+    reg_path = String(cfg["regression"])
+    m, _ = load_model(reg_path)
+    zeroed = Bool(getc(cfg, "zero_c", true))
+    if zeroed
+        m = Model(m.B, m.A, m.q, m.S, m.D, (0.0f0, 0.0f0, 0.0f0),
+                  m.eps, m.knee)
+    end
+    mj = model_json(m, reg_path, zeroed, cfg)
+    if write_dir !== nothing
+        path = joinpath(String(write_dir), "MODEL.JSON")
+        isfile(path) ||
+            error("no MODEL.JSON in $write_dir; there is nothing to update " *
+                  "there, so solve the run first")
+        old = readjson(path, Dict)
+        String(getc(old, "regression_sha256", "")) == mj["regression_sha256"] ||
+            error("$path was written from a different regression than " *
+                  "$reg_path; its tables were solved from that one, so " *
+                  "writing these gains beside them would ship a model the " *
+                  "tables disagree with")
+        open(path, "w") do io
+            JSON3.pretty(io, mj)
+        end
+    end
+    mj["honing"]
 end
 
 """
@@ -2027,6 +2096,7 @@ function run_solve(cfg::AbstractDict)
     progress(phase = "model", file = "MODEL.JSON",
              nonzero_blocks = mj["nonzero_blocks"],
              honing_omega = mj["honing"]["omega"],
+             honing_budget_frac = mj["honing"]["config"]["budget_frac"],
              honing_bound_by = mj["honing"]["omega_limits"]["bound_by"])
     progress(phase = "done", out_dir = out_dir, targets = length(entries))
     manifest
