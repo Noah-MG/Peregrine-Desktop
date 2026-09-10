@@ -2161,14 +2161,115 @@ def step_honing(ws: Workspace) -> None:
 # Step 4 -- SD card
 # --------------------------------------------------------------------------
 
+def card_candidates(ws: Workspace, kind: str) -> list[tuple[str, str]]:
+    """
+    (label, folder) pairs holding a card image, newest first.
+
+    A local solve's image is the run directory itself; a saved job's image is
+    its tables/ directory, which only exists once the job has been run and its
+    tables pulled home.
+    """
+    out = []
+    if kind == "run":
+        for d in sorted(os.listdir(ws.runs), reverse=True):
+            p = os.path.join(ws.runs, d)
+            if os.path.isdir(p):
+                out.append((d, p))
+    else:
+        # Job names are chosen by hand, so their order says nothing about age;
+        # go by when the tables arrived (the manifest is written last).
+        for d in os.listdir(ws.jobs):
+            p = os.path.join(ws.jobs, d, "tables")
+            if os.path.isdir(p):
+                out.append((d, p))
+        out.sort(key=lambda it: _arrived(it[1]), reverse=True)
+    return out
+
+
+def _arrived(folder: str) -> float:
+    m = os.path.join(folder, "MANIFEST.JSON")
+    return os.path.getmtime(m if os.path.exists(m) else folder)
+
+
+def ask_folder_path() -> str | None:
+    while True:
+        src = ask("Folder to write (blank to cancel)", "")
+        if not src:
+            return None
+        src = os.path.abspath(os.path.expandvars(os.path.expanduser(src)))
+        if os.path.isdir(src):
+            return src
+        print(c(f"  not a folder: {src}", "31"))
+
+
+def pick_card_source(ws: Workspace) -> str | None:
+    """
+    The folder whose contents get written to the card.
+
+    Asks first where the tables came from -- solved here, or solved on a
+    rented GPU through a saved job -- then lists what the workspace holds of
+    that kind. Any other folder can still be typed in by hand.
+    """
+    print("  What should go on the card?")
+    print(r"    1  tables solved on this computer        (runs\)")
+    print(r"    2  tables from a saved job, solved on a  (jobs\<name>\tables)")
+    print("       rented GPU and pulled home")
+    print("    3  some other folder -- type its path")
+    kind = ask("Choose 1, 2 or 3 (0 to cancel)", "1")
+    if kind not in ("1", "2", "3"):
+        return None
+
+    if kind == "3":
+        src = ask_folder_path()
+    else:
+        cands = card_candidates(ws, "run" if kind == "1" else "job")
+        if not cands:
+            where = ws.runs if kind == "1" else ws.jobs
+            print(c(f"  Nothing to write in {where}.", "33"))
+            if kind == "2":
+                print(c("  A job has tables only after `peregrine_remote.py "
+                        "run` has pulled them home.", "2"))
+            return None
+        print()
+        for i, (name, p) in enumerate(cands, 1):
+            notes = []
+            if not os.path.exists(os.path.join(p, "MANIFEST.JSON")):
+                notes.append(c("unfinished -- no MANIFEST.JSON", "33"))
+            rec = ws.card_record(p)
+            if rec:
+                notes.append(c(f"written to {rec.get('drive')}: "
+                               f"{rec.get('written_utc', '')[:16]}", "2"))
+            tag = c(" (newest)", "2") if i == 1 else ""
+            print(f"    {i:>2}  {name}{tag}"
+                  + ("   " + "; ".join(notes) if notes else ""))
+        print()
+        n = ask_int("Which one (0 to cancel)", 1, 0, len(cands))
+        if n == 0:
+            return None
+        src = cands[n - 1][1]
+    if not src:
+        return None
+
+    if not os.path.exists(os.path.join(src, "MANIFEST.JSON")):
+        # verify_tables.py still has the last word after the copy; this is
+        # only so an obviously wrong folder is caught before the wipe.
+        print(c("  No MANIFEST.JSON here -- this does not look like a "
+                "finished set of tables.", "33"))
+        if not confirm("Write it anyway?"):
+            return None
+    print(f"  source: {c(src, '36')}")
+    return src
+
+
 def step_card(ws: Workspace) -> None:
     rule("4. Write the SD card")
-    run = ws.latest_run()
+    run = pick_card_source(ws)
     if not run:
-        print(c("  No solved tables yet -- run step 3 first.", "33")); return
-    print(f"  source: {c(run, '36')}")
+        return
     files = sdcard.card_payload(run)
     payload = sum(os.path.getsize(s) for s, _ in files)
+    if not files:
+        print(c("  That folder holds nothing to write.", "31")); return
     print(f"  payload: {human(payload)} in {len(files)} file(s)")
     print()
 
@@ -2229,6 +2330,12 @@ def step_card(ws: Workspace) -> None:
     if typed != choice:
         print(c("  Cancelled -- nothing was changed.", "32")); return
 
+    # The source may now be anywhere, including the card itself -- wiping the
+    # drive we are about to copy from would destroy the tables.
+    if os.path.splitdrive(os.path.abspath(run))[0].upper() == f"{choice}:":
+        print(c(f"  The source folder is on {choice}: -- copy it off the card "
+                f"first.", "31")); return
+
     try:
         removed = sdcard.wipe(choice, typed, ws.root)
     except (RuntimeError, ValueError, OSError) as e:
@@ -2255,7 +2362,12 @@ def step_card(ws: Workspace) -> None:
         # Only record success once the card itself has been read back and
         # verified -- a copy that completed but failed verification is not a
         # finished step.
-        ws.mark_card_written(run, choice, nf, nb)
+        try:
+            ws.mark_card_written(run, choice, nf, nb)
+        except OSError as e:
+            # A source outside the workspace may not be writable; the card is
+            # still good, only the step-4 marker is missing.
+            print(c(f"  (could not record the write in {run}: {e})", "2"))
         print(c(f"\n  Card {choice}: is ready.", "1;32"))
     else:
         print(c("\n  Card verification FAILED -- step 4 left unfinished.", "1;31"))
