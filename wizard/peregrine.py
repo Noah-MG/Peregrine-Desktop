@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tomllib
 from datetime import datetime, timezone
@@ -317,6 +318,8 @@ def step_pods(ws: Workspace) -> None:
             got = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return
+    if pods_bad(got.get("pod_orientation")):
+        show_pod_warning(got["pod_orientation"])
     if got.get("centred"):
         print(c("  Nothing to change. Go on to step 1.", "32"))
     else:
@@ -327,6 +330,55 @@ def step_pods(ws: Workspace) -> None:
 # --------------------------------------------------------------------------
 # Step 1 -- calibration
 # --------------------------------------------------------------------------
+
+def pod_check(ws: Workspace) -> dict | None:
+    """The pod-orientation verdict stored with the current regression."""
+    p = os.path.join(ws.calib, "drivetrain_fit.json")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh)["diagnostics"]["pod_orientation"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def pods_bad(pods: dict | None) -> bool:
+    return bool(pods) and pods.get("status") in ("mismatch", "suspect")
+
+
+def show_pod_warning(pods: dict) -> None:
+    """
+    The misoriented-pod warning, in red, where it cannot be scrolled past.
+
+    The fitter prints the same thing, but in the middle of a long report. A
+    swapped or reversed pod is found out otherwise only after a full solve,
+    so it is repeated here in colour at the end of the step.
+    """
+    red = "1;97;41"
+    head = ("ODOMETRY PODS LOOK MISORIENTED" if pods["status"] == "mismatch"
+            else "ODOMETRY PODS MAY BE MISORIENTED")
+    print()
+    print(c(" " * 70, red))
+    print(c(f"  !! {head}".ljust(70), red))
+    print(c(" " * 70, red))
+    def wrap(text, first, rest, code=None):
+        for line in textwrap.wrap(text, 70, initial_indent=first,
+                                  subsequent_indent=rest):
+            print(c(line, code) if code else line)
+
+    r = pods.get("reason", "")
+    wrap(r[:1].upper() + r[1:] + ".", "  ", "  ", "1;31")
+    for e in pods.get("explanation", []):
+        wrap(e, "    - ", "      ", "31")
+    if pods.get("fixes"):
+        print()
+        print(c("  How to fix it:", "1"))
+        for i, f in enumerate(pods["fixes"], 1):
+            wrap(f, f"    {i}. ", "       ")
+    for n in pods.get("notes", []):
+        print()
+        wrap(n, "  note: ", "        ", "2")
+    print(c(" " * 70, red))
+
 
 def find_logs(ws: Workspace) -> list[tuple[str, str]]:
     """Calibration CSVs on any mounted card, plus any already imported."""
@@ -400,6 +452,9 @@ def step_calibration(ws: Workspace) -> None:
         print(r.stderr.strip()[:2000])
         return
     print(c(f"  wrote {os.path.join(ws.calib, 'drivetrain_fit.toml')}", "32"))
+    pods = pod_check(ws)
+    if pods_bad(pods):
+        show_pod_warning(pods)
 
 
 # --------------------------------------------------------------------------
@@ -1361,6 +1416,12 @@ def step_solve(ws: Workspace) -> None:
         print(c("  Field or targets missing -- run step 2 first.", "33")); return
     if not julia_exe():
         print(c("  julia is not on PATH.", "31")); return
+    # A solve is the expensive step; do not spend it on a mirrored robot.
+    pods = pod_check(ws)
+    if pods_bad(pods):
+        show_pod_warning(pods)
+        if not confirm("  Solve with this regression anyway"):
+            return
 
     run_dir = os.path.join(ws.runs, datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
@@ -2428,7 +2489,12 @@ def status(ws: Workspace) -> None:
             pass
     print(f"  {mark(os.path.exists(pods))}  0. Pod offsets from a rotation run"
           + pod_note)
-    print(f"  {mark(bool(ws.regression))}  1. Calibration -> regression")
+    reg_note = ""
+    if ws.regression and pods_bad(pod_check(ws)):
+        reg_note = c("   (!! odometry pods look misoriented -- see step 1)",
+                     "1;31")
+    print(f"  {mark(bool(ws.regression))}  1. Calibration -> regression"
+          + reg_note)
     print(f"  {mark(bool(ws.field_file and ws.targets_file))}  2. Field and targets")
     print(f"  {mark(bool(run))}  3. Solve value tables"
           + (f"   ({os.path.basename(run)})" if run else ""))

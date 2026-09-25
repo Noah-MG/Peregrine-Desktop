@@ -31,6 +31,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fit_drivetrain as fd
+import pod_orientation
 
 # How big an offset has to be before it is worth changing anything. Below this
 # the phantom velocity it creates is lost in the noise of everything else.
@@ -312,6 +313,16 @@ def main(argv=None) -> int:
     print("  translation cmd rms %.4f  (limit %.3f)"
           % (trans_rms, args.max_translate))
 
+    # A spin says nothing about which way the pods point -- that needs the
+    # robot to drive -- but every log gets the check, and a spin that did
+    # translate a little may still be enough to catch a swapped pod.
+    fit_args = fd.parse_args([args.log])
+    fit_args.v_min = 2.0                  # fit_drivetrain's default, in cm/s
+    pods = fd.check_pods(fd.prepare(seg, fit_args), "cm")
+    fd.print_pod_check(pods)
+    if pods["status"] == "inconclusive":
+        print("  (the driving log in step 1 checks the pod directions)")
+
     problems = check_run(sweep, w, trans_rms, int(spin.sum()), args)
     if problems:
         print()
@@ -424,6 +435,9 @@ def main(argv=None) -> int:
         print("    takes the opposite sign -- negate both adjustments and")
         print("    reapply. One iteration settles it permanently.")
 
+    if pod_orientation.banner(pods):
+        fd.print_pod_check(pods)
+
     if warnings:
         print()
         print("  " + "!" * 68)
@@ -451,6 +465,7 @@ def main(argv=None) -> int:
                 "samples_used": int(spin.sum()),
                 "sweep_deg": sweep,
                 "warnings": warnings,
+                "pod_orientation": pods,
             }, fh, indent=2)
         print("  wrote " + args.out)
         print()
