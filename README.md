@@ -107,8 +107,8 @@ py -3.12 solver/cloud/peregrine_remote.py --self-test
 julia --project=solver --threads=auto solver/solve.jl --self-test
 ```
 
-The last one takes minutes on a GPU and much longer on a CPU — on a Mac,
-expect the better part of an hour or more.
+The last one takes minutes on a GPU and far longer on a CPU, which is
+what a Mac always uses; start it and leave it.
 
 ## The steps
 
