@@ -402,6 +402,9 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .warn { background: #fff5f5; border-left: 4px solid #dc2626; }
 .good { background: #f0fdf4; border-left: 4px solid #059669; }
 .note { color: #666; font-size: 13px; }
+.pods { border-left-width: 8px; border: 2px solid #dc2626;
+        border-left: 8px solid #dc2626; font-size: 15px; }
+.pods h2 { color: #b91c1c; border: none; margin: 0 0 8px; }
 code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px;
        font-size: 12px; }
 """
@@ -409,6 +412,24 @@ code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px;
 
 def esc(s):
     return html.escape(str(s))
+
+
+def pod_verdict(pods) -> str:
+    head = ("Odometry pods look misoriented" if pods["status"] == "mismatch"
+            else "Odometry pods may be misoriented")
+    r = pods["reason"]
+    out = ["<h2>&#9888; " + head + "</h2>",
+           "<p><b>" + esc(r[0].upper() + r[1:]) + ".</b></p>"]
+    if pods.get("explanation"):
+        out.append("<ul>" + "".join("<li>" + esc(e) + "</li>"
+                                    for e in pods["explanation"]) + "</ul>")
+    if pods.get("fixes"):
+        out.append("<p><b>How to fix it:</b></p><ol>" +
+                   "".join("<li>" + esc(f) + "</li>" for f in pods["fixes"]) +
+                   "</ol>")
+    for n in pods.get("notes", []):
+        out.append("<p class='note'>" + esc(n) + "</p>")
+    return "".join(out)
 
 
 def build_report(ctx) -> str:
@@ -737,6 +758,8 @@ def main(argv=None) -> int:
         return 1
 
     prep = fd.prepare(seg, args)
+    pods = fd.check_pods(prep, args.units)
+    fd.print_pod_check(pods)
     k = prep.keep
     if k.sum() < 50:
         print("error: only " + str(int(k.sum())) + " usable samples",
@@ -799,6 +822,10 @@ def main(argv=None) -> int:
 
     # ---- verdicts -------------------------------------------------------
     verdicts = []
+    if pods["status"] in ("mismatch", "suspect"):
+        # First, and louder than anything else: every other verdict describes
+        # a robot whose odometry is mirrored or rotated.
+        verdicts.append(("warn pods", pod_verdict(pods)))
     mean_cv = {f: float(np.nanmean([table[f][r]["roll"] for r in fd.RESPONSES]))
                for f in table}
     best = max(mean_cv, key=lambda f: mean_cv[f])
@@ -882,12 +909,16 @@ def main(argv=None) -> int:
 
     print()
     import re, textwrap
-    for _, v_ in verdicts:
+    for cls, v_ in verdicts:
+        if "pods" in cls:
+            continue                # the box below says it properly
         # Strip tags and decode entities: these strings are written for the
         # HTML report but also get shown in the terminal.
         plain = html.unescape(re.sub("<[^>]+>", "", v_))
         for j, line in enumerate(textwrap.wrap(plain, 72)):
             print(("  * " if j == 0 else "    ") + line)
+    if "pods" in verdicts[0][0]:
+        fd.print_pod_check(pods)
     print()
     print("  report: " + out)
     if args.open:

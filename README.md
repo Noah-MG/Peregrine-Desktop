@@ -47,6 +47,7 @@ Everything the wizard drives can also be run directly — see *Layout*.
 | `calibration/find_pod_offsets.py` | optional, **do first**: pod offsets from a rotation run |
 | `calibration/fit_drivetrain.py` | fits the drivetrain model from a driving log |
 | `calibration/diagnose_fit.py` | optional: plots the fit and recommends a model form |
+| `calibration/pod_orientation.py` | checks every log for swapped or reversed odometry pods |
 | `solver/solve.jl` | Julia/CUDA minimum-time value-table solver |
 | `solver/cloud/` | running a solve on a rented GPU, when the card here is the limit |
 | `docs/TABLE_FORMAT.md` | **the contract the robot firmware reads** |
@@ -115,6 +116,17 @@ comparison of candidate forms. See *Checking the model form*, and
 [calibration/README.md](calibration/README.md) — in particular why the fit
 uses `{fwd, strafe, turn}` rather than the four wheel powers, and how the
 Pinpoint's 1.5 kHz velocity quantisation is handled.
+
+**Every log is checked for misoriented odometry pods** — X and Y swapped
+between ports, or either one set to the wrong direction. Nothing on the robot
+notices that, the fit takes it happily, and it otherwise shows up only after a
+full solve, when the robot drives the wrong way. The check compares which way
+the wheels were told to go with which way the odometry says the robot went,
+and if they disagree prints a red **ODOMETRY PODS LOOK MISORIENTED** box
+saying which pod is wrong and exactly what to change. The wizard repeats it
+at the end of step 1, flags step 1 in the menu, and asks before starting a
+solve on that regression. See *Pod orientation* in
+[calibration/README.md](calibration/README.md).
 
 **2. Field and targets.** Two JSON files, with commented examples in
 `solver/examples/`. Obstacles are the **real** physical obstacles,

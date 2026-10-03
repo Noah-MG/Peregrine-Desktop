@@ -33,6 +33,8 @@ from typing import Sequence
 
 import numpy as np
 
+import pod_orientation
+
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
@@ -528,6 +530,30 @@ def prepare(seg: Segment, args) -> Prepared:
 
     return Prepared(t=t, u=u, u_raw=u_raw, v=v_pos, a=a, v_reported=v_rep,
                     keep=keep, diag=diag)
+
+
+def check_pods(prep: Prepared, units: str) -> dict:
+    """Do the odometry pods point the way the wheels drove? See pod_orientation.
+
+    Run on every log, before anything is fitted: a swapped or reversed pod
+    leaves a log that fits perfectly well and describes a mirrored robot.
+    """
+    v, a = prep.v.copy(), prep.a.copy()
+    if units == "m":
+        v[:, :2] *= 100.0               # the check's thresholds are in cm
+        a[:, :2] *= 100.0
+    return pod_orientation.check(prep.u @ MEC_MIX[:3].T, v, a, prep.keep)
+
+
+def print_pod_check(pods: dict) -> None:
+    box = pod_orientation.banner(pods)
+    if box:
+        print()
+        for line in box:
+            print("  " + line)
+        print()
+    else:
+        print("  " + pod_orientation.summary(pods))
 
 
 def traction_gain(u_mec, knee):
@@ -1547,6 +1573,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     dist_unit = args.units
     prep = prepare(seg, args)
+    pods = check_pods(prep, args.units)
+    prep.diag["pod_orientation"] = pods
+    print_pod_check(pods)
 
     if prep.keep.sum() < 30:
         print(f"error: only {prep.keep.sum()} usable samples after conditioning; "
@@ -1625,6 +1654,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print('    a = B*u + A*v + q*v[3]^2 + S*csign(v) + D*(abs.(v).*v) + c')
         print()
 
+    # Said again last, so it is the thing on screen when the run finishes.
+    if pod_orientation.banner(pods):
+        print_pod_check(pods)
     return 0
 
 

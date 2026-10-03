@@ -211,6 +211,41 @@ segments, a truncated final row is tolerated, frozen-pose logs from before the
 `odo.update()` fix are rejected by signature, header-only files exit cleanly,
 and exactly-duplicated consecutive pose rows are dropped.
 
+## Pod orientation
+
+Every log the tools read — the fit, the diagnostics report, and the pod-offset
+finder — is first checked for misoriented odometry pods (`pod_orientation.py`).
+A pod plugged into the wrong port, or set to the wrong direction in
+`setEncoderDirections()`, mirrors or rotates the reported pose. The log still
+fits, with high R², and the mistake surfaces only once a full solve drives the
+robot the wrong way.
+
+The wheel commands already say which way the robot should have gone. With the
+robot's mixer, positive `drive` is forward (+x), positive `strafe` is left
+(+y), and positive `turn` is clockwise (−heading). Heading comes from the
+Pinpoint's IMU, not the pods, so it cannot be affected by a pod mistake: the
+check uses the `turn` → heading response to confirm which way the motors run
+(if every motor is inverted, both expectations flip with it), then asks which
+of the eight swaps and reversals of {x, y} the `drive`/`strafe` response looks
+like. It regresses body-frame acceleration on the command (with velocity and a
+constant alongside to absorb drag): a pod mistake `M` turns the true gains `B`
+into exactly `M·B`, so the signs survive any amount of model error.
+
+| status | meaning |
+| --- | --- |
+| `ok` | both pods agree with the wheels |
+| `mismatch` | clearly swapped and/or reversed — a red box says which pod, and what to change |
+| `suspect` | probably wrong, weaker evidence — same box, softer heading |
+| `inconclusive` | the log cannot tell, e.g. a spin-only run from step 0 |
+
+The result goes into the output under `diagnostics.pod_orientation`. The fit
+is still written — the warning does not block anything — but the wizard
+repeats it in colour, flags step 1 in its menu, and asks before starting a
+solve on that regression.
+
+`py -3.12 calibration/pod_orientation.py` runs a self-test over every wiring
+mistake, with the motors both ways round.
+
 ## Why mecanum only
 
 The four motor powers are **not** separately identifiable from a normal
