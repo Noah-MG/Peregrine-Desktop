@@ -1,13 +1,14 @@
 # Drivetrain calibration
 
-Reads a `calibration_log_*.csv` written by `CalibrationLogger` on the
-robot, fits a linear drivetrain model, and emits the coefficients as
+Reads a calibration log written on the robot (any file name: the logger
+has written both `calibration_log_*.csv` and `log_*.csv`; what matters is
+the `timestamp,FR,FL,BR,BL,x,y,h,x_vel,y_vel,h_vel` header), fits a linear drivetrain model, and emits the coefficients as
 JSON and TOML for the downstream Julia solver.
 
 ## Usage
 
 ```bash
-py -3.12 calibration/fit_drivetrain.py path/to/calibration_log_XXXX.csv
+py -3.12 calibration/fit_drivetrain.py path/to/log_XXXX.csv
 ```
 
 Requires `numpy`. Writes `drivetrain_fit.json` and `drivetrain_fit.toml`

@@ -1450,7 +1450,7 @@ def parse_args(argv: Sequence[str] | None = None):
         description="Fit a linear drivetrain model from a Peregrine calibration log.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("log", nargs="?", help="path to a calibration_log_*.csv")
+    p.add_argument("log", nargs="?", help="path to a calibration log CSV")
     p.add_argument("--self-test", action="store_true",
                    help="recover a known model from a simulated drive, then exit")
     p.add_argument("-o", "--out-dir", default=None,

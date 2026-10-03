@@ -136,8 +136,10 @@ It reports "centred, nothing to change" below 0.5 cm. That threshold is about
 consequence, not statistics: at this precision a 2 mm offset is
 *statistically* real while being far too small to matter.
 
-**1. Calibration.** Finds `calibration_log_*.csv` on any mounted card, imports
-one, and fits
+**1. Calibration.** Finds every `.csv` on any mounted card, whatever it is
+called, and lists the ones with calibration columns first, newest first, with
+their dates — so the default is the run you just recorded. Imports one, and
+fits
 
 ```
 a = B·u + A·v + q·ω² + S·csign(v) + D·(|v|·v) + c

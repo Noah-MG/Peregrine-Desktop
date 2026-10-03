@@ -691,7 +691,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Diagnose a drivetrain regression and suggest a model form.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("log", nargs="?", help="calibration_log_*.csv to analyse")
+    p.add_argument("log", nargs="?", help="calibration log CSV to analyse")
     p.add_argument("--self-test", action="store_true",
                    help="check the model selection against synthetic robots "
                         "with a known true model, then exit")
