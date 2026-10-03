@@ -342,11 +342,9 @@ def step_pods(ws: Workspace) -> None:
 
     logs = find_logs(ws)
     if not logs:
-        print(c("  No calibration_log_*.csv found on a card or in the workspace.",
-                "33"))
+        print(c("  No CSV found on a card or in the workspace.", "33"))
         return
-    for i, (src, p_) in enumerate(logs, 1):
-        print(f"   {i:2d}. [{src}] {os.path.basename(p_)}")
+    show_logs(logs)
     print()
     i = ask_int("Which log (a rotation-only one)", 1, 1, len(logs))
     src, path = logs[i - 1]
@@ -440,31 +438,100 @@ def show_pod_warning(pods: dict) -> None:
     print(c(" " * 70, red))
 
 
+# The columns the calibration tools read, as `fit_drivetrain.HEADER_FIELDS`
+# has them. Repeated rather than imported: the wizard is stdlib only, and
+# the fitter needs numpy.
+LOG_HEADER = ("timestamp", "FR", "FL", "BR", "BL",
+              "x", "y", "h", "x_vel", "y_vel", "h_vel")
+# How far below a card's root to look. The robot controller keeps its files
+# six levels down (Android/data/<app>/files/logs/), so this leaves room for a
+# logger that moves them, without walking a deep tree for ever.
+LOG_SCAN_DEPTH = 8
+
+
+def is_calibration_log(path: str) -> bool:
+    """Does this CSV have the columns the calibration tools read?"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.readline().lstrip("\ufeff").strip()
+    except OSError:
+        return False
+    return tuple(f.strip() for f in head.split(",")) == LOG_HEADER
+
+
+def _card_csvs(root: str) -> list[str]:
+    """Every CSV on a card, whatever it is called and wherever it is.
+
+    Logs used to be found by name, and renaming them in the logger made the
+    wizard offer only the old ones -- so a stale log got fitted. Hidden
+    entries are skipped: they are macOS's own files (`._*` sidecars,
+    .Spotlight-V100, .Trashes), never a log.
+    """
+    out = []
+    base = root.rstrip("\\/").count(os.sep)
+    for dirpath, dirs, files in os.walk(root):
+        if dirpath.rstrip("\\/").count(os.sep) - base >= LOG_SCAN_DEPTH:
+            dirs[:] = []
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        out += [os.path.join(dirpath, f) for f in files
+                if f.lower().endswith(".csv") and not f.startswith(".")]
+    return out
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def find_logs(ws: Workspace) -> list[tuple[str, str]]:
-    """Calibration CSVs on any mounted card, plus any already imported."""
+    """Every CSV on any mounted card, plus any already imported.
+
+    Calibration logs first, newest first, so that the default is the run
+    just recorded and an old log -- or some other CSV on the card -- has to
+    be chosen on purpose. A workspace copy of a log still on a card is
+    listed once, as the card's.
+    """
     found: list[tuple[str, str]] = []
-    for v in sdcard.list_volumes():
-        if not v.get("Id") or not v.get("Root"):
+    try:
+        vols = sdcard.list_volumes()
+    except RuntimeError as e:
+        print(c(f"  (cannot look for cards: {e})", "33"))
+        vols = []
+    for v in vols:
+        if not v.get("Id") or not v.get("Root") or not os.path.isdir(v["Root"]):
             continue
-        d = os.path.join(v["Root"], "Android", "data",
-                         "com.qualcomm.ftcrobotcontroller", "files", "logs")
-        if os.path.isdir(d):
-            for f in sorted(os.listdir(d)):
-                if f.startswith("calibration_log_") and f.endswith(".csv"):
-                    found.append((f"card {sdcard.show_id(v['Id'])}",
-                                  os.path.join(d, f)))
-    for f in sorted(os.listdir(ws.calib)):
-        if f.endswith(".csv"):
+        for p in _card_csvs(v["Root"]):
+            found.append((f"card {sdcard.show_id(v['Id'])}", p))
+    on_card = {os.path.basename(p) for _, p in found}
+    for f in os.listdir(ws.calib):
+        if f.lower().endswith(".csv") and f not in on_card:
             found.append(("workspace", os.path.join(ws.calib, f)))
+    found.sort(key=lambda it: (not is_calibration_log(it[1]), -_mtime(it[1])))
     return found
+
+
+def show_logs(logs: list[tuple[str, str]]) -> None:
+    """The numbered list a log is picked from."""
+    width = max(len(src) for src, _ in logs) + 2
+    for i, (src, p) in enumerate(logs, 1):
+        when = datetime.fromtimestamp(_mtime(p)).strftime("%Y-%m-%d %H:%M")
+        try:
+            size = human(os.path.getsize(p))
+        except OSError:
+            size = "?"
+        note = "" if is_calibration_log(p) else \
+            c("  (columns not recognised -- not a calibration log?)", "33")
+        print(f"   {i:2d}. {'[' + src + ']':<{width}} {os.path.basename(p):<38} {when}"
+              f" {size:>10}{note}")
 
 
 def step_calibration(ws: Workspace) -> None:
     rule("1. Calibration -> drivetrain regression")
     logs = find_logs(ws)
     if not logs:
-        print(c("  No calibration_log_*.csv found on any card or in the "
-                "workspace.", "33"))
+        print(c("  No CSV found on any card or in the workspace.", "33"))
         print("  Insert the SD card, or copy a CSV into "
               + c(ws.calib, "36"))
         p = ask_path("Path to a CSV (blank to go back)", "")
@@ -473,9 +540,7 @@ def step_calibration(ws: Workspace) -> None:
         logs = [("manual", p)]
 
     print()
-    for i, (src, p) in enumerate(logs, 1):
-        sz = os.path.getsize(p)
-        print(f"   {i:2d}. [{src}] {os.path.basename(p):<38} {human(sz):>10}")
+    show_logs(logs)
     print()
     i = ask_int("Which log", 1, 1, len(logs))
     src, path = logs[i - 1]
