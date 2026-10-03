@@ -84,9 +84,47 @@ def _describe(m: np.ndarray) -> list[str]:
     return out
 
 
+# The direction a body-frame response points, in the robot's own words.
+_DIRECTION = {(0, 1): "forward", (0, -1): "backward",
+              (1, 1): "left", (1, -1): "right"}
+
+
+def _observed(G: np.ndarray) -> str:
+    """What each command did, taking the pods as right.
+
+    The other reading of a mismatch. A log compares the pods with the motors
+    and cannot say which of the two is wrong: a motor in the wrong port, set
+    to the wrong direction, or logged under the wrong name moves the robot
+    off the mixer's directions in exactly the way a pod mistake seems to.
+    Saying what the wheels did in plain directions lets someone who knows
+    their pods are right see the motor mistake instead.
+    """
+    def where(col):
+        ax = int(np.argmax(np.abs(col)))
+        return _DIRECTION[(ax, 1 if col[ax] > 0 else -1)]
+    return ("If the pods are right, then in this log 'drive' (all four motors "
+            "forward) moved the robot %s, 'strafe' moved it %s, and '+turn' "
+            "spun it %s -- where the logger's mixer expects forward, left and "
+            "clockwise. A motor plugged into the wrong port, set to the wrong "
+            "direction, or logged under the wrong name does exactly this, and "
+            "no log can tell it apart from a pod mistake."
+            % (where(G[:2, 0]), where(G[:2, 1]),
+               "counter-clockwise" if G[2, 2] > 0 else "clockwise"))
+
+
+# A pod check that needs no motors, so it is the one that can settle which
+# side is wrong.
+PUSH_TEST = ("Before changing anything, check the pods alone: with the motors "
+             "off, push the robot forward by hand and watch the Pinpoint's x "
+             "rise, then push it to its left and watch y rise. If both do, "
+             "the pods are right and the motors are not wired, named or "
+             "directed the way the calibration OpMode's mixer assumes (see "
+             "the note below) -- fix that, not the pods.")
+
+
 def _fixes(m: np.ndarray) -> list[str]:
     """What to change on the robot to turn `m` into the identity."""
-    fixes = []
+    fixes = [PUSH_TEST]
     swapped = m[0, 0] == 0
     if swapped:
         fixes.append("Swap the two pod cables between the X and Y ports on the "
@@ -167,8 +205,9 @@ def check(u_mec: np.ndarray, v_body: np.ndarray, a_body: np.ndarray,
         if motors < 0:
             res["notes"].append(
                 "+turn spun the robot counter-clockwise, the opposite of what "
-                "the mixer expects. Every motor looks inverted; that is "
-                "harmless for the fit, and the pod check allows for it.")
+                "the mixer expects. If every motor is simply inverted that is "
+                "harmless for the fit, and the pod check allows for it; it is "
+                "also what motors in the wrong ports can look like.")
     else:
         motors = 1.0
         res["anchor"] = "assumed"
@@ -221,6 +260,7 @@ def check(u_mec: np.ndarray, v_body: np.ndarray, a_body: np.ndarray,
     res["reason"] = ("the odometry does not move the way the wheels drove: "
                      "the pods look %s" % _kind(best))
     res["fixes"] = _fixes(best)
+    res["notes"].append(_observed(G))
     if np.array_equal(best, -np.eye(2)):
         res["notes"].append(
             "Both axes reversed is also what a Pinpoint mounted 180 degrees "
