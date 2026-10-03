@@ -893,7 +893,8 @@ def main(argv=None) -> int:
         "knee_mode": args.knee_mode,
         "fig_knee": fig_knee(knee_rows, args.knee),
         "null": {r: table[ref_name][r]["null"] for r in fd.RESPONSES},
-        "cmd": "py -3.12 calibration/diagnose_fit.py " + args.log +
+        "cmd": ("py -3.12" if sys.platform == "win32" else "python3") +
+               " calibration/diagnose_fit.py " + args.log +
                (" --fit " + args.fit if args.fit else ""),
         "preproc": ("window=%.3fs order=%d max_gap=%.3fs units=%s "
                     "smooth_inputs=%s v_min=%.2f w_min=%.3f"
@@ -923,7 +924,8 @@ def main(argv=None) -> int:
     print("  report: " + out)
     if args.open:
         import webbrowser
-        webbrowser.open("file:///" + out.replace("\\", "/"))
+        from pathlib import Path
+        webbrowser.open(Path(os.path.abspath(out)).as_uri())
     return 0
 
 

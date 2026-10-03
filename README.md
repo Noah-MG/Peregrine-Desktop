@@ -11,10 +11,16 @@ calibration CSV -> drivetrain regression -> field + targets
 
 ## Quick start
 
-Double-click **`peregrine.bat`**, or from a terminal:
+**Windows:** double-click **`peregrine.bat`**, or from a terminal:
 
 ```bash
 peregrine.bat
+```
+
+**macOS:** double-click **`peregrine.command`** in Finder, or from Terminal:
+
+```bash
+./peregrine
 ```
 
 That is the intended way in. It walks through every step and remembers
@@ -23,10 +29,16 @@ and when double-clicked keeps the window open at the end so you can read the
 output.
 
 To call it as just `peregrine` from anywhere, add this folder to your PATH
-once — run this from the repository root:
+once — run this from the repository root. On Windows:
 
 ```bash
 setx PATH "%PATH%;%CD%"
+```
+
+On macOS (zsh):
+
+```bash
+echo "export PATH=\"\$PATH:$PWD\"" >> ~/.zprofile
 ```
 
 The wizard is a plain Python script underneath, so this is equivalent:
@@ -35,12 +47,18 @@ The wizard is a plain Python script underneath, so this is equivalent:
 py -3.12 wizard/peregrine.py
 ```
 
+Commands in this repository are written the Windows way. On a Mac, use
+`python3` wherever they say `py -3.12`, and a `/Volumes/<name>` path
+wherever they name a drive letter.
+
 Everything the wizard drives can also be run directly — see *Layout*.
 
 ## Layout
 
 | path | what |
 | --- | --- |
+| `peregrine.bat` | launcher, Windows |
+| `peregrine`, `peregrine.command` | launcher, macOS (terminal, Finder) |
 | `wizard/peregrine.py` | terminal wizard — the front door |
 | `wizard/sdcard.py` | drive detection and the **only** destructive code |
 | `wizard/verify_tables.py` | checks a card image against the format spec |
@@ -54,11 +72,18 @@ Everything the wizard drives can also be run directly — see *Layout*.
 
 ## Requirements
 
-- Python 3.12 (`py -3.12`), with `numpy` for the calibration fitters. The
-  wizard itself is stdlib only.
+- Python 3.12 (`py -3.12` on Windows, `python3` on macOS — 3.11 is the
+  oldest that works), with `numpy` for the calibration fitters and
+  `matplotlib` for the diagnostics report. The wizard itself is stdlib only.
+  On a Mac with Homebrew, `brew install python numpy`, plus `matplotlib`
+  from pip for the same `python3`. The launcher prefers whichever Python
+  on your PATH can import `numpy`.
 - Julia 1.12 with `CUDA.jl` and `JSON3` — `julia --project=solver -e 'using
-  Pkg; Pkg.instantiate()'`.
-- An NVIDIA GPU for the solver. It falls back to CPU, much more slowly.
+  Pkg; Pkg.instantiate()'`. On macOS too: `CUDA.jl` installs and loads
+  there, it just reports no device.
+- An NVIDIA GPU for the solver. It falls back to CPU, much more slowly. A Mac
+  has no CUDA, so it always solves on the CPU — fine for small grids and for
+  planning, but a full-resolution table belongs on a rented GPU (below).
 - Optional: an SSH key and a rented GPU box, if the grid you want is bigger
   than the card here. See `solver/cloud/README.md` — the 8 GB card is what
   forces tiling, and tiling is what makes a long lookahead expensive, so a
@@ -66,6 +91,24 @@ Everything the wizard drives can also be run directly — see *Layout*.
   exist while you are planning: step 3 saves a plan as a **job**, and
   `peregrine_remote.py run <job> --host root@<ip>` solves it whenever the
   box is up.
+
+## Checking an install
+
+Every tool carries its own self-test, and none of them needs a robot, a card
+or a rented box. On a new machine run them all once (`python3` on a Mac):
+
+```bash
+py -3.12 calibration/pod_orientation.py
+py -3.12 calibration/find_pod_offsets.py --self-test
+py -3.12 calibration/fit_drivetrain.py --self-test
+py -3.12 calibration/diagnose_fit.py --self-test
+py -3.12 wizard/sdcard.py --self-test
+py -3.12 solver/cloud/peregrine_remote.py --self-test
+julia --project=solver --threads=auto solver/solve.jl --self-test
+```
+
+The last one takes minutes on a GPU and far longer on a CPU, which is
+what a Mac always uses; start it and leave it.
 
 ## The steps
 
@@ -457,11 +500,20 @@ All destructive code is confined to `wizard/sdcard.py`, deliberately kept
 short enough to read in one sitting. A wipe requires **five independent
 checks to pass**:
 
-1. Not on a disk Windows marks as system or boot.
-2. Not a letter that hosts Windows, your profile, the workspace, or this repo.
-3. Genuinely external — removable, or on a USB/SD/MMC bus.
+1. Not on a disk the OS marks as system or boot — on a Mac, any disk that
+   `/` or its APFS container lives on.
+2. Not a volume that hosts the OS, your profile, the workspace, or this repo.
+3. Genuinely external — removable, or on a USB/SD/MMC bus. A mounted disk
+   image does not count.
 4. No system directories in the root.
-5. The drive letter typed back by hand.
+5. The drive letter (Windows) or volume name (macOS, e.g. `NO NAME`) typed
+   back by hand.
+
+On a Mac the card is picked by the name it is mounted under in `/Volumes`.
+macOS writes a `._` sidecar beside every file it puts on a FAT32 card; the
+copy removes the ones it caused, since the format allows nothing on the card
+but the tables, and the wizard offers to eject the card afterwards — macOS
+caches writes to it, so pull it only once it is ejected.
 
 It deletes files. It never formats, never touches partition tables, and never
 runs on a path that is not the root of a verified removable volume. To see
@@ -471,11 +523,16 @@ what it would allow, without changing anything:
 py -3.12 wizard/sdcard.py
 ```
 
+`py -3.12 wizard/sdcard.py --self-test` checks the guards themselves against
+synthetic drives, with no card needed.
+
 ## Verifying a card
 
 ```bash
 py -3.12 wizard/verify_tables.py G:\
 ```
+
+On a Mac, `python3 wizard/verify_tables.py "/Volumes/NO NAME"`.
 
 This re-implements the lookup **from `docs/TABLE_FORMAT.md`**, not from the
 solver's internals, so it tests the contract the firmware depends on rather

@@ -17,6 +17,10 @@ py -3.12 solver/cloud/peregrine_remote.py provision root@<ip>
 py -3.12 solver/cloud/peregrine_remote.py run overnight --host root@<ip>
 ```
 
+(On a Mac, `python3` in place of `py -3.12`. macOS ships `ssh`, `scp` and
+`tar`, which is all this needs; a passphrase-protected key goes into the
+agent macOS already runs with `ssh-add --apple-use-keychain <key>`.)
+
 `run` pushes the working tree and the inputs, starts the solve under `tmux`,
 draws the same progress bar the wizard does, pulls the tables back, verifies
 them against `docs/TABLE_FORMAT.md`, and prints the bill.
