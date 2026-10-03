@@ -5,6 +5,11 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# The macOS launchers are shell scripts and must keep LF or sh cannot run
+# them -- explicit, so a change to the default above cannot break them.
+peregrine text eol=lf
+*.command text eol=lf
+
 # Value tables and any other binary payload must never be converted.
 *.BIN binary
 *.bin binary

@@ -9,14 +9,17 @@ A terminal walkthrough of the whole offline pipeline:
 
 Stdlib only. Run with:
 
-    py -3.12 wizard/peregrine.py
+    py -3.12 wizard/peregrine.py        (Windows)
+    python3 wizard/peregrine.py         (macOS)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,8 +40,39 @@ SOLVER = os.path.join(REPO, "solver", "solve.jl")
 SOLVER_PROJ = os.path.join(REPO, "solver")
 HONING_BENCH = os.path.join(REPO, "solver", "bench", "honing.jl")
 EXAMPLES = os.path.join(REPO, "solver", "examples")
-SETTINGS = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Peregrine",
-                        "wizard.json")
+
+
+def settings_dir() -> str:
+    """Where Peregrine keeps its own small state on this machine.
+
+    LOCALAPPDATA on Windows, Application Support on a Mac. Never the source
+    tree: the settings name a workspace, which is per-machine.
+    """
+    if sys.platform == "win32":
+        base = (os.environ.get("LOCALAPPDATA")
+                or os.path.expanduser(os.path.join("~", "AppData", "Local")))
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = (os.environ.get("XDG_CONFIG_HOME")
+                or os.path.expanduser("~/.config"))
+    return os.path.join(base, "Peregrine")
+
+
+SETTINGS = os.path.join(settings_dir(), "wizard.json")
+# Where settings landed before there was a Mac branch above: LOCALAPPDATA is
+# unset off Windows, so they went into the source tree beside this file.
+# Read once if nothing newer exists, so an existing workspace is not lost.
+LEGACY_SETTINGS = os.path.join(HERE, "Peregrine", "wizard.json")
+
+# How to run one of this repo's Python tools, for the commands printed for
+# the user to copy. The tools themselves are always started with
+# sys.executable.
+PY = "py -3.12" if sys.platform == "win32" else "python3"
+
+
+def file_uri(path: str) -> str:
+    return pathlib.Path(os.path.abspath(path)).as_uri()
 
 BAR_W = 44
 CARD_MARKER = "card_written.json"
@@ -89,6 +123,30 @@ def ask(prompt: str, default: str | None = None) -> str:
     # Explorer and from editors that helpfully add both.
     v = input(c(f"  {prompt}{suffix}: ", "1")).lstrip("﻿").strip().strip('"')
     return v or (default or "")
+
+
+def clean_path(p: str) -> str:
+    """A path as typed, pasted, or dropped onto the terminal.
+
+    Dragging a file into macOS Terminal types it with its spaces escaped
+    (`My\\ Logs/run.csv`) or, in some terminals, single-quoted. Neither is
+    part of the name. Windows paths are left alone: there a backslash is the
+    separator.
+    """
+    p = p.strip()
+    if p and sys.platform != "win32" and not os.path.exists(p) and \
+            ("\\" in p or p[0] == p[-1] == "'"):
+        try:
+            parts = shlex.split(p)
+        except ValueError:
+            parts = []
+        if len(parts) == 1:
+            p = parts[0]
+    return os.path.expandvars(os.path.expanduser(p)) if p else p
+
+
+def ask_path(prompt: str, default: str | None = None) -> str:
+    return clean_path(ask(prompt, default))
 
 
 def ask_int(prompt, default, lo=None, hi=None) -> int:
@@ -172,11 +230,13 @@ class Bar:
 # --------------------------------------------------------------------------
 
 def load_settings() -> dict:
-    try:
-        with open(SETTINGS, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    for path in (SETTINGS, LEGACY_SETTINGS):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {}
 
 
 def save_settings(s: dict) -> None:
@@ -191,7 +251,7 @@ class Workspace:
 
     The location is the user's call -- the tables are enormous and often will
     not fit on the system drive -- so only a pointer to it is kept in
-    LOCALAPPDATA.
+    `settings_dir()`.
     """
 
     def __init__(self, root: str):
@@ -244,7 +304,7 @@ class Workspace:
     def mark_card_written(self, run: str, drive: str, files: int,
                           nbytes: int) -> None:
         rec = {
-            "drive": drive.upper(),
+            "drive": drive,
             "written_utc": datetime.now().astimezone().isoformat(timespec="seconds"),
             "files": files,
             "bytes": nbytes,
@@ -384,15 +444,15 @@ def find_logs(ws: Workspace) -> list[tuple[str, str]]:
     """Calibration CSVs on any mounted card, plus any already imported."""
     found: list[tuple[str, str]] = []
     for v in sdcard.list_volumes():
-        letter = (v.get("Letter") or "").upper()
-        if not letter:
+        if not v.get("Id") or not v.get("Root"):
             continue
-        d = os.path.join(f"{letter}:\\", "Android", "data",
+        d = os.path.join(v["Root"], "Android", "data",
                          "com.qualcomm.ftcrobotcontroller", "files", "logs")
         if os.path.isdir(d):
             for f in sorted(os.listdir(d)):
                 if f.startswith("calibration_log_") and f.endswith(".csv"):
-                    found.append((f"card {letter}:", os.path.join(d, f)))
+                    found.append((f"card {sdcard.show_id(v['Id'])}",
+                                  os.path.join(d, f)))
     for f in sorted(os.listdir(ws.calib)):
         if f.endswith(".csv"):
             found.append(("workspace", os.path.join(ws.calib, f)))
@@ -407,7 +467,7 @@ def step_calibration(ws: Workspace) -> None:
                 "workspace.", "33"))
         print("  Insert the SD card, or copy a CSV into "
               + c(ws.calib, "36"))
-        p = ask("Path to a CSV (blank to go back)", "")
+        p = ask_path("Path to a CSV (blank to go back)", "")
         if not p or not os.path.isfile(p):
             return
         logs = [("manual", p)]
@@ -508,7 +568,7 @@ def step_diagnose(ws: Workspace) -> None:
     print(c(f"  report: {out}", "32"))
     if confirm("Open it in a browser?"):
         import webbrowser
-        webbrowser.open("file:///" + out.replace("\\", "/"))
+        webbrowser.open(file_uri(out))
 
 
 # --------------------------------------------------------------------------
@@ -599,7 +659,7 @@ def step_field(ws: Workspace) -> None:
         cur = os.path.join(ws.field, name)
         prompt = f"Path to {name}" + (" (blank to keep current)" if
                                       os.path.exists(cur) else "")
-        p = ask(prompt, "")
+        p = ask_path(prompt, "")
         if not p:
             if os.path.exists(cur):
                 _install(cur, cur, what)
@@ -675,7 +735,16 @@ def target_overrides(target: str, measured: dict) -> dict:
 
 
 def julia_exe() -> str | None:
-    return shutil.which("julia")
+    found = shutil.which("julia")
+    if found:
+        return found
+    # juliaup's default home, for a shell whose profile never put it on PATH.
+    for p in (os.path.join(os.path.expanduser("~"), ".juliaup", "bin", "julia"),
+              os.path.join(os.path.expanduser("~"), ".juliaup", "bin",
+                           "julia.exe")):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
 
 
 # Everything the solve needs, in the unit the thing is actually measured in.
@@ -1370,9 +1439,9 @@ def save_job(ws: Workspace, cfg: dict, target: str, p: dict) -> str | None:
         print(c(line, "2"))
     print()
     print("  When the droplet is up, from this repo:")
-    print(c(f"    py -3.12 solver/cloud/peregrine_remote.py provision "
+    print(c(f"    {PY} solver/cloud/peregrine_remote.py provision "
             f"root@<ip>", "36"))
-    print(c(f"    py -3.12 solver/cloud/peregrine_remote.py run {safe} "
+    print(c(f"    {PY} solver/cloud/peregrine_remote.py run {safe} "
             f"--host root@<ip>", "1;36"))
     print(c("  The tables come home to the job's tables/ directory.", "2"))
     return jdir
@@ -2254,10 +2323,10 @@ def _arrived(folder: str) -> float:
 
 def ask_folder_path() -> str | None:
     while True:
-        src = ask("Folder to write (blank to cancel)", "")
+        src = ask_path("Folder to write (blank to cancel)", "")
         if not src:
             return None
-        src = os.path.abspath(os.path.expandvars(os.path.expanduser(src)))
+        src = os.path.abspath(src)
         if os.path.isdir(src):
             return src
         print(c(f"  not a folder: {src}", "31"))
@@ -2272,8 +2341,10 @@ def pick_card_source(ws: Workspace) -> str | None:
     that kind. Any other folder can still be typed in by hand.
     """
     print("  What should go on the card?")
-    print(r"    1  tables solved on this computer        (runs\)")
-    print(r"    2  tables from a saved job, solved on a  (jobs\<name>\tables)")
+    print("    1  tables solved on this computer        "
+          + os.path.join("(runs", ")"))
+    print("    2  tables from a saved job, solved on a  "
+          + os.path.join("(jobs", "<name>", "tables)"))
     print("       rented GPU and pulled home")
     print("    3  some other folder -- type its path")
     kind = ask("Choose 1, 2 or 3 (0 to cancel)", "1")
@@ -2298,7 +2369,8 @@ def pick_card_source(ws: Workspace) -> str | None:
                 notes.append(c("unfinished -- no MANIFEST.JSON", "33"))
             rec = ws.card_record(p)
             if rec:
-                notes.append(c(f"written to {rec.get('drive')}: "
+                notes.append(c(f"written to "
+                               f"{sdcard.show_id(rec.get('drive', '?'))} "
                                f"{rec.get('written_utc', '')[:16]}", "2"))
             tag = c(" (newest)", "2") if i == 1 else ""
             print(f"    {i:>2}  {name}{tag}"
@@ -2355,24 +2427,26 @@ def step_card(ws: Workspace) -> None:
         print(c("  removable FAT32 volume that is not a system or boot disk.", "33"))
         return
 
-    letters = [a["Letter"].upper() for a in safe]
-    print(f"  Eligible: {', '.join(l + ':' for l in letters)}")
-    choice = ask("Which drive (letter, blank to cancel)", "").strip().rstrip(":").upper()
-    if not choice:
+    noun = sdcard.ID_NOUN
+    print(f"  Eligible: {', '.join(sdcard.show_id(a['Id']) for a in safe)}")
+    typed = ask(f"Which drive ({noun}, blank to cancel)", "")
+    if not sdcard.norm_id(typed):
         return
-    if choice not in letters:
-        print(c(f"  {choice}: is not in the eligible list.", "31")); return
+    target = sdcard.find(safe, typed)
+    if target is None:
+        print(c(f"  {typed} is not in the eligible list.", "31")); return
+    choice = target["Id"]
+    shown = sdcard.show_id(choice)
 
     try:
         nfiles, nbytes, top = sdcard.inventory(choice)
     except OSError as e:
-        print(c(f"  cannot read {choice}: {e}", "31")); return
+        print(c(f"  cannot read {shown}: {e}", "31")); return
 
-    target = next(a for a in safe if a["Letter"].upper() == choice)
     rule()
     print(c("  THIS WILL PERMANENTLY DELETE EVERYTHING ON THIS DRIVE", "1;31"))
     rule()
-    print(f"  drive     {choice}:  {target.get('Label') or '(no label)'}  "
+    print(f"  drive     {shown}  {target.get('Label') or '(no label)'}  "
           f"{target.get('FriendlyName','')}")
     print(f"  size      {human(target.get('Size',0))} "
           f"({target.get('FileSystem')})")
@@ -2385,16 +2459,16 @@ def step_card(ws: Workspace) -> None:
         print(c("  Payload is larger than the card. Aborting.", "31")); return
     rule()
 
-    print(c(f"  Type the drive letter '{choice}' to confirm, anything else "
+    print(c(f"  Type the {noun} '{choice}' to confirm, anything else "
             f"cancels.", "1;33"))
-    typed = ask("Confirm drive letter", "").strip().rstrip(":").upper()
-    if typed != choice:
+    typed = ask(f"Confirm {noun}", "")
+    if sdcard.norm_id(typed) != sdcard.norm_id(choice):
         print(c("  Cancelled -- nothing was changed.", "32")); return
 
     # The source may now be anywhere, including the card itself -- wiping the
     # drive we are about to copy from would destroy the tables.
-    if os.path.splitdrive(os.path.abspath(run))[0].upper() == f"{choice}:":
-        print(c(f"  The source folder is on {choice}: -- copy it off the card "
+    if sdcard.on_volume(run, target):
+        print(c(f"  The source folder is on {shown} -- copy it off the card "
                 f"first.", "31")); return
 
     try:
@@ -2417,7 +2491,8 @@ def step_card(ws: Workspace) -> None:
     print()
     print(c("  verifying the card...", "2"))
     v = subprocess.run([sys.executable, os.path.join(HERE, "verify_tables.py"),
-                        f"{choice}:\\"], capture_output=True, text=True)
+                        sdcard.volume_root(choice)],
+                       capture_output=True, text=True)
     sys.stdout.write(v.stdout)
     if v.returncode == 0:
         # Only record success once the card itself has been read back and
@@ -2429,7 +2504,12 @@ def step_card(ws: Workspace) -> None:
             # A source outside the workspace may not be writable; the card is
             # still good, only the step-4 marker is missing.
             print(c(f"  (could not record the write in {run}: {e})", "2"))
-        print(c(f"\n  Card {choice}: is ready.", "1;32"))
+        print(c(f"\n  Card {shown} is ready.", "1;32"))
+        if sdcard.IS_MAC and confirm("Eject it now?", default_yes=True):
+            ok, msg = sdcard.eject(choice)
+            print(c("  ejected -- safe to remove", "32") if ok else
+                  c(f"  could not eject ({msg}); eject it in Finder before "
+                    f"pulling it", "33"))
     else:
         print(c("\n  Card verification FAILED -- step 4 left unfinished.", "1;31"))
 
@@ -2437,6 +2517,31 @@ def step_card(ws: Workspace) -> None:
 # --------------------------------------------------------------------------
 # Menu
 # --------------------------------------------------------------------------
+
+def other_drives() -> list[tuple[str, str]]:
+    """Drives worth suggesting for a workspace, beside the system one."""
+    if sys.platform == "win32":
+        return [(d, d + "\\") for d in ("D:", "E:") if os.path.isdir(d + "\\")]
+    out = []
+    try:
+        names = sorted(os.listdir("/Volumes"))
+    except OSError:
+        return out
+    for name in names:
+        root = os.path.join("/Volumes", name)
+        # The boot volume appears here as a link to "/".
+        if not os.path.islink(root) and os.path.ismount(root):
+            out.append((root, root))
+    return out
+
+
+def default_workspace() -> str:
+    # On a Mac the user has to find this folder to drop logs into it, so it
+    # goes somewhere Finder shows rather than inside ~/Library.
+    if sys.platform == "win32":
+        return os.path.join(settings_dir(), "data")
+    return os.path.join(os.path.expanduser("~"), "Peregrine")
+
 
 def pick_workspace(settings: dict) -> Workspace:
     cur = settings.get("workspace")
@@ -2446,17 +2551,15 @@ def pick_workspace(settings: dict) -> Workspace:
     if cur:
         print(f"  current: {c(cur, '36')}")
     print()
-    for d in ("D:", "E:"):
-        if os.path.isdir(d + "\\"):
-            try:
-                free = shutil.disk_usage(d + "\\").free
-                print(f"    {d}  {human(free)} free")
-            except OSError:
-                pass
+    for label, root in other_drives():
+        try:
+            free = shutil.disk_usage(root).free
+            print(f"    {label}  {human(free)} free")
+        except OSError:
+            pass
     print()
     while True:
-        p = ask("Workspace directory", cur or os.path.join(
-            os.environ.get("LOCALAPPDATA", HERE), "Peregrine", "data"))
+        p = ask_path("Workspace directory", cur or default_workspace())
         try:
             ws = Workspace(p)
         except OSError as e:
@@ -2501,7 +2604,8 @@ def status(ws: Workspace) -> None:
     detail = ""
     if card:
         when = card.get("written_utc", "")[:16].replace("T", " ")
-        detail = f"   ({card['drive']}: {when}, {human(card.get('bytes', 0))})"
+        detail = (f"   ({sdcard.show_id(card['drive'])} {when}, "
+                  f"{human(card.get('bytes', 0))})")
     print(f"  {mark(bool(card))}  4. Write the SD card{detail}")
     print()
     print(c("  d. diagnose the regression fit (optional)", "2"))

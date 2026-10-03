@@ -5,6 +5,8 @@ Run a Peregrine solve on a rented GPU box over SSH.
     py -3.12 solver/cloud/peregrine_remote.py provision root@1.2.3.4
     py -3.12 solver/cloud/peregrine_remote.py run <job> --host root@1.2.3.4
 
+(`python3` in place of `py -3.12` on a Mac.)
+
 `run` is the whole job: push the working tree and the inputs, start the solve
 in a detached tmux session, follow its progress with the same bar the wizard
 draws, pull the tables back, verify them, and tell you what the rental cost.
@@ -77,6 +79,7 @@ disk); `--no-stream` restores the fetch-everything-at-the-end behaviour.
 
 import argparse
 import json
+import ntpath
 import os
 import posixpath
 import queue
@@ -95,10 +98,12 @@ sys.path.insert(0, os.path.join(REPO, "wizard"))
 
 # The wizard's terminal helpers, so a remote solve looks exactly like a local
 # one. peregrine.py guards its entry point, so importing it runs nothing.
-from peregrine import Bar, c, hms, human  # noqa: E402
+from peregrine import PY, Bar, c, hms, human, settings_dir  # noqa: E402
 
-STATE = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Peregrine",
-                     "remote.json")
+STATE = os.path.join(settings_dir(), "remote.json")
+# Before macOS was supported, LOCALAPPDATA's absence put the state in the
+# source tree beside this file. Read from there if nothing newer exists.
+LEGACY_STATE = os.path.join(HERE, "Peregrine", "remote.json")
 
 # Rented boxes bill by the second and stop billing only when the machine is
 # destroyed, so the elapsed time of a run is a price. Default is
@@ -122,11 +127,18 @@ OUTPUT_KEYS = ("out_dir", "scratch_dir")
 # --------------------------------------------------------------------------
 
 def load_state() -> dict:
-    try:
-        with open(STATE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    # Only the live path once the self-test has pointed STATE elsewhere.
+    paths = (STATE, LEGACY_STATE) if STATE == _STATE_DEFAULT else (STATE,)
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {}
+
+
+_STATE_DEFAULT = STATE
 
 
 def save_state(st: dict) -> None:
@@ -154,10 +166,10 @@ def resolve_host(args, st: dict) -> str:
     h = want or st.get("host")
     if not h:
         die("no box to talk to. Give one:\n"
-            "    py -3.12 solver/cloud/peregrine_remote.py <cmd> "
+            f"    {PY} solver/cloud/peregrine_remote.py <cmd> "
             "--host root@1.2.3.4\n"
             "or remember it for this box's lifetime:\n"
-            "    py -3.12 solver/cloud/peregrine_remote.py host root@1.2.3.4")
+            f"    {PY} solver/cloud/peregrine_remote.py host root@1.2.3.4")
     if st.get("host") != h:
         known = st.get("host")
         st.clear()
@@ -273,6 +285,30 @@ def key_cipher(body: str):
     return raw[p + 4:p + 4 + n].decode("ascii", "replace")
 
 
+def agent_help(key: str) -> str:
+    """How to get a passphrase-protected key into an agent, here."""
+    if sys.platform == "win32":
+        return ("Start the agent once, as Administrator:\n"
+                "    Set-Service ssh-agent -StartupType Automatic\n"
+                "    Start-Service ssh-agent\n\n"
+                "Then, as yourself, load the key (it asks for the passphrase "
+                "once):\n"
+                f"    ssh-add {key}\n\n"
+                "After that this works, and keeps working across reboots.")
+    if sys.platform == "darwin":
+        # macOS starts an agent per login session by itself; what is missing
+        # is only the key. The keychain flag makes that survive a reboot.
+        return ("Load the key into the agent macOS already runs (it asks for "
+                "the\npassphrase once and keeps it in your keychain):\n"
+                f"    ssh-add --apple-use-keychain {key}\n\n"
+                "To have it loaded again after a reboot, add to ~/.ssh/config:"
+                "\n    Host *\n      UseKeychain yes\n      AddKeysToAgent yes")
+    return ("Start an agent and load the key (it asks for the passphrase "
+            "once):\n"
+            '    eval "$(ssh-agent -s)"\n'
+            f"    ssh-add {key}")
+
+
 def check_ssh(host: str) -> None:
     print(f"  reaching {c(host, '36')} ...", end="", flush=True)
     r = ssh(host, "echo ok", check=False)
@@ -294,13 +330,7 @@ def check_ssh(host: str) -> None:
                 "the\nautomated calls here cannot unlock it. (Plain `ssh "
                 f"{host}` works\nbecause it can prompt you; these calls run "
                 "BatchMode and cannot.)\n\n"
-                "Start the agent once, as Administrator:\n"
-                "    Set-Service ssh-agent -StartupType Automatic\n"
-                "    Start-Service ssh-agent\n\n"
-                "Then, as yourself, load the key (it asks for the passphrase "
-                "once):\n"
-                f"    ssh-add {locked[0]}\n\n"
-                "After that this works, and keeps working across reboots.")
+                + agent_help(locked[0]))
         if locked:
             die("an agent is running but does not seem to hold your key.\n"
                 f"Load it with:\n    ssh-add {locked[0]}\n\n{err[:400]}")
@@ -326,6 +356,26 @@ def remote_env(host: str) -> dict:
 # Uploading
 # --------------------------------------------------------------------------
 
+def tar_env() -> dict:
+    """The environment for a local `tar -c`.
+
+    macOS's bsdtar otherwise stores extended attributes as `._` AppleDouble
+    entries, which land on the box as stray files beside every source file
+    and make GNU tar there warn about unknown header keywords.
+    """
+    return dict(os.environ, COPYFILE_DISABLE="1")
+
+
+def remote_name(local: str) -> str:
+    """The file name a desktop path is uploaded under.
+
+    `ntpath` splits on both separators, so a config written on Windows names
+    the same file whichever machine reads it -- `os.path.basename` on a Mac
+    would keep `D:\\...\\field.json` whole and upload under that name.
+    """
+    return ntpath.basename(local)
+
+
 def push_tree(host: str) -> None:
     """Stream the working tree up as a tar. No rsync on Git Bash or Windows."""
     print("  pushing the working tree ...", end="", flush=True)
@@ -333,7 +383,8 @@ def push_tree(host: str) -> None:
     for pat in EXCLUDE:
         excl += ["--exclude", pat]
     tar = subprocess.Popen(["tar", "-cz", "-C", REPO, *excl, "."],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=tar_env())
     dest = subprocess.Popen(
         ssh_cmd(host, "mkdir -p ~/peregrine && tar -xz -C ~/peregrine"),
         stdin=tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -358,7 +409,7 @@ def push_inputs(host: str, cfg: dict, env: dict) -> dict:
             die(f"config has no '{key}'")
         if not os.path.isfile(local):
             die(f"config's '{key}' is not a file here: {local}")
-        name = os.path.basename(local)
+        name = remote_name(local)
         print(f"  pushing {name} ({human(os.path.getsize(local))}) ...",
               end="", flush=True)
         r = subprocess.run(["scp", *SSH_OPTS, local, f"{host}:{inputs}/{name}"],
@@ -765,7 +816,7 @@ def cmd_benchmark(args, st) -> int:
     env = remote_env(host)
     if not env:
         die("this box has not been provisioned. Run:\n"
-            "    py -3.12 solver/cloud/peregrine_remote.py provision")
+            f"    {PY} solver/cloud/peregrine_remote.py provision")
     push_tree(host)
     julia = env.get("julia", "julia")
     print()
@@ -806,13 +857,7 @@ def _gpu_key(name: str) -> str:
 
 def _remember_rates(key: str, res: dict) -> None:
     """Write the measured rates where the wizard's planner reads them."""
-    path = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Peregrine",
-                        "wizard.json")
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            settings = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        settings = {}
+    settings = load_wizard_settings()
     rates = settings.setdefault("gpu_rates", {})
     rates[key] = {"cell_cost": res.get("cell_cost"),
                   "cell_rate": res.get("cell_rate"),
@@ -824,9 +869,8 @@ def _remember_rates(key: str, res: dict) -> None:
                   "prefetch_gain": (res.get("prefetch") or {}).get("gain"),
                   "measured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                 time.gmtime())}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(settings, fh, indent=2)
+    from peregrine import save_settings
+    save_settings(settings)
 
 
 def cmd_host(args, st) -> int:
@@ -924,13 +968,8 @@ def jobs_dir() -> str | None:
 
 
 def load_wizard_settings() -> dict:
-    path = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Peregrine",
-                        "wizard.json")
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    from peregrine import load_settings
+    return load_settings()
 
 
 def resolve_config(spec: str) -> tuple:
@@ -1058,7 +1097,7 @@ def cmd_jobs(args, st) -> int:
     for j in js:
         _print_job(j, job_rate(args, j))
         print()
-    print(c("  run one with:  py -3.12 solver/cloud/peregrine_remote.py run "
+    print(c(f"  run one with:  {PY} solver/cloud/peregrine_remote.py run "
             "<name> --host root@<ip>", "2"))
     return 0
 
@@ -1071,7 +1110,7 @@ def _prepare(host, cfg_path, st):
     env = remote_env(host)
     if not env:
         die("this box has not been provisioned. Run:\n"
-            "    py -3.12 solver/cloud/peregrine_remote.py provision")
+            f"    {PY} solver/cloud/peregrine_remote.py provision")
     push_tree(host)
     cfg = push_inputs(host, cfg, env)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1516,8 +1555,7 @@ def self_test() -> int:
     # push_inputs does the input keys; remote_config does the rest.
     staged = dict(cfg)
     for k in INPUT_KEYS:
-        staged[k] = posixpath.join(env["inputs_dir"],
-                                   os.path.basename(cfg[k]))
+        staged[k] = posixpath.join(env["inputs_dir"], remote_name(cfg[k]))
     r = remote_config(staged, env, "20260901_120000")
     leftover = [k for k, v in r.items()
                 if isinstance(v, str) and ("\\" in v or re.match(r"^[A-Za-z]:", v))]
@@ -1531,6 +1569,15 @@ def self_test() -> int:
     check("a desktop VRAM override is dropped, not carried onto a bigger card",
           "vram_budget_bytes" not in r)
     check("the grid is untouched", r["grid"]["n"] == [72, 72, 32, 21, 21, 32])
+    # The same config written on a Mac. Either desktop must upload a file
+    # under its own name, whichever machine is reading the config.
+    check("a Windows path uploads under the file's own name",
+          remote_name(cfg["field"]) == "field.json", remote_name(cfg["field"]))
+    mac = "/Users/me/Peregrine Workspace/field/field.json"
+    check("a Mac path uploads under the file's own name",
+          remote_name(mac) == "field.json", remote_name(mac))
+    check("the local tar does not add AppleDouble files",
+          tar_env().get("COPYFILE_DISABLE") == "1")
 
     print("\n[2] the exclusion list keeps the big and the local off the wire")
     for pat, why in ((".git", "history"), ("__pycache__", "bytecode"),

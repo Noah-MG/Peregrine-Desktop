@@ -419,6 +419,38 @@ function warm_fits(g::Grid6, budget::Int64, sp, m::Model, margin::Int,
 end
 
 """
+Memory the OS could hand this process without swapping, in bytes; 0 if it
+cannot be read.
+
+`Sys.free_memory` is that on Windows and Linux. On macOS it counts only pages
+nobody has touched, and leaves out the inactive and purgeable pages macOS
+hands back on demand -- so a Mac with gigabytes to spare reads as having a
+few hundred megabytes, and every prefetch would be refused. There the
+reclaimable pages are added from `vm_stat`.
+"""
+function available_memory()::Int64
+    free = try
+        Int64(Sys.free_memory())
+    catch
+        Int64(0)
+    end
+    Sys.isapple() || return free
+    try
+        out = read(`vm_stat`, String)
+        m = match(r"page size of (\d+) bytes", out)
+        page = m === nothing ? Int64(4096) : parse(Int64, m.captures[1])
+        pages(kind) = begin
+            k = match(Regex("Pages $(kind):\\s+(\\d+)"), out)
+            k === nothing ? Int64(0) : parse(Int64, k.captures[1])
+        end
+        return max(free, page * (pages("free") + pages("inactive") +
+                                 pages("speculative") + pages("purgeable")))
+    catch
+        return free
+    end
+end
+
+"""
 Should the tiled driver prefetch, and what does it need to?
 
 The prefetch holds one whole tile window in host RAM so the read of the next
@@ -448,11 +480,7 @@ function prefetch_plan(cfg::AbstractDict, dec, warm::Bool)
     end
     force_on && return (true, bytes, "")
     frac = Float64(getc(cfg, "prefetch_ram_frac", 0.5))
-    free = try
-        Int64(Sys.free_memory())
-    catch
-        Int64(0)
-    end
+    free = available_memory()
     free <= 0 && return (false, bytes, "cannot read free memory")
     bytes <= free * frac && return (true, bytes, "")
     # Naming the lever matters here, because the obvious reading of this

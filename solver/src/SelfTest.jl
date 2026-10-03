@@ -1099,6 +1099,13 @@ written rather than cells written a moment ago.
 function test_prefetch()
     println("
 [14] the prefetch changes the schedule, not the answer")
+    # Whether to prefetch is decided against free RAM, and on a Mac the
+    # obvious reading of that undercounts by an order of magnitude.
+    avail = available_memory()
+    _check(0 < avail <= Sys.total_memory(),
+           "available memory is read, and is no more than the machine has",
+           "$(round(avail / 2^30, digits = 2)) GB of " *
+           "$(round(Sys.total_memory() / 2^30, digits = 1)) GB")
     if !CUDA.functional()
         println("  SKIP  no CUDA device"); return true
     end

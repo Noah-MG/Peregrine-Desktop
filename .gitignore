@@ -20,9 +20,17 @@ __pycache__/
 .venv/
 venv/
 
+# Wizard and remote-driver state from before macOS was supported: off
+# Windows it landed in the source tree. It now lives in
+# ~/Library/Application Support/Peregrine, and is read from here only once.
+wizard/Peregrine/
+solver/cloud/Peregrine/
+
 # Editors / OS
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+.DS_Store
+._*
 *.swp

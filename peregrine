@@ -1,0 +1,58 @@
+#!/bin/sh
+# ---------------------------------------------------------------------
+# Peregrine desktop wizard launcher for macOS -- the counterpart of
+# peregrine.bat.
+#
+# Run ./peregrine from this folder, or call "peregrine" from any
+# directory once this folder is on your PATH (or this file is linked
+# into it). Double-click peregrine.command in Finder for the same thing
+# in a Terminal window. Any arguments are passed straight through.
+# ---------------------------------------------------------------------
+
+# Follow symlinks, so a link to this file from somewhere on PATH still
+# finds the repository it belongs to.
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+HERE=$(cd "$(dirname "$self")" && pwd)
+WIZ="$HERE/wizard/peregrine.py"
+
+if [ ! -f "$WIZ" ]; then
+    echo
+    echo "  Cannot find the wizard at:"
+    echo "    \"$WIZ\""
+    echo "  Keep this launcher in the root of the Peregrine-Desktop folder."
+    exit 1
+fi
+
+# Find a Python 3.11+ interpreter (the wizard reads TOML with tomllib).
+# Each candidate is actually run rather than just located: /usr/bin/python3
+# on a Mac without the command line tools is a stub that only offers to
+# install them. One that can also import numpy is preferred, since the
+# calibration fitters run under the same interpreter as the wizard.
+PYEXE=
+for need in "import numpy" ""; do
+    for py in python3.13 python3.12 python3.11 python3 python; do
+        command -v "$py" >/dev/null 2>&1 || continue
+        if "$py" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)
+$need" >/dev/null 2>&1; then
+            PYEXE=$py
+            break 2
+        fi
+    done
+done
+
+if [ -z "$PYEXE" ]; then
+    echo
+    echo "  No usable Python 3.11+ found."
+    echo "  Install one with Homebrew (brew install python) or from"
+    echo "  https://www.python.org/downloads/ and run this again."
+    exit 1
+fi
+
+exec "$PYEXE" "$WIZ" "$@"
