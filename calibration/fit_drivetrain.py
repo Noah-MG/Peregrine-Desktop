@@ -752,27 +752,44 @@ def print_traction(args, rows):
         print("  saturating term will always reduce the fit residual somewhere.")
         print()
         print("    %-14s %8s %8s %8s %8s" % ("knee", "v_x", "v_y", "omega", "mean"))
-        cands = [r for r in rows if r[0] is not None]
-        best = max(cands, key=lambda r: r[2])
+        # The chosen knee is whatever the search returned, not a second guess
+        # at it here: the two disagreed when a score came back non-finite.
         for knee, r2, mu in rows:
             lbl = ("no saturation*" if knee is None else "%.2f" % knee)
             print("    %-14s %8.3f %8.3f %8.3f %8.3f%s"
-                  % (lbl, *r2, mu, "   <-- chosen" if knee == best[0] else ""))
-        flat = [r for r in rows if r[0] is None]
-        gain = best[2] - (flat[0][2] if flat else best[2])
+                  % (lbl, *r2, mu, "   <-- chosen" if knee == args.knee else ""))
         print("    * reference only -- the model requires a knee, so this row")
         print("      is never chosen. It is here to price the one that was.")
         print()
-        print("  Knee at %.2f, worth %+.3f mean rollout R2 over no saturation."
-              % (best[0], gain))
-        print("  Past that demand, extra command buys no extra force.")
-        if gain < 0.01:
-            print()
-            print("  That gain is small, so this run does not pin the knee down.")
-            print("  Two runs look like this: one that never reaches the traction")
-            print("  limit, and one that never comes back below it. The knee is")
-            print("  still shipped -- treat it as an upper bound on what the")
-            print("  floor delivers and re-measure on a run that crosses it.")
+        scored = [r for r in rows
+                  if r[0] is not None and math.isfinite(r[2])]
+        flat = [r for r in rows if r[0] is None and math.isfinite(r[2])]
+        if not scored:
+            print("  This run could not score ANY knee -- every candidate came")
+            print("  back blank above. The rollout judges a 0.5 s horizon on the")
+            print("  held-out second half of the run, so it needs roughly two")
+            print("  seconds of kept samples; a shorter run, or one where most")
+            print("  samples were dropped as stationary, leaves nothing to score.")
+            print("  A knee is still required, so it fell back to %.2f, the"
+                  % args.knee)
+            print("  mildest candidate -- the honest reading of a run that never")
+            print("  showed the limit. Do not trust it as a measurement: drive")
+            print("  longer, through the point where the tyres break away, and")
+            print("  fit again.")
+        else:
+            mine = [r for r in scored if r[0] == args.knee]
+            best = mine[0] if mine else max(scored, key=lambda r: r[2])
+            gain = best[2] - (flat[0][2] if flat else best[2])
+            print("  Knee at %.2f, worth %+.3f mean rollout R2 over no "
+                  "saturation." % (best[0], gain))
+            print("  Past that demand, extra command buys no extra force.")
+            if gain < 0.01:
+                print()
+                print("  That gain is small, so this run does not pin the knee down.")
+                print("  Two runs look like this: one that never reaches the traction")
+                print("  limit, and one that never comes back below it. The knee is")
+                print("  still shipped -- treat it as an upper bound on what the")
+                print("  floor delivers and re-measure on a run that crosses it.")
     elif args.knee:
         print("  knee fixed at %.2f by --traction-knee" % args.knee)
     if args.knee:
@@ -1248,12 +1265,28 @@ def choose_knee(prep, args, grid=KNEE_GRID):
     that never reaches it has nothing to see -- in both cases the chosen knee
     describes the data weakly, and the printed gain over the reference is what
     says so.
+
+    A run can also be too short to score at all: the rollout holds out the
+    second half of a 0.5 s horizon, so a kept span under ~2 s scores every
+    candidate NaN. That is a statement about the run, not about the grid, so
+    it falls back to the mildest candidate -- the reading that the limit was
+    never reached -- and leaves the report to say the data did not pin it
+    down.
     """
+    # Candidates have to be real knees. A non-positive one would disable
+    # saturation inside `saturate_u` and then score as the reference row,
+    # which could see "no saturation" chosen for a model that requires it.
+    cands = [float(x) for x in grid
+             if x is not None and math.isfinite(x) and x > 0]
+    if not cands:
+        raise ValueError("the traction knee grid is empty; a knee is "
+                         "required, so there is nothing to choose from")
+
     k = prep.keep
     best = (None, -np.inf, None)
     rows = []
     flat_score = None
-    for knee in (KNEE_REFERENCE,) + tuple(grid):
+    for knee in (KNEE_REFERENCE,) + tuple(cands):
         us = saturate_u(prep.u[k], knee)
         X, names = build_design(us, prep.v[k], args.coulomb, args.intercept,
                                 args.omega_sq, args.drag)
@@ -1263,16 +1296,21 @@ def choose_knee(prep, args, grid=KNEE_GRID):
             coef[i] = b
         r2, _ = rollout_r2(prep.t[k], us @ MEC_MIX[:3].T, prep.v[k], coef,
                            names, horizon=0.5)
-        mu = float(np.nanmean(r2))
+        # All-NaN means the rollout declined to score this run at all;
+        # -inf means the integration diverged. Keep them apart -- nanmean of
+        # all-NaN is a warning and a NaN anyway.
+        mu = float("nan") if np.all(np.isnan(r2)) else float(np.nanmean(r2))
         rows.append((knee, r2, mu))
         if knee is None:
             flat_score = mu
             continue          # reference row only, never a candidate
-        if mu > best[1]:
+        if math.isfinite(mu) and mu > best[1]:
             best = (knee, mu, r2)
     if best[0] is None:
-        raise RuntimeError("the traction knee grid is empty; a knee is "
-                           "required, so there is nothing to choose from")
+        # Nothing was scoreable. A knee is mandatory, so return the mildest
+        # one rather than failing the whole fit; `print_traction` reads the
+        # same all-unscored rows and says what happened.
+        return max(cands), rows
     return best[0], rows
 
 

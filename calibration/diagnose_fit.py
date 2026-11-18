@@ -23,6 +23,7 @@ import argparse
 import base64
 import html
 import io
+import math
 import os
 import sys
 from datetime import datetime
@@ -295,20 +296,29 @@ def fig_families(table, ref):
 
 
 def fig_knee(rows, chosen):
-    """Rollout score against traction knee, with 'no saturation' on the left."""
+    """Rollout score against traction knee, with 'no saturation' on the left.
+
+    A candidate the rollout declined to score comes back NaN, and a diverging
+    one -inf. Neither can be drawn or used for the axis limits, so they are
+    shown as empty bars marked n/a -- a run too short to score makes EVERY
+    row look like that.
+    """
     labels = ["none" if k is None else "%.2f" % k for k, _, _ in rows]
     means = [m for _, _, m in rows]
+    drawn = [m if math.isfinite(m) else 0.0 for m in means]
+    finite = [m for m in means if math.isfinite(m)]
     fig, ax = plt.subplots(figsize=(9, 3.6))
     colors = [OK if (k == chosen) else ACCENT for k, _, _ in rows]
-    ax.bar(range(len(rows)), means, color=colors)
+    ax.bar(range(len(rows)), drawn, color=colors)
     ax.set_xticks(range(len(rows)))
     ax.set_xticklabels(labels)
     ax.set_xlabel("traction knee (command magnitude at which the tyres give up)")
     ax.set_ylabel("mean rollout R2")
-    lo = min(means); hi = max(means)
+    lo, hi = (min(finite), max(finite)) if finite else (0.0, 1.0)
     ax.set_ylim(lo - 0.08 * (hi - lo + 1e-6), hi + 0.08 * (hi - lo + 1e-6))
     for i, m in enumerate(means):
-        ax.text(i, m, "%.3f" % m, ha="center", va="bottom", fontsize=8, color=FG)
+        ax.text(i, drawn[i], "%.3f" % m if math.isfinite(m) else "n/a",
+                ha="center", va="bottom", fontsize=8, color=FG)
     style(ax)
     fig.suptitle("Wheel slip: how well the model predicts motion at each knee "
                  "(green = chosen)", fontsize=11, color=FG)
@@ -850,14 +860,28 @@ def main(argv=None) -> int:
 
     rollv = {r: table[ref_name][r]["roll"] for r in fd.RESPONSES}
     if args.knee is not None and knee_rows:
-        flat = [r for r in knee_rows if r[0] is None]
-        best = max(knee_rows, key=lambda r: r[2])
-        if flat and best[0] is not None:
+        # Price the knee that was actually chosen, against the reference row.
+        # Non-finite scores are no comparison at all: a run too short for the
+        # rollout scores every row NaN, and `max` over NaN picks arbitrarily.
+        flat = [r for r in knee_rows
+                if r[0] is None and np.isfinite(r[2])]
+        chosen = [r for r in knee_rows
+                  if r[0] == args.knee and np.isfinite(r[2])]
+        if flat and chosen:
             verdicts.append(("", (
                 "<b>Wheel slip is being modelled</b> with a knee at %.2f, "
                 "worth %+.3f mean rollout R2 over no saturation. Everything "
                 "below already has it applied. Note it describes this floor "
-                "only." % (args.knee, best[2] - flat[0][2]))))
+                "only." % (args.knee, chosen[0][2] - flat[0][2]))))
+        elif not any(r[0] is not None and np.isfinite(r[2])
+                     for r in knee_rows):
+            verdicts.append(("warn", (
+                "<b>The traction knee could not be measured on this run.</b> "
+                "The rollout needs roughly two seconds of kept samples to "
+                "score a knee, and no candidate scored. A knee is required, "
+                "so %.2f was shipped as the mildest candidate -- drive "
+                "longer, through the point where the tyres break away, and "
+                "fit again." % args.knee)))
 
     worst = min(fd.RESPONSES, key=lambda r: rollv[r]
                 if np.isfinite(rollv[r]) else -9)
